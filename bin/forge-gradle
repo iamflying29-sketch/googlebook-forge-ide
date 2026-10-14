@@ -1,0 +1,27 @@
+#!/bin/bash
+# Runs a Gradle build (./gradlew when the project has one) sized to the free memory: the build gets the Googlebook's
+# free memory above its 2.3 GB reserve (at most 2 GB) as a hard cap, and Gradle's Java heap is scaled to fit well
+# inside that cap, so Gradle reports "out of memory" itself long before the cap is reached. By default the build runs
+# without a lingering Gradle daemon, so its memory is returned as soon as it finishes (FORGE_GRADLE_DAEMON=1 keeps the
+# daemon for faster repeated builds). Part of Forge IDE.
+reserve=2300; max_cap=2048; min_cap=1500
+info=$(curl -s -m 8 "http://127.0.0.1:${FORGE_PORT:-8765}/api/memcheck?vm=0&host=0&what=a%20Gradle%20build" 2>/dev/null)
+host=$(printf '%s' "$info" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin); print(int(d.get("host_mb") if d.get("host_mb") is not None else -1))
+except Exception: print(-1)')
+vm=$(free -m | awk 'NR==2 {print $7}')
+if [ "$host" -ge 0 ]; then budget=$((host - reserve)); else budget=$max_cap; echo "Forge: the Googlebook's free memory is unknown; using the VM's only."; fi
+[ $((vm - 300)) -lt "$budget" ] && budget=$((vm - 300))
+cap=$budget; [ "$cap" -gt $max_cap ] && cap=$max_cap
+if [ "$cap" -lt $min_cap ]; then
+  echo "Forge: not enough free memory for a Gradle build right now (the Googlebook has ${host} MB free; about $((min_cap + reserve)) MB are needed so that it keeps its 2.3 GB reserve)."
+  echo "Close other apps, switch chats to the GPU engine, or unload the model, then try again."
+  exit 1
+fi
+heap=$((cap - 900))   # room for class metadata, the JIT, the small Gradle client and aapt2 helpers
+jvmargs="-Xmx${heap}m -XX:MaxMetaspaceSize=320m -XX:+UseSerialGC -XX:ReservedCodeCacheSize=160m -Dfile.encoding=UTF-8"
+mode=--no-daemon; [ "${FORGE_GRADLE_DAEMON:-0}" = 1 ] && mode=--daemon
+echo "Forge: Gradle gets ${cap} MB (Java heap ${heap} MB) of the Googlebook's free memory."
+if [ -x ./gradlew ]; then G=./gradlew; else G=gradle; fi
+exec systemd-run --user --scope --quiet -p "MemoryMax=${cap}M" -p MemorySwapMax=0 nice -n 5 \
+  "$G" $mode "-Dorg.gradle.jvmargs=$jvmargs" "$@"

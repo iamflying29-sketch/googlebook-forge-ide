@@ -10,7 +10,8 @@
       else if (k === 'text') n.textContent = v;
       else if (k === 'html') n.innerHTML = v;
       else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
-      else if (v !== null && v !== undefined) n.setAttribute(k, v);
+      else if (v === true) n.setAttribute(k, '');
+      else if (v !== null && v !== undefined && v !== false) n.setAttribute(k, v);   // false means "not set" (disabled, checked, open)
     }
     for (const c of children) if (c !== null && c !== undefined) n.append(c);
     return n;
@@ -128,6 +129,7 @@
     if (name === 'git' && window.ForgeExtras) window.ForgeExtras.loadGit();
     if (name === 'notepads' && window.ForgeExtras) window.ForgeExtras.renderNotepads();
     if (name === 'debug' && window.ForgeDebug) window.ForgeDebug.render();
+    if (name === 'android' && window.ForgeAndroid) window.ForgeAndroid.render();
   }
   Forge.showView = showView;
   for (const b of $$('.act')) b.onclick = () => showView(b.dataset.view);
@@ -696,7 +698,35 @@
 
   // ------------------------------------------------------------------ Tab completions (opt-in)
   let completionSeq = 0;
+  /** Groovy (build.gradle files) is not built into Monaco: a small highlighter for keywords, strings and comments. */
+  function registerGroovy() {
+    const monaco = Forge.monaco;
+    if (monaco.languages.getLanguages().some((l) => l.id === 'groovy')) return;
+    monaco.languages.register({ id: 'groovy', extensions: ['.gradle', '.groovy'], aliases: ['Groovy', 'Gradle'] });
+    monaco.languages.setLanguageConfiguration('groovy', {
+      comments: { lineComment: '//', blockComment: ['/*', '*/'] },
+      brackets: [['{', '}'], ['[', ']'], ['(', ')']],
+      autoClosingPairs: [{ open: '{', close: '}' }, { open: '[', close: ']' }, { open: '(', close: ')' }, { open: "'", close: "'" }, { open: '"', close: '"' }],
+    });
+    monaco.languages.setMonarchTokensProvider('groovy', {
+      keywords: ['def', 'class', 'interface', 'enum', 'trait', 'extends', 'implements', 'import', 'package', 'return', 'if', 'else', 'for', 'while',
+        'switch', 'case', 'default', 'break', 'continue', 'try', 'catch', 'finally', 'throw', 'new', 'in', 'as', 'true', 'false', 'null',
+        'static', 'final', 'public', 'private', 'protected', 'void', 'this', 'super', 'plugins', 'dependencies', 'android', 'repositories', 'apply'],
+      tokenizer: {
+        root: [
+          [/[a-zA-Z_$][\w$]*/, { cases: { '@keywords': 'keyword', '@default': 'identifier' } }],
+          [/\/\/.*$/, 'comment'], [/\/\*/, 'comment', '@comment'],
+          [/"""/, 'string', '@tstring'], [/"([^"\\]|\\.)*"/, 'string'], [/'([^'\\]|\\.)*'/, 'string'],
+          [/\d+(\.\d+)?[lLfFdD]?/, 'number'], [/[{}()[\]]/, '@brackets'],
+        ],
+        comment: [[/[^/*]+/, 'comment'], [/\*\//, 'comment', '@pop'], [/[/*]/, 'comment']],
+        tstring: [[/"""/, 'string', '@pop'], [/./, 'string']],
+      },
+    });
+  }
+
   function registerCompletions() {
+    try { registerGroovy(); } catch (e) { /* highlighting is optional */ }
     const monaco = Forge.monaco;
     monaco.languages.registerInlineCompletionsProvider({ pattern: '**' }, {
       provideInlineCompletions: async (model, position, context, token) => {
@@ -751,6 +781,9 @@
     { label: 'Split editor: open this file to the side', hint: 'Ctrl \\', run: () => window.ForgeSplit && window.ForgeSplit.toggle() },
     { label: 'Markdown: open preview to the side', hint: 'Ctrl Shift V', run: () => window.ForgePreview && window.ForgePreview.toggleMarkdown() },
     { label: 'Add folder to this window (multi-root)', run: () => openFolderModal(null, 'add') },
+    { label: 'Android: open the Android and toolchains view', run: () => showView('android') },
+    { label: 'Android: screenshot of the Googlebook to the chat', run: () => window.ForgeAndroid && window.ForgeAndroid.screenshotToChat() },
+    { label: 'Android: logcat', run: () => window.ForgeAndroid && window.ForgeAndroid.openLogcat('') },
     { label: 'New Jupyter notebook', run: () => window.ForgeNotebook && window.ForgeNotebook.newNotebook() },
     { label: 'Debug: start debugging the open Python file', hint: 'F5', run: () => window.ForgeDebug && window.ForgeDebug.start(false) },
     { label: 'Debug: run without debugging', hint: 'Ctrl F5', run: () => window.ForgeDebug && window.ForgeDebug.start(true) },
@@ -903,6 +936,7 @@
     { key: 'vision_cpu_model', label: 'CPU vision model (Ollama)', type: 'text', hint: 'Used when the GPU is not available, only when memory allows.' },
     { group: 'Editor' },
     { key: 'lsp', label: 'Language servers (code intelligence)', type: 'bool', hint: 'Suggestions, hover information, go to definition, find references, rename and live errors for Python, JavaScript, TypeScript, shell, JSON, CSS, HTML and C or C++. Each language server starts only when you open a file of that language and only when memory allows.' },
+    { key: 'kotlin_project_model', label: 'Kotlin project model', type: 'select', options: ['auto', 'light', 'gradle'], hint: 'How the Kotlin language server learns your project. gradle: a full Gradle import at every start (exact libraries, but a second large Java process; needs about 4.7 GB free on the Googlebook). light: Forge writes the project description itself from your source folders, the JDK, the Kotlin library, android.jar and libraries Gradle already downloaded (about half the memory, 4.1 GB). auto: gradle when there is room, otherwise light.' },
     { key: 'tab_completions', label: 'Tab completions while typing', type: 'bool', hint: 'Slow on CPU; Alt+\\ triggers one manually any time.' },
     { key: 'completion_delay_ms', label: 'Completion delay (ms)', type: 'number' },
     { key: 'font_size', label: 'Editor font size', type: 'number' },

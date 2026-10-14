@@ -9,6 +9,7 @@ import json
 import mimetypes
 import re
 import os
+import subprocess
 import posixpath
 import socket
 import sys
@@ -55,6 +56,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "external_file_protection": True,
     "semantic_index": True,
     "custom_modes": [],
+    "kotlin_project_model": "auto",
     "command_allowlist": [],             # commands starting with these run without asking (unless destructive)
     "command_denylist": [],              # commands starting with these always ask
     "lsp": True,                         # language servers for code intelligence in the editor
@@ -83,7 +85,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 FOLDER_SETTING_KEYS = {"command_allowlist", "command_denylist", "vision", "model", "temperature", "top_p", "top_k", "repeat_penalty", "num_ctx", "num_predict", "thinking",
                        "verbose", "tool_mode", "max_iterations", "auto_approve_commands", "external_file_protection",
                        "repo_map_chars", "tab_completions", "completion_delay_ms", "font_size", "prewarm", "lsp",
-                       "semantic_index", "custom_modes"}
+                       "semantic_index", "custom_modes", "kotlin_project_model"}
 
 MODEL_LOAD_NEED_MB = 5800   # loading llama3.1 8B Q4_K_M needs about 5.2 GB plus headroom
 
@@ -477,10 +479,29 @@ class State:
         m = mem_info()
         if m.get("available_mb", 99999) < vm_need_mb:
             return f"Not enough free memory in the VM for {what} ({m.get('available_mb')} MB free, {vm_need_mb} MB needed)."
-        host = self.vision.app.get("host_mem_mb") if time.time() - self.vision.app_seen < 60 else None
+        host = self.host_free_mb()
         if isinstance(host, (int, float)) and 0 <= host < host_need_mb:
             return f"Not enough free memory on the Googlebook for {what} ({int(host)} MB free, {host_need_mb} MB needed)."
         return None
+
+    def host_free_mb(self) -> Optional[float]:
+        """The Googlebook's free memory: from the Forge app's report, or else read over adb (MemAvailable from
+        /proc/meminfo, a few hundred bytes, with a time limit), cached for 10 seconds. None when neither works."""
+        if time.time() - self.vision.app_seen < 60 and isinstance(self.vision.app.get("host_mem_mb"), (int, float)):
+            return float(self.vision.app["host_mem_mb"])
+        cached = getattr(self, "_host_mem_cache", None)
+        if cached and time.time() - cached[0] < 10:
+            return cached[1]
+        value = None
+        try:
+            r = subprocess.run(["adb", "shell", "grep MemAvailable /proc/meminfo"], capture_output=True, text=True, timeout=5)
+            m = re.search(r"MemAvailable:\s+(\d+)\s+kB", r.stdout or "")
+            if r.returncode == 0 and m:
+                value = int(m.group(1)) / 1024.0
+        except (OSError, subprocess.TimeoutExpired):
+            value = None
+        self._host_mem_cache = (time.time(), value)
+        return value
 
     def model_can_see(self, model: Optional[str]) -> bool:
         """True when an Ollama chat model has its own vision (then images are also passed to it directly)."""
@@ -579,6 +600,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._ws_dap(q)
             if u.path == "/ws/kernel":
                 return self._ws_kernel(q)
+            if u.path == "/ws/logcat":
+                return self._ws_logcat(q)
             if u.path.startswith("/api/"):
                 return self._api_get(u.path, q)
             return self._static(u.path)
@@ -661,7 +684,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             if path not in ("/api/status", "/api/dirs", "/api/events", "/api/run", "/api/engine/config", "/api/engine/model",
                             "/api/engine/status", "/api/settings", "/api/image", "/api/image/analysis", "/api/engine/control",
-                            "/api/engine/vision_file", "/api/vision/status"):
+                            "/api/engine/vision_file", "/api/vision/status", "/api/memcheck", "/api/toolchains"):
                 return self._error(400, f"This window's folder is not available ({e}). Open another folder.")
             folder_missing = str(e)
             ws = st.workspace
@@ -707,6 +730,22 @@ class Handler(BaseHTTPRequestHandler):
                         size = 0
                     items.append({"name": e.name, "path": ws.relpath(e.path), "dir": is_dir, "size": size})
             return self._json(200, {"path": rel, "items": items})
+        if path == "/api/memcheck":
+            # Used by forge-gradle and forge-cargo before a build starts in the terminal.
+            try:
+                vm, host = int(arg("vm", "1000")), int(arg("host", "3000"))
+            except ValueError:
+                return self._error(400, "bad numbers")
+            why = st.small_memory_block(arg("what", "this job")[:80], vm, host)
+            hf = st.host_free_mb()
+            return self._json(200, {"ok": why is None, "reason": why, "host_mb": int(hf) if hf is not None else None,
+                                    "vm_mb": mem_info().get("available_mb")})
+        if path == "/api/toolchains":
+            from . import toolchains
+            return self._json(200, toolchains.status())
+        if path == "/api/android/status":
+            from . import android, toolchains
+            return self._json(200, {"toolchains": toolchains.status(), "devices": android.devices(), "project": android.project_info(ws.root)})
         if path == "/api/roots":
             return self._json(200, {"primary": ws.root, "extra": st.extra_roots(ws.root)})
         if path == "/api/raw":
@@ -1192,6 +1231,26 @@ class Handler(BaseHTTPRequestHandler):
             meta = st.vision.images.save(raw, str(b.get("name") or ""))
             meta["url"] = "/api/image?id=" + meta["id"]
             return self._json(200, meta)
+        if path == "/api/android/connect":
+            from . import android
+            return self._json(200, android.connect())
+        if path == "/api/android/install":
+            from . import android
+            apk = ws.resolve(str(b.get("apk", "")), must_exist=True)
+            if not apk.endswith(".apk"):
+                return self._error(400, "That is not an APK file.")
+            return self._json(200, android.install(apk))
+        if path == "/api/android/launch":
+            from . import android
+            return self._json(200, android.launch(str(b.get("app_id", ""))))
+        if path == "/api/android/screenshot":
+            from . import android
+            png = android.screenshot()
+            if png is None:
+                return self._error(503, "The screenshot failed. Check that adb is connected (Android view, Connect).")
+            meta = st.vision.images.save(png, "googlebook-screen.png")
+            meta["url"] = "/api/image?id=" + meta["id"]
+            return self._json(200, meta)
         if path == "/api/replace":
             import fnmatch
             q = str(b.get("q", ""))
@@ -1340,15 +1399,27 @@ class Handler(BaseHTTPRequestHandler):
             img_id = str(b.get("id", ""))
             question = str(b.get("question") or "").strip()
             notes: list = []
+            activity: list = []
             t0 = time.time()
+
+            def ev(kind: str, **d: Any) -> None:
+                # The same live events a chat receives; deltas are summarized to keep the reply small.
+                if kind == "vision_delta":
+                    if activity and activity[-1].get("kind") == "vision_delta":
+                        activity[-1]["chunks"] += 1
+                    else:
+                        activity.append({"kind": "vision_delta", "chunks": 1, "t": round(time.time() - t0, 1)})
+                    return
+                activity.append({"kind": kind, "t": round(time.time() - t0, 1), **d})
             if question:
                 found = st.vision.images.find(img_id)
                 if not found:
                     return self._error(404, "no such image")
-                answer, source = st.vision.ask(found[0], found[1], question, settings, notes.append)
-                return self._json(200, {"answer": answer, "source": source, "notes": notes, "seconds": round(time.time() - t0, 1)})
-            res = st.vision.analyze(img_id, settings, notes.append)
-            return self._json(200, {**res, "notes": notes, "seconds": round(time.time() - t0, 1)})
+                answer, source = st.vision.ask(found[0], found[1], question, settings, notes.append, ev)
+                return self._json(200, {"answer": answer, "source": source, "notes": notes, "activity": activity,
+                                        "seconds": round(time.time() - t0, 1)})
+            res = st.vision.analyze(img_id, settings, notes.append, ev)
+            return self._json(200, {**res, "notes": notes, "activity": activity, "seconds": round(time.time() - t0, 1)})
         if path == "/api/vision/stop":
             st.vision.holds = 0
             st.vision.release()
@@ -1545,19 +1616,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         lang = q.get("lang", [""])[0][:20]
 
-        def memory_ok() -> Optional[str]:
-            m = mem_info()
-            if m.get("available_mb", 99999) < lsp.LSP_MIN_VM_MB:
-                return f"Not enough free memory in the VM for a language server ({m.get('available_mb')} MB free)."
-            host = st.vision.app.get("host_mem_mb") if time.time() - st.vision.app_seen < 60 else None
-            if isinstance(host, (int, float)) and 0 <= host < lsp.LSP_MIN_HOST_MB:
-                return f"Not enough free memory on the Googlebook for a language server ({int(host)} MB free)."
-            return None
+        def memory_ok(vm_need: int = lsp.LSP_MIN_VM_MB, host_need: int = lsp.LSP_MIN_HOST_MB) -> Optional[str]:
+            return st.small_memory_block(f"the {lang} language server", vm_need, host_need)
 
         sock = handshake(self)
         if sock is None:
             return
-        lsp.serve(sock, lang, folder, memory_ok, os.path.join(DATA_DIR, "logs"))
+        lsp.serve(sock, lang, folder, memory_ok, os.path.join(DATA_DIR, "logs"),
+                  kotlin_pref=str(st.effective_settings(folder).get("kotlin_project_model", "auto")),
+                  host_free_mb=st.host_free_mb() if lang == "kotlin" else None)
 
     def _ws_dap(self, q: Dict[str, list]) -> None:
         """The debugger for this window: the browser speaks the Debug Adapter Protocol to debugpy."""
@@ -1577,8 +1644,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         import importlib.util
         cmd = [sys.executable, "-m", "debugpy.adapter"] if importlib.util.find_spec("debugpy") else None
-        lsp.serve(sock, "python", folder, lambda: st.small_memory_block("the debugger", 600, 2200),
-                  os.path.join(DATA_DIR, "logs"), cmd=cmd, what="debugger (debugpy)")
+        lsp.serve(sock, "python", folder, lambda vm, host: st.small_memory_block("the debugger", vm, host),
+                  os.path.join(DATA_DIR, "logs"), cmd=cmd, what="debugger (debugpy)", cap="1G", needs=(700, 3300))
 
     def _ws_kernel(self, q: Dict[str, list]) -> None:
         """A notebook window's connection to its Python kernel."""
@@ -1641,6 +1708,28 @@ class Handler(BaseHTTPRequestHandler):
             if kernel is not None:
                 kernel.listeners.discard(listener)
             listener.close()
+            sock.close()
+
+    def _ws_logcat(self, q: Dict[str, list]) -> None:
+        """A live logcat for the Android view; it ends when the window closes or at its limits."""
+        from .android import Logcat
+        if not _origin_ok(self):
+            self.send_response(403); self.send_header("Content-Length", "0"); self.end_headers()
+            return
+        sock = handshake(self)
+        if sock is None:
+            return
+        lc = Logcat(sock.send_text, q.get("app_id", [""])[0][:200], q.get("level", ["V"])[0][:1])
+        try:
+            lc.run()
+            while True:
+                op, _data = sock.recv()
+                if op == 8:
+                    break
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            lc.stop()
             sock.close()
 
     def _ws_terminal(self, q: Dict[str, list]) -> None:

@@ -45,7 +45,7 @@ while kill -0 "$parent" 2>/dev/null && kill -0 "$child" 2>/dev/null; do sleep 3 
 kill $child 2>/dev/null; wait $child
 """
 EMBED_MIN_VM_MB = 700
-EMBED_MIN_HOST_MB = 2300
+EMBED_MIN_HOST_MB = 2600      # about 300 MB for the server plus the 2.3 GB the Googlebook keeps free
 
 
 def available() -> bool:

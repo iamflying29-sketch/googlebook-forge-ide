@@ -1,4 +1,4 @@
-# Forge IDE Manual (version 1.4)
+# Forge IDE Manual (version 1.5)
 
 Forge is a Cursor-style AI coding IDE that runs entirely on your Lenovo Googlebook 15. The editor, the agent, the terminal and the models all live on the laptop, and nothing you type leaves it. This manual explains every part of it.
 
@@ -10,6 +10,7 @@ Forge is a Cursor-style AI coding IDE that runs entirely on your Lenovo Googlebo
 - **Forge GPU engine**: the same Llama 3.1 weights on the Intel graphics, through llama.cpp's Vulkan backend, inside the Forge app.
 - **The vision model**: Qwen3-VL, which looks at screenshots for Llama. It runs on the Intel graphics in the Forge app (4B, or 2B when memory is tighter), or on the CPU in the VM as a fallback. Text recognition (tesseract) reads the words in every image.
 - **Helpers that start only when needed**: language servers for code intelligence, the Python debugger, notebook kernels, a small embedding model for the codebase index, and whisper.cpp for voice input in a browser. Each one starts when you use its feature, only when memory allows, and stops again when it is no longer used.
+- **Toolchains**: the Android SDK, Kotlin, Gradle, Java 21 and Rust, ready in Forge's terminal and for the agent (see section 15).
 
 ## 2. Starting and stopping
 
@@ -40,10 +41,10 @@ Every Forge window has its own folder, like a window in Cursor. The folder name 
 ## 4. The layout
 
 - **Title bar**: folder name, new window, search (Ctrl P), the window's default model, and buttons for the sidebar, the terminal and the AI panel.
-- **Activity bar**: Explorer, Search, AI Changes, Source control, Run and Debug, Notepads, Chats, Settings.
+- **Activity bar**: Explorer, Search, AI Changes, Source control, Run and Debug, Android and toolchains, Notepads, Chats, Settings.
 - **Editor**: the Monaco editor from VS Code, with code intelligence from language servers. Ctrl S saves. Ctrl \ splits the editor into two panes.
-- **Bottom panel**: Terminal (several bash tabs), Agent log, Problems (with a count of errors and warnings), Debug console.
-- **AI panel**: the chat, with a tab for each open chat. Drag the gutters to resize; the layout is remembered.
+- **Bottom panel**: Terminal (several bash tabs), Agent log, Problems (with a count of errors and warnings), Debug console, Logcat.
+- **AI panel**: the chat, with a tab for each open chat and, while a reply is written, a bar showing what Llama and the vision model are doing. Drag the gutters to resize; the layout is remembered.
 - **Status bar**: engine state, free memory of the VM and of the Googlebook, the codebase index, files waiting for review, the debugger state, speed, context use, cursor position and the Tab completion state.
 
 ## 5. Working with the agent
@@ -81,7 +82,7 @@ Type **@** in the input box (or click "@ Add context") for the context menu:
 
 - **Files** and **folders** of the project (a folder adds its file list and its most relevant code).
 - **codebase**: the most relevant code of the whole project, found by meaning and by keywords.
-- **docs**: a documentation site you indexed (see section 15). "add new documentation…" indexes a new one.
+- **docs**: a documentation site you indexed (see section 17). "add new documentation…" indexes a new one.
 - **chat**: the questions and answers of an earlier chat of this folder, without its tool output.
 - **web**: web search results for your message.
 - **git**: your uncommitted changes.
@@ -104,16 +105,24 @@ Typing @codebase, @web, @git or @terminal by hand works too. **Ctrl L** adds the
 - When there is not enough free memory for the vision model, Forge uses text recognition only and says so in the panel.
 - The Images section in Settings chooses: auto (GPU, then CPU, then text recognition), gpu, cpu, or ocr (text recognition only).
 
-## 9. Voice input
+## 9. Watching Llama and the vision model work together
+
+Llama 3.1 cannot see images, so Forge pairs it with a vision model. You can watch every step in the chat.
+
+- **The model bar** under the chat tabs shows what each model is doing right now while a reply is written, for example "Llama 3.1: Writing · 6.2 tok/s" or "Qwen3-VL 4B: Looking at the image · 12 s". A green dot means it is working, yellow means it is waiting or paused, and red means it failed or was skipped. Text recognition appears there too while it reads an image.
+- **Conversation cards** show each exchange between the models. When you attach a screenshot, the card says "Forge asks Qwen3-VL 4B to describe image 1 for Llama 3.1". When Llama needs more detail, it says "Llama 3.1 asks Qwen3-VL 4B" with Llama's own question. The vision model's answer streams into the card word by word. The card shows the image, how long the look took and what text recognition read, and it ends with what Llama does with the answer.
+- **"How the models worked"** at the top of a reply is a timeline of every step with its time. It covers Llama reading, thinking, writing and calling tools; text recognition; and the vision model starting, loading, looking and answering. It also shows the handoff of the Intel GPU: Llama's GPU engine pauses so the vision model can use the GPU, and it resumes afterwards. The title sums up how long each model was busy. The timeline is saved with the chat, so you can open it again later.
+
+## 10. Voice input
 
 Click the microphone button in the AI panel (or press Ctrl Shift Space) and speak. Click it again when you are done.
 
 - **In the Forge app**, Forge uses Android's own speech recognizer, the same Google speech service the Googlebook uses elsewhere. You see the words appear while you speak, short pauses do not stop it, and it stops by itself after three minutes. The first time, Android asks whether Forge may use the microphone. The microphone also turns off when you minimize or close the Forge window.
 - **In a browser**, Forge records your voice and whisper.cpp turns it into text inside the VM after you click the button again. This needs the voice part of `install-extras.sh`.
 
-## 10. Editing
+## 11. Editing
 
-- **Code intelligence**: language servers give suggestions as you type, information when you point at a name, go to definition (F12 or Ctrl click), find references, rename (F2), formatting, quick fixes and live errors, for Python, JavaScript, TypeScript, shell, JSON, CSS, HTML and C or C++. A server starts when you open a file of its language and stops when the window closes. Settings, Editor, Language servers turns them off.
+- **Code intelligence**: language servers give suggestions as you type, information when you point at a name, go to definition (F12 or Ctrl click), find references, rename (F2), formatting, quick fixes and live errors, for Python, JavaScript, TypeScript, shell, JSON, CSS, HTML, XML, C or C++, Kotlin, Java and Rust. A server starts when you open a file of its language and stops when the window closes. Settings, Editor, Language servers turns them off.
 - **Ctrl K** on a selection: describe the change, review the diff, Ctrl Enter accepts, Esc rejects.
 - **Tab completions** are off by default; Alt \ asks for one, and the Tab chip in the status bar turns them on.
 - **Right-click** in the editor: Add selection to chat, Edit with AI, Explain, Fix problems. Right-click on a tab or a file in the Explorer: Open to the side.
@@ -122,7 +131,7 @@ Click the microphone button in the AI panel (or press Ctrl Shift Space) and spea
 - **Images** open in an image viewer. Click the image to switch between fitting the window and actual size.
 - **Search and replace**: the Search view finds text in all files of the window (with a file filter and regular expressions). Type a replacement and click "Replace all". Forge shows how many matches in which files before it changes anything, and the change can be undone from AI Changes.
 
-## 11. Reviewing and undoing
+## 12. Reviewing and undoing
 
 - **In the editor**: files the agent changed are highlighted like in Cursor. Added lines are green and removed lines are shown in red above them, with **Keep** and **Undo** buttons for each change. A bar at the bottom right shows the number of changes with ‹ and › to step through them, **Keep all** and **Undo all**. Undo puts the old lines back and saves the file; Ctrl Z brings the change back. The status bar shows how many files are still waiting for review; click it to open the next one. "Review in editor" under a reply starts a review of all files that reply changed.
 - **File chips** under a reply open a side-by-side diff with Keep and Revert. **Revert all** under a reply undoes every file change of that reply.
@@ -131,7 +140,7 @@ Click the microphone button in the AI panel (or press Ctrl Shift Space) and spea
 - Files the agent removes go to `.forge-trash` inside the project, or to `~/.forge-ide/trash` outside it. Nothing is deleted outright.
 - Every save and agent edit runs a syntax check, and the language servers check open files as you type. Problems lists both, with Open, Fix with AI for each problem, and Fix all with AI.
 
-## 12. Debugging Python
+## 13. Debugging Python
 
 Open the **Run and Debug** view (the play icon in the activity bar).
 
@@ -143,7 +152,7 @@ Open the **Run and Debug** view (the play icon in the activity bar).
 
 "Run without debugging" (Ctrl F5) runs the file with its output in the Debug console. The debugger is debugpy; it needs `python3-debugpy` (`install-extras.sh debug`). Stopping a session also stops the program and everything it started.
 
-## 13. Notebooks
+## 14. Notebooks
 
 Jupyter notebooks (`.ipynb` files) open as cells, like in Cursor.
 
@@ -151,10 +160,22 @@ Jupyter notebooks (`.ipynb` files) open as cells, like in Cursor.
 - **Output** appears under each cell: printed text, the value of the last line, tables (for example from pandas), images (matplotlib figures are shown automatically) and errors. An error has a **Fix with AI** button that sends the cell and the error to the agent.
 - **Markdown cells** show formatted text; double-click to edit, Shift Enter to finish.
 - Point at a cell for ▲ and ▼ (move), M or { } (switch between Markdown and code) and ✕ (delete). The toolbar adds cells, interrupts a running cell, restarts the kernel and clears all output.
-- The **kernel** is a Python process that keeps your variables between cells. It starts when you run the first cell, keeps running while the notebook is open (also across reloads), and stops after 10 minutes without an open window or 30 minutes without use. It runs inside its own 2 GB memory limit, so a cell that uses too much memory stops the kernel instead of the system.
+- The **kernel** is a Python process that keeps your variables between cells. It starts when you run the first cell, keeps running while the notebook is open (also across reloads), and stops after 10 minutes without an open window or 30 minutes without use. It runs inside its own 1.5 GB memory limit, so a cell that uses too much memory stops the kernel instead of the system, and it starts only when that much memory plus the Googlebook's 2.3 GB reserve is free.
 - The notebook is still a normal file: Ctrl S saves it with its outputs, and "{ } JSON" shows the file itself. "New Jupyter notebook" in the command palette creates one.
 
-## 14. The codebase index
+## 15. Android, Kotlin, Java and Rust
+
+- **Toolchains**: the Android SDK (platforms 35, 36 and 36.1; build-tools 35, 36.1 and 37; NDK 29; CMake 4.1.2; sdkmanager, avdmanager, lint, apkanalyzer, aapt2, d8, apksigner and zipalign), bundletool, the Kotlin compiler 2.4.21, Gradle 9.8.1, Java 21 and Rust 1.99 (cargo, clippy and rustfmt) are on the PATH in Forge's terminal and for the agent.
+- **Code intelligence**: Kotlin (JetBrains' Kotlin language server, with its data sharing set to none, so it sends nothing), Java (Eclipse JDT), XML for AndroidManifest and layout files (LemMinX) and Rust (rust-analyzer) get suggestions, hover, go to definition, references, rename, formatting and live errors, like the other languages. `build.gradle.kts` files are Kotlin, and `build.gradle` files get Groovy highlighting.
+- **The Android view** (the Android icon in the activity bar) shows the device and the toolchains, with Connect, Screenshot to chat and Logcat. In an Android project it adds Build, install and run; Build debug APK; Install; Run; App logcat; Lint; Unit tests; and Release bundle (AAB). In a Rust project it adds cargo check, build, run, test and clippy. Builds run in a terminal tab, so you can watch them and stop them with Ctrl C.
+- **The device is your Googlebook**, over Wireless debugging. The Linux VM has no virtualization support, so there is no emulator. Forge uses Debian's adb, the same one your other Googlebook tools use, and installs apps with `adb install` instead of Gradle's installDebug, because a second adb version could stop the adb server those tools rely on.
+- **Screenshot to chat** attaches what the Googlebook shows, so the vision model can look at your running app for Llama. The agent does the same by itself in Android projects: it builds, installs and starts the app, takes a screenshot, asks the vision model what the app shows, and reads the error log.
+- **Logcat** in the bottom panel shows the log live, colored by level, for the whole device or one app, with a text filter and Add to chat. It stops by itself after 15 minutes or 20 MB.
+- **Builds and memory**: `forge-gradle` and `forge-cargo` (used by the Android view, and applied automatically to the agent's Gradle, Cargo and kotlinc commands) size every build to the free memory. A Gradle build gets the Googlebook's free memory above its 2.3 GB reserve as a hard cap (at most 2 GB, at least 1.5 GB, so it needs about 3.8 GB free), and Gradle's Java heap is scaled to fit well inside that cap, so a build that needs more memory stops with Gradle's own message instead of being killed. Builds run without a lingering Gradle daemon, so their memory is returned as soon as they finish; `FORGE_GRADLE_DAEMON=1 forge-gradle ...` keeps the daemon for faster repeated builds. `~/.gradle/gradle.properties` also limits Gradle when you run it yourself: a 1 GB heap, Kotlin compiled inside the Gradle process, two workers, and a daemon that stops after 15 idle minutes. Cargo uses three parallel jobs.
+- **Language servers for Kotlin, Java and Rust** are large programs. Each starts only with enough free memory and runs inside a memory cap: on the Googlebook, 3.8 GB free for Java and Rust and 4.1 GB for Kotlin.
+- **The Kotlin project model** (Settings, Editor). JetBrains' Kotlin server normally runs a Gradle import every time it starts in a Gradle project, which adds a second large Java process. In **light** mode Forge writes the project description itself, in its own cache folder (your project is not touched): the source folders of each module, the JDK, the Kotlin library, android.jar for Android modules, jars in libs folders, and the libraries your build files name when Gradle has already downloaded them. The server then needs about half the memory and starts in seconds, with full error checking, also for loose Kotlin files. **gradle** mode uses the full Gradle import, with every library exactly as Gradle resolves it, and needs 4.7 GB free. **auto** (the default) uses the Gradle import when there is room for it and light mode otherwise. If light mode reports a library as missing, build the project once (so Gradle downloads it) or switch to gradle mode. When memory is short, Forge says so once, and the server starts when you reopen the file later with more memory free.
+
+## 16. The codebase index
 
 Forge turns your code into embedding vectors with nomic-embed-text, a small embedding model, so codebase search and @codebase find code by what it does, not only by the words in it. Results are blended with keyword ranking.
 
@@ -163,7 +184,7 @@ Forge turns your code into embedding vectors with nomic-embed-text, a small embe
 - The embedding model runs in its own small llama.cpp server (about 250 MB), never in Ollama, so it never pushes Llama out of memory. It stops after two idle minutes.
 - Settings, Codebase index shows the state and has Index now and Pause. Settings, Agent, Codebase index turns it off, also per folder.
 
-## 15. Memories, rules, docs, hooks and more
+## 17. Memories, rules, docs, hooks and more
 
 - **Memories**: when you tell the agent something lasting ("always use tabs", "my server runs on Debian"), it offers to remember it. You see the memory, can edit it, and choose Save or Do not save. Memories are added to every chat, globally or for this project. Settings, Memories lists, edits and removes them.
 - **Rules for the AI**: global rules and project rules in Settings (`~/.forge-ide/rules.md` and `.forge/rules.md`); `.cursorrules`, `AGENTS.md` and `CLAUDE.md` are read too. Cursor's rule folder works as well: Markdown files in `.cursor/rules` or `.forge/rules` with a small header. `alwaysApply: true` rules are always followed, rules with `globs` are added when a matching file is attached, and rules with only a `description` are listed so the agent reads them when they are relevant.
@@ -175,15 +196,15 @@ Forge turns your code into embedding vectors with nomic-embed-text, a small embe
 - **MCP servers** in Settings: their tools run only after your approval.
 - **Terminal Ctrl K**: plain English in, a command pasted into the terminal for you to run.
 
-## 16. Working outside the project folder
+## 18. Working outside the project folder
 
 The agent may read and change files anywhere on the computer with absolute or ~ paths, for example `/mnt/shared/Documents` (your Documents folder). With **External-file protection** on (Settings, Agent), it asks before changing a file outside the project; the approval card shows the path and the change. System files (for example in /etc or /usr) and keys (for example ~/.ssh) always ask, even with protection off. You can open any file yourself by typing its path in quick open (Ctrl P), for example `/etc/hostname`.
 
-## 17. Settings: User and Folder
+## 19. Settings: User and Folder
 
 The Settings view has two tabs. **User** settings apply to every folder. **Folder** settings override them for the current folder only and are saved in `.forge/settings.json` inside it. A setting without an override says "(from User)", and an override has a Reset link. Engine, connection and memory settings are machine-wide and only appear under User. Below the settings are the cards for the GPU engine, the codebase index, custom modes, the command lists, memories, docs, hooks, rules and MCP servers.
 
-## 18. The GPU engine
+## 20. The GPU engine
 
 **Start it**: Forge app, Settings, the GPU engine card, Start engine. The first start downloads the model weights once (4.9 GB). The app asks the VM to hand memory back, waits until the free-memory check passes, loads the model and reports "running". A notification with a Stop engine button stays visible.
 
@@ -193,7 +214,7 @@ The Settings view has two tabs. **User** settings apply to every folder. **Folde
 
 If the GPU engine is not running, a chat tells you so instead of loading the 5 GB CPU model by itself. Start the engine, or pick an Ollama model.
 
-## 19. Memory safety
+## 21. Memory safety
 
 The Googlebook has 16 GB for Android, the VM and the models together. If it runs out, Android closes apps, and if it closes the Terminal app, the VM goes with it. Forge's rules:
 
@@ -201,12 +222,12 @@ The Googlebook has 16 GB for Android, the VM and the models together. If it runs
 - Only one model is on the GPU at a time. The vision model and Llama take turns.
 - When a GPU model stops, the graphics driver keeps its memory for reuse, and Android does not show it as free. Forge accounts for that only within 15 minutes of its own GPU use. After a long pause, the engine may wait for memory; closing heavy apps helps, and restarting the Googlebook clears it.
 - In the VM, the CPU model loads only with about 5.8 GB free in the VM and, when the Forge app can report it, on the Googlebook too. A watchdog unloads models under 320 MB free in the VM. Switching a chat to a different Ollama model is refused when there is no room for it.
-- The helpers check memory before they start: language servers, the debugger, notebook kernels, the embedding server and speech recognition each need free memory in the VM and on the Googlebook. Notebook kernels run inside a 2 GB limit. Helpers stop when they are not used, and the embedding server stops by itself if the Forge server ever stops.
+- The helpers check memory before they start, and helpers that run inside a memory cap start only when the Googlebook has the cap plus its 2.3 GB reserve free, so even a helper that grows to its cap cannot push the Googlebook below the reserve. The caps: the debugged program 1 GB, a notebook kernel 1.5 GB, the Kotlin language server 1.8 GB (2.4 GB with a full Gradle import), the Java and Rust language servers 1.5 GB, and builds whatever is free above the reserve, up to 2 GB. Helpers stop when they are not used, and the embedding server stops by itself if the Forge server ever stops.
 - The command palette has Unload the model from memory.
 
 Do not run Waydroid, a second model or a large build at the same time as a model.
 
-## 20. Keyboard shortcuts
+## 22. Keyboard shortcuts
 
 | Keys | Action |
 | --- | --- |
@@ -242,11 +263,11 @@ Do not run Waydroid, a second model or a large build at the same time as a model
 | Alt \ | Ask for a completion |
 | Ctrl R (in the app) | Reload the IDE |
 
-## 21. Where things are
+## 23. Where things are
 
-Code in `~/projects/forge-ide`; data in `~/.forge-ide/` (settings, chats, checkpoints, images, attachments, memories, docs, hooks, commands, the codebase index, notepads, rules and models); folder settings, rules, memories and hooks in `.forge/` inside each folder; the app and this manual in Documents/Forge; exported chats in Documents/Forge/Chats; language servers in `~/.local/lib/forge-lsp`; whisper.cpp in `~/.local/lib/forge-voice`; the embedding server in `~/.local/lib/forge-embed`; the engine build in `~/tools/gpu-build`; Ollama tuning in `/etc/systemd/system/ollama.service.d/forge-tuning.conf`; helper logs in `~/.forge-ide/logs`.
+Code in `~/projects/forge-ide`; data in `~/.forge-ide/` (settings, chats, checkpoints, images, attachments, memories, docs, hooks, commands, the codebase index, notepads, rules and models); folder settings, rules, memories and hooks in `.forge/` inside each folder; the app and this manual in Documents/Forge; exported chats in Documents/Forge/Chats; language servers in `~/.local/lib/forge-lsp`; whisper.cpp in `~/.local/lib/forge-voice`; the embedding server in `~/.local/lib/forge-embed`; the Kotlin, Java and XML language servers, the Kotlin compiler, Gradle, bundletool, forge-gradle and forge-cargo in `~/.local/lib/forge-android`; Rust in `~/.cargo` and `~/.rustup`; the Android SDK in `~/tools/android-sdk`; Gradle's memory settings in `~/.gradle/gradle.properties`; language server caches in `~/.forge-ide/lsp-cache`; the engine build in `~/tools/gpu-build`; Ollama tuning in `/etc/systemd/system/ollama.service.d/forge-tuning.conf`; helper logs in `~/.forge-ide/logs`.
 
-## 22. Troubleshooting
+## 24. Troubleshooting
 
 - **Waiting screen**: the VM or server is not up. Open the Terminal app, wait, Retry, or `forge-ide status`.
 - **Ollama offline**: `sudo systemctl restart ollama`.
@@ -255,12 +276,16 @@ Code in `~/projects/forge-ide`; data in `~/.forge-ide/` (settings, chats, checkp
 - **A screenshot gets only text recognition**: the vision model did not fit in free memory, or the Forge app is not running. The panel under the image says why.
 - **"Not enough free memory"** for the CPU model or a helper: close other programs, or use Unload, then retry.
 - **No suggestions or hover in the editor**: the language server for that language is not installed (`install-extras.sh lsp`), memory was short when the file opened, or Language servers is off in Settings. Reopen the file after fixing it.
+- **The Terminal app says the Linux VM is low on memory and suggests more RAM**: the Terminal counts every out-of-memory stop inside the VM, including the deliberate ones, when a helper reaches its memory cap and is stopped. Helpers are sized to stay well below their caps, so this should be rare. If it happens, the helper's feature stops (a build fails, or code intelligence for one language ends), and nothing else is affected. Reopening the file or running the build again with more memory free continues.
+- **"Not enough free memory" for a build**: a build needs at least 1.5 GB above the Googlebook's 2.3 GB reserve (about 3.8 GB free). Close other apps, use the GPU engine (which takes the model out of the VM), or unload the model.
+- **No device in the Android view**: click Connect. If that fails, check that Wireless debugging is on.
+- **Kotlin code intelligence does not start**: it needs 4.1 GB free on the Googlebook (4.7 GB in gradle mode). Forge says so once; reopen the file when more memory is free. The first start in a project takes longer while it reads the project and the libraries.
 - **The microphone does nothing in the app**: allow the microphone for Forge in Android's settings (Apps, Forge, Permissions).
 - **The index stays at "Index waiting"**: memory was short; it continues by itself when memory is free again. Settings, Codebase index shows the reason.
 - **A notebook says the kernel stopped**: a cell used more than 2 GB of memory, or the kernel was idle for a long time. Run a cell to start a new kernel; variables need to be computed again.
 - **The agent seems confused by earlier parts of a long chat**: start a new chat (Ctrl N), use /reset, or Restore checkpoint on an earlier message.
 - **A bad agent change**: Undo in the editor, Revert all under the reply, Restore checkpoint, or AI Changes.
 
-## 23. Updating Forge
+## 25. Updating Forge
 
-Edit the code, then `forge-ide restart`. For the app, `android/build.sh` and `adb install -r android/Forge.apk`. For the model file, edit `model/Modelfile` and run `forge-ide model`. For the optional parts, run `install-extras.sh` again with the part's name.
+Edit the code, then `forge-ide restart`. For the app, `android/build.sh` and `adb install -r android/Forge.apk`. For the model file, edit `model/Modelfile` and run `forge-ide model`. For the optional parts, run `install-extras.sh` again with the part's name (`lsp`, `debug`, `docs`, `voice`, `index`, `android` or `rust`).

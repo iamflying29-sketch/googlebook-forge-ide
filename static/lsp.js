@@ -10,12 +10,15 @@
     python: ['python', 'python'], javascript: ['javascript', 'javascript'], typescript: ['typescript', 'typescript'],
     shell: ['shell', 'shellscript'], json: ['json', 'json'], css: ['css', 'css'], scss: ['scss', 'scss'], less: ['less', 'less'],
     html: ['html', 'html'], c: ['c', 'c'], cpp: ['cpp', 'cpp'], go: ['go', 'go'], rust: ['rust', 'rust'], java: ['java', 'java'],
+    kotlin: ['kotlin', 'kotlin'], xml: ['xml', 'xml'],
   };
   const clients = new Map();       // server key -> Client
   const registered = new Set();    // monaco language ids with providers
   const unavailable = new Set();   // server keys that failed to start this session
+  const retryAfter = new Map();    // server key -> time after which a memory-refused server may be tried again
+  const told = new Set();
   const attached = new Map();      // model uri -> { model, client, version, timer, disposer }
-  L.status = () => [...clients.values()].map((c) => ({ lang: c.key, ready: c.isReady, command: c.command }));
+  L.status = () => [...clients.values()].map((c) => ({ lang: c.key, ready: c.isReady, command: c.command, mode: c.mode || '' }));
 
   // ------------------------------------------------------------------ helpers
   const M = () => F.monaco;
@@ -112,8 +115,16 @@
       });
     }
     async onMessage(msg) {
-      if (msg.forge === 'ready') { this.command = msg.command; this.initialize(); return; }
-      if (msg.forge === 'error') { unavailable.add(this.key); log('language server: ' + msg.message); this._rej(new Error(msg.message)); return; }
+      if (msg.forge === 'ready') { this.command = msg.command; this.mode = msg.mode || ''; if (msg.mode) log(this.key + ' language server: ' + msg.mode); this.initialize(); return; }
+      if (msg.forge === 'error') {
+        log('language server: ' + msg.message);
+        if (/memory/i.test(msg.message)) {
+          // Refused to protect memory: say so once, and try again when a file of this language is opened later.
+          retryAfter.set(this.key, Date.now() + 60000);
+          if (!told.has(this.key)) { told.add(this.key); F.toast(msg.message + ' Code intelligence for this language starts when you reopen the file with more memory free.', 'error', 9000); }
+        } else unavailable.add(this.key);
+        this._rej(new Error(msg.message)); return;
+      }
       if (msg.forge) return;
       if (msg.id !== undefined && !msg.method) {
         const p = this.pending.get(msg.id);
@@ -124,6 +135,7 @@
         let result = null;
         try {
           if (msg.method === 'workspace/configuration') result = (msg.params.items || []).map(() => null);
+          else if (msg.method === 'workspace/diagnostic/refresh') { setTimeout(() => { for (const st of attached.values()) if (st.client === this) pull(st); }, 300); }
           else if (msg.method === 'workspace/applyEdit') result = { applied: await applyEdit(msg.params.edit) };
           else if (msg.method === 'workspace/workspaceFolders') result = [{ uri: folderUri(), name: F.folderName(F.folder) }];
         } catch (e) { result = null; }
@@ -149,6 +161,7 @@
               references: {}, documentSymbol: { hierarchicalDocumentSymbolSupport: true }, formatting: {}, rangeFormatting: {},
               rename: { prepareSupport: false }, codeAction: { codeActionLiteralSupport: { codeActionKind: { valueSet: ['quickfix', 'refactor', 'source'] } } },
               publishDiagnostics: { relatedInformation: false },
+              diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
             },
             workspace: { applyEdit: true, workspaceFolders: true, configuration: true },
           },
@@ -166,6 +179,7 @@
     const entry = LANGS[monacoLang];
     if (!entry || unavailable.has(entry[0]) || F.settings.lsp === false) return null;
     let c = clients.get(entry[0]);
+    if ((!c || c.dead) && (retryAfter.get(entry[0]) || 0) > Date.now()) return null;
     if (!c || c.dead) { c = new Client(entry[0]); clients.set(entry[0], c); }
     registerProviders(monacoLang);
     return c;
@@ -183,6 +197,7 @@
     attached.set(key, st);
     c.notify('textDocument/didOpen', { textDocument: { uri: key, languageId: LANGS[lang][1], version: 1, text: model.getValue() } });
     st.disposer = model.onDidChangeContent(() => { clearTimeout(st.timer); st.timer = setTimeout(() => flush(st), 250); });
+    pullSoon(st, 400);
   };
   function flush(st) {
     if (!st.timer && st.flushed) return;
@@ -190,14 +205,33 @@
     if (st.model.isDisposed()) return;
     st.version++;
     st.client.notify('textDocument/didChange', { textDocument: { uri: st.model.uri.toString(), version: st.version }, contentChanges: [{ text: st.model.getValue() }] });
+    pullSoon(st, 700);
+  }
+  /** Servers like the Kotlin server send errors only when asked (pull diagnostics, LSP 3.17). */
+  function pullSoon(st, ms) {
+    if (!st.client.caps.diagnosticProvider) return;
+    clearTimeout(st.pullTimer);
+    st.pullTimer = setTimeout(() => pull(st), ms);
+  }
+  async function pull(st) {
+    if (!st.client.caps.diagnosticProvider || st.model.isDisposed() || st.pulling) { if (st.pulling) st.pullAgain = true; return; }
+    st.pulling = true;
+    const uri = st.model.uri.toString();
+    try {
+      const r = await st.client.request('textDocument/diagnostic', { textDocument: { uri }, previousResultId: st.resultId || undefined }, 120000);
+      if (r && r.resultId) st.resultId = r.resultId;
+      if (r && r.kind !== 'unchanged' && Array.isArray(r.items)) diagnostics(st.client, { uri, diagnostics: r.items });
+    } catch (e) { /* the server may still be indexing; the next edit asks again */ }
+    st.pulling = false;
+    if (st.pullAgain) { st.pullAgain = false; pullSoon(st, 300); }
   }
   function sync(model) { const st = attached.get(model.uri.toString()); if (st && st.timer) flush(st); return st; }
-  L.saved = (model) => { const st = sync(model); if (st) st.client.notify('textDocument/didSave', { textDocument: { uri: model.uri.toString() } }); };
+  L.saved = (model) => { const st = sync(model); if (st) { st.client.notify('textDocument/didSave', { textDocument: { uri: model.uri.toString() } }); pullSoon(st, 300); } };
   L.detach = (model) => {
     const key = model.uri.toString();
     const st = attached.get(key);
     if (!st) return;
-    clearTimeout(st.timer);
+    clearTimeout(st.timer); clearTimeout(st.pullTimer);
     if (st.disposer) st.disposer.dispose();
     st.client.notify('textDocument/didClose', { textDocument: { uri: key } });
     attached.delete(key);

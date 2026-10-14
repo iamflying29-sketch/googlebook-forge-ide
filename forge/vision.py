@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from .images import VISION_PROMPT, ImageStore, describe_with_vision, run_ocr, sniff
+from .images import VISION_PROMPT, ImageStore, run_ocr, sniff
 from .llamacpp_client import LlamaCppClient
 from .ollama_client import OllamaError
 
@@ -37,6 +37,10 @@ TIERS = [
 ]
 
 
+def _noop(*_a: Any, **_k: Any) -> None:
+    return None
+
+
 class VisionManager:
     def __init__(self, state: Any, data_dir: str):
         self.st = state
@@ -49,6 +53,10 @@ class VisionManager:
         self.app_report_ts = 0.0                # when the app last reported a vision state change
         self.busy = threading.Lock()            # one look at a time: the GPU and memory are shared
         self.holds = 0                          # while > 0 the vision model stays loaded (several images in one message)
+        # Live activity for the chat (model states, streamed answers, the GPU handoff with Llama). Set per look.
+        self._ev: Callable[..., None] = _noop
+        self._llama_lent_gpu = False
+        self._label = "the vision model"
 
     # ------------------------------------------------------------------ app side (long poll)
     def tiers(self) -> List[dict]:
@@ -66,9 +74,17 @@ class VisionManager:
         """Give the GPU back to Llama right away (the app stops the vision server and resumes Llama's engine)."""
         if self.holds > 0:
             return
+        was_wanted = self.wanted_until > 0
         self.wanted_until = 0.0
         with self.cond:
             self.cond.notify_all()
+        if was_wanted:
+            self._ev("model_activity", model="vision", state="released", label=self._label,
+                     detail="Finished. The Forge app stops it and frees its memory.")
+            if self._llama_lent_gpu:
+                self._ev("model_activity", model="llama", state="resuming", label="Llama 3.1",
+                         detail="The Intel GPU is free again, so Llama's GPU engine resumes.")
+            self._llama_lent_gpu = False
 
     class _Hold:
         def __init__(self, vm: "VisionManager"):
@@ -122,43 +138,87 @@ class VisionManager:
     def _ask_gpu(self, path: str, mime: str, question: str, emit: Callable[[str], None]) -> Optional[tuple]:
         if time.time() - self.app_seen > 60 or not self.tiers():
             return None
+        ev = self._ev
+        st = self.st
+        tier = self.app.get("vtier") if self.app.get("vstate") == "running" else None
+        self._label = f"{tier or self.tiers()[0]['name']} (Intel GPU)"
+        llama_on_gpu = st.active_engine() == "gpu" and st.engine_stats.get("state") in ("running", "paused")
         requested = time.time()
         self.wanted_until = requested + IDLE_STOP_S
         with self.cond:
             self.cond.notify_all()
         c = self._client()
         deadline = time.time() + 300
-        told = False
+        last_vstate, last_engine = None, st.engine_stats.get("state")
+        if not c.alive():
+            ev("model_activity", model="vision", state="starting", label=self._label,
+               detail="Forge asks the Forge app to start the vision model on the Intel GPU.")
+            if llama_on_gpu:
+                self._llama_lent_gpu = True
+                ev("model_activity", model="llama", state="pausing", label="Llama 3.1",
+                   detail="Llama's GPU engine pauses so the vision model can use the Intel GPU (one model on the GPU at a time).")
         while time.time() < deadline:
             if c.alive():
                 break
+            vstate, engine = self.app.get("vstate"), st.engine_stats.get("state")
+            if engine != last_engine:
+                last_engine = engine
+                if engine == "paused" and llama_on_gpu:
+                    ev("model_activity", model="llama", state="paused", label="Llama 3.1",
+                       detail="Llama's GPU engine is paused and has lent the Intel GPU to the vision model.")
+            if vstate != last_vstate and self.app_report_ts > requested:
+                last_vstate = vstate
+                if self.app.get("vtier"):
+                    self._label = f"{self.app.get('vtier')} (Intel GPU)"
+                if vstate == "downloading":
+                    ev("model_activity", model="vision", state="preparing", label=self._label,
+                       detail="Copying the vision model files into the Forge app (only the first time).")
+                elif vstate == "starting":
+                    ev("model_activity", model="vision", state="loading", label=self._label,
+                       detail="Loading the vision model onto the Intel GPU" + (f" ({self.app.get('vdetail')})" if self.app.get("vdetail") else "") + ".")
             if self.app.get("vstate") == "error" and self.app_report_ts > requested:
-                emit("The GPU vision model could not start (" + str(self.app.get("vdetail", "unknown reason")) + ").")
+                why = str(self.app.get("vdetail", "unknown reason"))
+                emit("The GPU vision model could not start (" + why + ").")
+                ev("model_activity", model="vision", state="failed", label=self._label, detail="Could not start: " + why)
                 self.release()
                 return None
-            if not told:
-                emit("Starting the vision model on the Intel GPU…")
-                told = True
             time.sleep(1.0)
         else:
+            ev("model_activity", model="vision", state="failed", label=self._label, detail="Did not start within five minutes.")
             self.release()
             return None
+        if self.app.get("vtier"):
+            self._label = f"{self.app.get('vtier')} (Intel GPU)"
         with open(path, "rb") as fh:
             b64 = base64.b64encode(fh.read()).decode()
-        body = {"model": "vision", "temperature": 0.1, "max_tokens": 500, "cache_prompt": False,
-                "messages": [{"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                    {"type": "text", "text": question}]}]}
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            {"type": "text", "text": question}]}]
+        ev("model_activity", model="vision", state="looking", label=self._label,
+           detail="Looking at the image (it turns the picture into up to 1,280 image tokens, then reads the question).")
+        t0 = time.time()
+        parts: List[str] = []
         try:
-            r = c._json("POST", "/v1/chat/completions", body, timeout=300)
+            for obj in c.chat_stream("vision", messages, options={"temperature": 0.1, "num_predict": 500}):
+                delta = (obj.get("message") or {}).get("content", "")
+                if delta:
+                    if not parts:
+                        ev("model_activity", model="vision", state="answering", label=self._label,
+                           detail=f"Writing its answer (it looked for {time.time() - t0:.0f} s).")
+                    parts.append(delta)
+                    ev("vision_delta", text=delta)
+                if obj.get("done"):
+                    break
         except OllamaError as e:
             emit(f"The GPU vision model failed ({e}).")
+            ev("model_activity", model="vision", state="failed", label=self._label, detail=f"Failed: {e}")
             self.release()
             return None
-        text = "".join((ch.get("message") or {}).get("content", "") or "" for ch in r.get("choices", []))
+        text = "".join(parts).strip()
+        ev("model_activity", model="vision", state="done", label=self._label,
+           detail=f"Answered in {time.time() - t0:.0f} s ({len(text.split())} words).")
         self.release()
-        tier = self.app.get("vtier") or "Qwen3-VL"
-        return text.strip(), f"{tier} on the Intel GPU"
+        return text, self._label.replace("(Intel GPU)", "on the Intel GPU").strip()
 
     def _ask_cpu(self, path: str, question: str, emit: Callable[[str], None]) -> Optional[tuple]:
         st = self.st
@@ -177,6 +237,8 @@ class VisionManager:
             loaded = []
         if loaded:
             emit("The CPU vision model was skipped because the main model is using the VM's memory.")
+            self._ev("model_activity", model="vision", state="skipped", label=f"{model} (CPU)",
+                     detail="Skipped: Llama is using the VM's memory, and two models must not be loaded at once.")
             return None
         if m.get("available_mb", 0) < CPU_VISION_NEED_MB:
             emit(f"The CPU vision model was skipped to protect memory ({m.get('available_mb')} MB free in the VM).")
@@ -188,45 +250,89 @@ class VisionManager:
         if isinstance(host, (int, float)) and host < HOST_MEM_FOR_CPU_VISION_MB:
             emit("The CPU vision model was skipped to protect the Googlebook's memory.")
             return None
-        emit("Looking at the image with the CPU vision model…")
+        ev = self._ev
+        self._label = f"{model} (CPU)"
+        ev("model_activity", model="vision", state="loading", label=self._label,
+           detail="Loading the CPU vision model in the Linux VM (it is unloaded again right after this look).")
+        with open(path, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode()
+        t0 = time.time()
+        parts: List[str] = []
         try:
-            text = describe_with_vision(st.ollama, model, path, keep_alive="0", prompt=question)
+            for obj in st.ollama.chat_stream(model, [{"role": "user", "content": question, "images": [b64]}],
+                                             options={"temperature": 0.1, "num_ctx": 4096, "num_predict": 450},
+                                             keep_alive="0", think=False):
+                delta = (obj.get("message") or {}).get("content", "")
+                if delta:
+                    if not parts:
+                        ev("model_activity", model="vision", state="answering", label=self._label,
+                           detail=f"Writing its answer (loading and looking took {time.time() - t0:.0f} s).")
+                    parts.append(delta)
+                    ev("vision_delta", text=delta)
+                if obj.get("done"):
+                    break
         except OllamaError as e:
             emit(f"The CPU vision model failed ({e}).")
+            ev("model_activity", model="vision", state="failed", label=self._label, detail=f"Failed: {e}")
             return None
+        text = "".join(parts).strip()
+        ev("model_activity", model="vision", state="done", label=self._label,
+           detail=f"Answered in {time.time() - t0:.0f} s and was unloaded from memory.")
         return text, f"{model} on the CPU"
 
-    def ask(self, path: str, mime: str, question: str, settings: dict, emit: Callable[[str], None]) -> tuple:
-        """Returns (answer, source). An empty answer means only text recognition is available."""
+    def ask(self, path: str, mime: str, question: str, settings: dict, emit: Callable[[str], None],
+            ev: Optional[Callable[..., None]] = None) -> tuple:
+        """Returns (answer, source). An empty answer means only text recognition is available. `ev` receives live
+        activity for the chat: model_activity (states of the vision model and of Llama's GPU engine) and
+        vision_delta (the answer while it is written)."""
         mode = str(settings.get("vision", "auto"))
         if mode == "ocr":
+            (ev or _noop)("model_activity", model="vision", state="off", label="the vision model",
+                          detail="Turned off in Settings (Images: ocr), so only text recognition is used.")
             return "", "off"
         with self.busy:
-            if mode in ("auto", "gpu"):
-                r = self._ask_gpu(path, mime, question, emit)
-                if r:
-                    return r
-            if mode in ("auto", "cpu"):
-                r = self._ask_cpu(path, question, emit)
-                if r:
-                    return r
+            self._ev = ev or _noop
+            try:
+                return self._ask_locked(path, mime, question, mode, emit)
+            finally:
+                self._ev = _noop
+
+    def _ask_locked(self, path: str, mime: str, question: str, mode: str, emit: Callable[[str], None]) -> tuple:
+        if mode in ("auto", "gpu"):
+            r = self._ask_gpu(path, mime, question, emit)
+            if r:
+                return r
+        if mode in ("auto", "cpu"):
+            r = self._ask_cpu(path, question, emit)
+            if r:
+                return r
+        self._ev("model_activity", model="vision", state="unavailable", label="the vision model",
+                 detail="Not available for this look, so Llama gets the recognized text only.")
         return "", "unavailable"
 
-    def analyze(self, img_id: str, settings: dict, emit: Callable[[str], None]) -> dict:
+    def analyze(self, img_id: str, settings: dict, emit: Callable[[str], None],
+                ev: Optional[Callable[..., None]] = None) -> dict:
         """OCR plus the default description, cached per image."""
+        ev = ev or _noop
         found = self.images.find(img_id)
         if not found:
             return {"error": "image not found"}
         path, mime = found
         cached = self.images.cached_analysis(img_id)
         if cached.get("description") and "ocr" in cached:
-            return cached
+            ev("model_activity", model="vision", state="cached", label=str(cached.get("source") or "the vision model"),
+               detail="This image was already described earlier, so the saved answer is reused.")
+            return {**cached, "cached": True}
         out = dict(cached)
         if "ocr" not in out:
-            emit("Reading the text in the image…")
+            ev("model_activity", model="ocr", state="working", label="Text recognition (tesseract)",
+               detail="Reading every word in the image.")
+            t0 = time.time()
             out["ocr"] = run_ocr(path)
+            ev("model_activity", model="ocr", state="done", label="Text recognition (tesseract)",
+               detail=(f"Found {len(out['ocr'])} characters of text" if out["ocr"] else "Found no text") + f" in {time.time() - t0:.1f} s.")
         if not out.get("description"):
-            desc, source = self.ask(path, mime, VISION_PROMPT, settings, emit)
+            desc, source = self.ask(path, mime, VISION_PROMPT, settings, emit, ev)
             out["description"], out["source"] = desc, source
         self.images.save_analysis(img_id, out)
         return out

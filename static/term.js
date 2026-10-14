@@ -84,6 +84,18 @@
   };
   T.activeOutput = function () { const e = terms.get(active); return e ? e.lastOut : ''; };
   T.paste = function (text) { const e = terms.get(active); if (e && e.ws && e.ws.readyState === 1) { e.ws.send(new TextEncoder().encode(text)); e.term.focus(); } };
+  /** Open a new terminal tab with a label and run a command in it (used by the Android view for builds). */
+  T.run = function (command, label) {
+    const entry = T.create();
+    if (label) entry.tab.textContent = label;
+    let tries = 0;
+    const go = () => {
+      if (entry.ws && entry.ws.readyState === 1) { setTimeout(() => entry.ws.send(new TextEncoder().encode(command + '\r')), 600); return; }
+      if (++tries < 60) setTimeout(go, 100);
+    };
+    go();
+    return entry;
+  };
   T.ensure = function () { if (!terms.size) T.create(); else T.fitAll(); };
   T.fitAll = function () { for (const e of terms.values()) { if (e.host.classList.contains('active')) { try { e.fit.fit(); } catch (x) { /* ignore */ } } } };
   T.resetAll = async function () { for (const id of [...terms.keys()]) await T.kill(id); T.create(); };

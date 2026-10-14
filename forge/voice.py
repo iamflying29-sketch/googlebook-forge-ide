@@ -16,7 +16,7 @@ MODELS = os.path.expanduser("~/.forge-ide/models")
 # Best first. small.en is more accurate, base.en is faster; Forge uses the best one that is installed.
 MODEL_NAMES = ("ggml-small.en.bin", "ggml-base.en.bin", "ggml-base.bin", "ggml-tiny.en.bin")
 VOICE_MIN_VM_MB = 900
-VOICE_MIN_HOST_MB = 2300
+VOICE_MIN_HOST_MB = 2600
 MAX_WAV_BYTES = 16_000 * 2 * 180 + 1024   # three minutes of 16 kHz mono 16-bit audio
 WORK = os.path.expanduser("~/.forge-ide/voice")
 _lock = threading.Lock()   # one recognition at a time; the work file is reused, never deleted

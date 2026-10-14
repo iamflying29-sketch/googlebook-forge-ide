@@ -24,14 +24,21 @@ class PtySession:
         env["COLORTERM"] = "truecolor"
         env["FORGE_IDE"] = "1"
         env["NO_AUTO_TMUX"] = "1"   # the user's ~/.profile auto-attaches tmux in login shells; not wanted here
+        from .toolchains import tool_env
+        env = tool_env(env)          # Android SDK, Kotlin, Gradle, Java and Rust tools on the PATH
         shell = shell or os.environ.get("SHELL") or "/bin/bash"
+        from .toolchains import shell_rc
+        rc = shell_rc()              # prepared before fork(): the child of a threaded server must not import or write
         pid, fd = pty.fork()
         if pid == 0:  # child
             try:
                 os.chdir(cwd)
             except OSError:
                 pass
-            os.execvpe(shell, [shell, "-l"] if shell.endswith("bash") else [shell], env)
+            if shell.endswith("bash"):
+                # Like a login shell, plus Forge's toolchains on the PATH (see toolchains.SHELL_RC).
+                os.execvpe(shell, [shell, "--rcfile", rc, "-i"], env)
+            os.execvpe(shell, [shell], env)
         self.pid = pid
         self.fd = fd
         self.alive = True

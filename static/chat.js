@@ -147,6 +147,102 @@
     for (const t of b.todos) d.append(el('div', { class: 'todo ' + t.status }, el('span', { class: 'tick', text: t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '▸' : '○' }), el('span', { text: t.content })));
     return d;
   }
+  // ================================================================== models at work: Llama 3.1 and the vision model
+  const MODEL_STATES = {
+    llama: { loading: 'Loading into memory', waiting: 'Waiting for its GPU engine', resumed: 'GPU engine resumed', reading: 'Reading',
+      thinking: 'Thinking', writing: 'Writing', tool: 'Calling a tool', done: 'Step finished', pausing: 'Lending the GPU',
+      paused: 'Paused (GPU lent to the vision model)', resuming: 'Resuming on the GPU', failed: 'Stopped', idle: 'Idle' },
+    vision: { starting: 'Starting', preparing: 'Copying its files', loading: 'Loading', looking: 'Looking at the image', answering: 'Answering',
+      done: 'Answered', released: 'Finished', cached: 'Answer reused', failed: 'Failed', skipped: 'Skipped', unavailable: 'Not available',
+      off: 'Turned off', idle: 'Idle' },
+    ocr: { working: 'Reading the text', done: 'Finished', idle: 'Idle' },
+  };
+  const BUSY = new Set(['loading', 'reading', 'thinking', 'writing', 'tool', 'starting', 'preparing', 'looking', 'answering', 'working']);
+  const WAITING = new Set(['waiting', 'pausing', 'paused', 'resuming']);
+  const modelName = (m, label) => m === 'llama' ? 'Llama 3.1' : m === 'ocr' ? 'Text recognition' : ((label || '').replace(/\s*\(.*\)$/, '') || 'Vision model');
+  const stateText = (m, st) => (MODEL_STATES[m] || {})[st] || st;
+  function stateClass(st) { return BUSY.has(st) ? 'busy' : WAITING.has(st) ? 'wait' : (st === 'failed' || st === 'skipped' || st === 'unavailable') ? 'bad' : 'idle'; }
+
+  /** Busy seconds per model, from the timeline. */
+  function busyTimes(items, endT) {
+    const out = {};
+    const last = {};
+    for (const it of items) {
+      const prev = last[it.model];
+      if (prev && (BUSY.has(prev.state) || WAITING.has(prev.state))) out[it.model] = (out[it.model] || 0) + (it.t - prev.t);
+      last[it.model] = it;
+    }
+    for (const [m, it] of Object.entries(last)) if ((BUSY.has(it.state) || WAITING.has(it.state)) && endT != null) out[m] = (out[m] || 0) + Math.max(0, endT - it.t);
+    return out;
+  }
+  function timelineSummary(b, endT) {
+    const bt = busyTimes(b.items, endT);
+    const names = {};
+    for (const it of b.items) names[it.model] = modelName(it.model, it.label);
+    const parts = Object.entries(bt).filter(([, v]) => v > 0.05).map(([m, v]) => names[m] + ' ' + (v < 10 ? v.toFixed(1) : Math.round(v)) + ' s');
+    return 'How the models worked' + (parts.length ? ': ' + parts.join(' · ') : '') + ' (' + b.items.length + ' steps)';
+  }
+  function timelineItem(it) {
+    return el('div', { class: 'tl-item ' + stateClass(it.state) }, el('span', { class: 'tl-t', text: '+' + it.t.toFixed(1) + ' s' }),
+      el('span', { class: 'tl-head' }, el('span', { class: 'mbadge ' + it.model, text: modelName(it.model, it.label), title: it.label || '' }),
+        el('span', { class: 'tl-state', text: stateText(it.model, it.state) })),
+      el('span', { class: 'tl-t' }), el('span', { class: 'tl-text', text: it.detail || '' }));
+  }
+  function timelineBlock(b, live) {
+    const d = el('details', { class: 'mtimeline' + (live ? ' live' : ''), open: (live || b.items.some((i) => i.model !== 'llama')) ? '' : null });
+    const sum = el('summary', { text: timelineSummary(b, live ? null : b.end) });
+    const list = el('div', { class: 'tl-list' });
+    for (const it of b.items) list.append(timelineItem(it));
+    d.append(sum, list);
+    d._sum = sum; d._list = list;
+    return d;
+  }
+  function exchangeCard(b) {
+    const card = el('div', { class: 'xchg ' + (b.state || 'asking') });
+    const asker = b.asker === 'llama' ? el('span', { class: 'mbadge llama', text: 'Llama 3.1' }) : el('span', { class: 'mbadge forge', text: 'Forge' });
+    const vis = el('span', { class: 'mbadge vision', text: b.vision_label ? modelName('vision', b.vision_label) : 'the vision model', title: b.vision_label || '' });
+    const head = el('div', { class: 'xhead' }, asker, el('span', { text: ' asks ' }), vis,
+      el('span', { class: 'muted', text: b.asker === 'llama' ? ' (Llama cannot see images, so it asks for help)' : (' to describe image ' + (b.number || '') + ' for Llama 3.1, which cannot see images').replace('  ', ' ') }));
+    const q = b.asker === 'llama' ? el('div', { class: 'xq', text: b.question })
+      : el('details', { class: 'xq' }, el('summary', { text: 'Describe this image precisely for a programmer who cannot see it' }), el('div', { class: 'muted small', text: b.question }));
+    const top = el('div', { class: 'xrow' }, q);
+    if (b.image_url) top.prepend(el('img', { class: 'xthumb', src: b.image_url, alt: 'image', title: 'Click to enlarge', onclick: () => openLightbox(b.image_url) }));
+    const status = el('div', { class: 'xstatus', text: b.status || (b.state === 'answered' ? '' : 'Waiting for the vision model…') });
+    const ans = el('div', { class: 'xans', text: b.answer || '' });
+    const ansHead = el('div', { class: 'xhead' }, el('span', { class: 'mbadge vision', text: b.vision_label ? modelName('vision', b.vision_label) : 'Vision model', title: b.vision_label || b.source || '' }),
+      el('span', { text: b.state === 'answered' ? (b.answer ? ' answers' + (b.cached ? ' (saved answer from earlier)' : '') : ' could not answer') : ' is working' }),
+      el('span', { class: 'muted', text: b.seconds != null ? '  ·  ' + b.seconds + ' s' : '' }));
+    card.append(head, top, ansHead, status, ans);
+    if (b.ocr) card.append(el('details', { class: 'xocr' }, el('summary', { text: 'Text recognition (tesseract) also read ' + b.ocr.length + ' characters' }), el('pre', { text: b.ocr })));
+    if (b.error) card.append(el('div', { class: 'status-line error', text: b.error }));
+    if (b.state === 'answered') card.append(el('div', { class: 'xfoot' }, el('span', { class: 'mbadge llama', text: 'Llama 3.1' }),
+      el('span', { text: b.asker === 'llama' ? ' gets this answer back as the result of its look_at_image call and continues.'
+        : (b.answer ? ' reads this description' : ' reads') + (b.ocr ? ' and the recognized text' : '') + ' together with your message.' })));
+    card._status = status; card._ans = ans; card._ansHead = ansHead;
+    return card;
+  }
+  function renderStrip() {
+    const strip = $('#model-strip');
+    if (!strip) return;
+    const t = active;
+    const show = t && t.models && (t.run || (t.modelsUntil && Date.now() < t.modelsUntil));
+    strip.classList.toggle('hidden', !show);
+    if (!show) return;
+    strip.innerHTML = '';
+    for (const m of ['llama', 'vision', 'ocr']) {
+      const st = t.models[m];
+      if (!st || (m === 'ocr' && st.state === 'idle')) continue;
+      const secs = Math.max(0, Math.round((Date.now() - st.since) / 1000));
+      const extra = m === 'llama' && st.state === 'writing' && st.tps ? ' · ' + st.tps + ' tok/s' : '';
+      strip.append(el('div', { class: 'mpill ' + m + ' ' + stateClass(st.state), title: (st.label || '') + (st.detail ? '\n' + st.detail : '') },
+        el('span', { class: 'mdot' }), el('b', { text: modelName(m, st.label) }),
+        el('span', { class: 'mstate', text: stateText(m, st.state) + extra + (BUSY.has(st.state) || WAITING.has(st.state) ? ' · ' + secs + ' s' : '') })));
+    }
+    if (!t.models.vision) strip.append(el('div', { class: 'mpill vision idle', title: 'The vision model starts only when an image needs looking at' },
+      el('span', { class: 'mdot' }), el('b', { text: 'Vision model' }), el('span', { class: 'mstate', text: 'Idle' })));
+  }
+  setInterval(() => { if (active && (active.run || (active.modelsUntil && Date.now() < active.modelsUntil + 1500))) renderStrip(); }, 1000);
+
   function openLightbox(url) { $('#lightbox-img').src = url; $('#lightbox').classList.remove('hidden'); }
   $('#lightbox').addEventListener('click', () => $('#lightbox').classList.add('hidden'));
   window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#lightbox').classList.contains('hidden')) $('#lightbox').classList.add('hidden'); });
@@ -212,10 +308,14 @@
     const m = el('div', { class: 'msg assistant' });
     const todos = (turn.blocks || []).find((b) => b.type === 'todos');
     if (todos) m.append(todosBlock(todos));
+    const tl = (turn.blocks || []).find((b) => b.type === 'timeline');
+    if (tl) m.append(timelineBlock(tl, false));
+    const hasExchange = (turn.blocks || []).some((b) => b.type === 'exchange');
     for (const b of turn.blocks || []) {
       if (b.type === 'thinking') m.append(thinkingBlock(b.text, false));
       else if (b.type === 'text') m.append(textBlock(b.text));
-      else if (b.type === 'tool') m.append(toolCard(b));
+      else if (b.type === 'exchange') m.append(exchangeCard(b));
+      else if (b.type === 'tool') { const c = toolCard(b); if (hasExchange && b.name === 'look_at_image') c.classList.add('as-exchange'); m.append(c); }
       else if (b.type === 'approval') m.append(approvalCard(b, true));
       else if (b.type === 'ask') m.append(askCard(b.question));
       else if (b.type === 'vision') m.append(visionBlock(b));
@@ -232,6 +332,7 @@
     constructor(session) {
       this.session = session; this.transcript = session.transcript || []; this.run = null;
       this.contexts = []; this.queue = []; this.scroll = 0; this.attention = false; this.draft = '';
+      this.models = null; this.modelsUntil = 0;
       this.pane = el('div', { class: 'tab-pane hidden' });
       host.append(this.pane);
       this.render();
@@ -265,7 +366,7 @@
     promptEl.value = tab.draft || '';
     autoGrow();
     $('#chat-empty').classList.toggle('hidden', tab.transcript.length > 0);
-    renderTabBar(); renderContexts(); renderQueue(); refreshComposer(); loadModelPicker();
+    renderTabBar(); renderContexts(); renderQueue(); refreshComposer(); loadModelPicker(); renderStrip();
     host.scrollTop = tab.scroll || host.scrollHeight;
     saveTabs();
     loadHistory($('#history'));
@@ -659,7 +760,10 @@
     catch (e) { spinner.textContent = 'Error: ' + e.message; spinner.classList.add('error'); turn.blocks.push({ type: 'status', text: 'Error: ' + e.message, error: true }); saveTranscript(tab); return; }
     userTurn.run_id = r.run_id;
     userEl.replaceWith(renderUser(tab, userTurn));
-    const R = tab.run = { id: r.run_id, tab, msgEl, turn, spinner, cur: null, curEl: null, tools: new Map(), filesEl: null, todosEl: null, pending: false };
+    const R = tab.run = { id: r.run_id, tab, msgEl, turn, spinner, cur: null, curEl: null, tools: new Map(), filesEl: null, todosEl: null, pending: false,
+      t0: Date.now(), exchanges: new Map(), timeline: null, timelineEl: null };
+    tab.models = { llama: { state: 'reading', label: '', detail: 'Starting', since: Date.now() } };
+    renderStrip();
     renderTabBar(); refreshComposer();
     const es = new EventSource('/api/events?run_id=' + r.run_id);
     R.es = es;
@@ -685,6 +789,15 @@
     R.spinner.remove();
     closeCurrent(R);
     tab.run = null;
+    if (tab.models) {
+      for (const st of Object.values(tab.models)) if (BUSY.has(st.state) || WAITING.has(st.state) || st.state === 'done') { st.state = 'idle'; st.since = Date.now(); }
+      tab.modelsUntil = Date.now() + 8000;
+    }
+    if (R.timeline) {
+      R.timeline.end = (Date.now() - R.t0) / 1000;
+      if (R.timelineEl) { R.timelineEl.classList.remove('live'); R.timelineEl._sum.textContent = timelineSummary(R.timeline, R.timeline.end); if (!R.timeline.items.some((i) => i.model !== 'llama')) R.timelineEl.open = false; }
+    }
+    renderStrip();
     if (tab !== active) tab.attention = true;
     renderTabBar(); refreshComposer();
     saveTranscript(tab);
@@ -736,6 +849,66 @@
       case 'thinking_delta': if (!R.cur || R.cur.type !== 'thinking') startBlock(R, 'thinking'); R.cur.text += ev.text; flushText(R); break;
       case 'text_delta': if (!R.cur || R.cur.type !== 'text') startBlock(R, 'text'); R.cur.text += ev.text; flushText(R); break;
       case 'tool_call_start': closeCurrent(R); break;
+      case 'model_activity': {
+        const now = (Date.now() - R.t0) / 1000;
+        const tab = R.tab;
+        if (!tab.models) tab.models = {};
+        const prev = tab.models[ev.model] || {};
+        tab.models[ev.model] = { state: ev.state, label: ev.label || prev.label || '', detail: ev.detail || '', since: Date.now(), tps: prev.tps };
+        if (!R.timeline) {
+          R.timeline = { type: 'timeline', items: [] };
+          R.turn.blocks.unshift(R.timeline);
+          R.timelineEl = timelineBlock(R.timeline, true);
+          const todo = R.msgEl.querySelector(':scope > .todos');
+          if (todo) todo.after(R.timelineEl); else R.msgEl.prepend(R.timelineEl);
+        }
+        const it = { t: Math.round(now * 10) / 10, model: ev.model, state: ev.state, label: ev.label || '', detail: ev.detail || '' };
+        R.timeline.items.push(it);
+        R.timelineEl._list.append(timelineItem(it));
+        R.timelineEl._sum.textContent = timelineSummary(R.timeline, now);
+        if (ev.exchange && R.exchanges.has(ev.exchange)) {
+          const x = R.exchanges.get(ev.exchange);
+          if (ev.model === 'vision' && ev.label) x.b.vision_label = ev.label;
+          x.b.status = (ev.model === 'llama' ? 'Llama 3.1: ' : ev.model === 'ocr' ? 'Text recognition: ' : '') + (ev.detail || stateText(ev.model, ev.state));
+          if (x.b.state !== 'answered') { const fresh = exchangeCard(x.b); x.el.replaceWith(fresh); x.el = fresh; }
+        }
+        if (R.tab === active) renderStrip();
+        logVerbose(ev.model, stateText(ev.model, ev.state) + ': ' + (ev.detail || ''));
+        break;
+      }
+      case 'model_progress': {
+        const st = R.tab.models && R.tab.models[ev.model];
+        if (st) { st.tps = ev.tps; st.tokens = ev.tokens; }
+        if (R.tab === active) renderStrip();
+        break;
+      }
+      case 'vision_exchange': {
+        closeCurrent(R); R.spinner.remove();
+        if (ev.phase === 'ask') {
+          const b = { type: 'exchange', id: ev.id, asker: ev.asker, question: ev.question, number: ev.number, image_url: ev.image_url, answer: '', state: 'asking' };
+          R.turn.blocks.push(b);
+          const card = exchangeCard(b);
+          R.exchanges.set(ev.id, { b, el: card });
+          R.msgEl.append(card); scrollIfActive(R, true);
+          // The exchange card shows Llama's question and the answer, so its look_at_image tool card is not repeated.
+          if (ev.asker === 'llama') for (const [, tx] of R.tools) if (tx.t.name === 'look_at_image') tx.card.classList.add('as-exchange');
+        } else if (ev.phase === 'answer' && R.exchanges.has(ev.id)) {
+          const x = R.exchanges.get(ev.id);
+          Object.assign(x.b, { state: 'answered', answer: ev.text || x.b.answer || '', ocr: ev.ocr || '', source: ev.source, cached: ev.cached, seconds: ev.seconds, error: ev.error, status: '' });
+          if (!x.b.vision_label && ev.source && ev.source !== 'unavailable' && ev.source !== 'off') x.b.vision_label = ev.source;
+          const fresh = exchangeCard(x.b); x.el.replaceWith(fresh); x.el = fresh;
+          scrollIfActive(R);
+        }
+        break;
+      }
+      case 'vision_delta': {
+        const x = ev.exchange && R.exchanges.get(ev.exchange);
+        if (!x) break;
+        x.b.answer = (x.b.answer || '') + ev.text;
+        x.el._ans.textContent = x.b.answer;
+        scrollIfActive(R);
+        break;
+      }
       case 'tool_call': {
         closeCurrent(R); R.spinner.remove();
         const t = { type: 'tool', call_id: ev.call_id, name: ev.name, arguments: ev.arguments, state: 'running', result: '' };

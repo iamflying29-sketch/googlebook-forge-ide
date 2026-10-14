@@ -12,6 +12,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import prompts
+from .images import VISION_PROMPT
 from .ollama_client import OllamaClient, OllamaError
 from .tools import NEEDS_APPROVAL, TOOL_NAMES, Workspace, is_dangerous_command, ollama_tool_schemas, outside_change_reason
 
@@ -396,6 +397,15 @@ class Agent:
             texts.append("### More rule files\nRead one with read_file when it is relevant to the task:\n" + "\n".join(listed))
         return "\n\n".join(texts)
 
+    def _llama_label(self, model: str) -> str:
+        """How the chat names the model doing the work, with where it runs."""
+        if hasattr(self.client, "wait_ready") or model == "gpu-model":
+            return "Llama 3.1 8B (Intel GPU)"
+        name = str(model or "").replace(":latest", "")
+        if name in ("forge-coder", "llama3.1", "llama3.1:8b"):
+            return f"Llama 3.1 8B (CPU, {name})"
+        return f"{name} (CPU)"
+
     def _rules_for_paths(self, paths: List[str]) -> str:
         """Auto-attached rules: rule files whose globs match a file in this message's context."""
         import fnmatch
@@ -426,6 +436,13 @@ class Agent:
         if rules:
             base += "\n\n## User rules (always follow these)\n" + rules
         if self.state is not None:
+            try:
+                from .toolchains import prompt_section
+                tc = prompt_section(self.ws.root)
+                if tc and mode != "ask":
+                    base += "\n\n" + tc
+            except Exception:  # noqa: BLE001
+                pass
             extra = self.state.extra_roots(self.ws.root)
             if extra:
                 base += ("\n\n## More folders in this window\nBesides the project folder, this window also contains these "
@@ -565,14 +582,24 @@ class Agent:
         if self.vision is None:
             return f"\n### Image {number}\n[the image could not be read: no vision helper]"
         emit = (lambda t: run.emit("status", text=t)) if run is not None else (lambda t: None)
-        res = self.vision.analyze(img_id, self.settings, emit)
+        xid = uuid.uuid4().hex[:8]
+        t0 = time.time()
+        if run is not None:
+            # Shown in the chat as a conversation: Forge asks the vision model on Llama's behalf, the answer streams in.
+            run.emit("vision_exchange", id=xid, phase="ask", asker="forge", number=number, image_id=img_id,
+                     image_url="/api/image?id=" + img_id, question=VISION_PROMPT)
+        ev = (lambda kind, **d: run.emit(kind, exchange=xid, **d)) if run is not None else None
+        res = self.vision.analyze(img_id, self.settings, emit, ev)
         if res.get("error"):
+            if run is not None:
+                run.emit("vision_exchange", id=xid, phase="answer", text="", error=res["error"], seconds=round(time.time() - t0, 1))
             return f"\n### Image {number}\n[the image could not be read: {res['error']}]"
         desc = (res.get("description") or "").strip()
         ocr = (res.get("ocr") or "").strip()
         source = res.get("source", "")
         if run is not None:
-            run.emit("image_analysis", number=number, id=img_id, source=source, description=desc, ocr=ocr[:6000])
+            run.emit("vision_exchange", id=xid, phase="answer", text=desc, ocr=ocr[:6000], source=source,
+                     cached=bool(res.get("cached")), seconds=round(time.time() - t0, 1))
         name = a.get("name") or "screenshot"
         lines = [f"\n### Image {number}: {name} (image id: {img_id})",
                  "You cannot see images yourself. Your vision helper looked at it for you. To ask it anything else about "
@@ -681,18 +708,37 @@ class Agent:
         stats: Optional[dict] = None
         last_obj: Optional[dict] = None
         tools = ollama_tool_schemas() if native else None
+        label = self._llama_label(model)
+        act = lambda state, detail: run.emit("model_activity", model="llama", state=state, label=label, detail=detail)
         if hasattr(self.client, "wait_ready") and not self.client.alive():
+            act("waiting", "Waiting for Llama's GPU engine to resume (it pauses while the vision model uses the Intel GPU).")
             ok = self.client.wait_ready(300, lambda: run.emit("status", text="Waiting for Llama's GPU engine to resume…"), run.cancel)
             if not ok:
+                act("failed", "The GPU engine did not come back.")
                 raise OllamaError("The GPU engine did not come back. Start it again from the Forge app (Settings, GPU engine card).")
+            act("resumed", "Llama's GPU engine is running again on the Intel GPU.")
+        elif not hasattr(self.client, "wait_ready") and self.state is not None and not self.state.model_loaded(model):
+            act("loading", "Loading the model into the VM's memory (this takes a little while the first time).")
+        ctx = sum(estimate_tokens(mm.get("content", "")) for mm in msgs)
+        act("reading", f"Reading the conversation (about {ctx:,} tokens; parts it has read before are reused from its cache).")
         options = self._options()
         if native:
             options = {k: v for k, v in options.items() if k != "stop"}
         t0 = time.monotonic()
         first_token: Optional[float] = None
+        chunks = 0
+        last_kind = None
+        last_progress = time.monotonic()
         for obj in self.client.chat_stream(model, msgs, options=options, tools=tools, cancel=run.cancel,
                                            keep_alive=str(self.settings.get("keep_alive", "30m"))):
             last_obj = obj
+            if (obj.get("message") or {}).get("content"):
+                chunks += 1
+                now = time.monotonic()
+                if now - last_progress > 2.5 and first_token is not None:
+                    last_progress = now
+                    gen = now - t0 - first_token
+                    run.emit("model_progress", model="llama", tokens=chunks, tps=round(chunks / gen, 1) if gen > 0.5 else None)
             m = obj.get("message", {})
             if m.get("tool_calls"):
                 for tc in m["tool_calls"]:
@@ -704,6 +750,15 @@ class Agent:
                     first_token = time.monotonic() - t0
                 full += delta
                 segs, closed = segment(full)
+                kind = segs[-1]["type"] if segs else "text"
+                if kind != last_kind:
+                    last_kind = kind
+                    if kind == "thinking":
+                        act("thinking", "Thinking before it acts" + (f" (first token after {first_token:.1f} s)" if chunks <= 2 else "") + ".")
+                    elif kind == "tool_call":
+                        act("tool", "Writing a tool call for Forge to run.")
+                    else:
+                        act("writing", "Writing" + (f" (first token after {first_token:.1f} s)" if chunks <= 2 else "") + ".")
                 for idx, seg in enumerate(segs):
                     if idx < len(emitted):
                         typ, n = emitted[idx]
@@ -735,6 +790,10 @@ class Agent:
                 "done_reason": o.get("done_reason"),
                 "context_estimate": sum(estimate_tokens(mm.get("content", "")) for mm in msgs) + estimate_tokens(full),
             }
+        if stats:
+            rate = f"{stats['gen_tps']} tokens per second" if stats.get("gen_tps") else ""
+            act("done", "Finished this step" + (f": {stats.get('completion_tokens') or chunks} tokens" if (stats.get("completion_tokens") or chunks) else "")
+                + (f" at {rate}" if rate else "") + ".")
         # Flush any held-back tail (a lone '<' that never became a tag).
         segs, closed = segment(full + "\u0000")
         full_final = full
@@ -971,7 +1030,25 @@ class Agent:
         if name == "delete_path":
             return ws.delete_path(str(need("path")), run_id=run.id)
         if name == "run_command":
-            out, _code = ws.run_command(str(need("command")), float(s("timeout", 90) or 90), s("cwd"))
+            command = str(need("command"))
+            from .toolchains import HEAVY_COMMAND, BUILD_MEMORY_CAP_MB
+            # Gradle runs through forge-gradle, which sizes the build to the free memory and scales Gradle's heap
+            # to fit (a raw ./gradlew would use the fixed heap from gradle.properties).
+            command = re.sub(r"(^|[;&|]\s*|\bcd\s+\S+\s*&&\s*)(?:\./gradlew|gradle)(?=\s|$)", r"\1forge-gradle", command)
+            cap = None
+            if "forge-gradle" in command:
+                pass   # forge-gradle checks memory and applies its own cap
+            elif HEAVY_COMMAND.search(command):
+                # Gradle, Cargo and other builds can take gigabytes. They start only with room for their cap (plus
+                # the 2.3 GB the Googlebook keeps free) and run inside it.
+                cap = BUILD_MEMORY_CAP_MB
+                if self.state is not None:
+                    why = self.state.small_memory_block("this build", cap + 300, cap + 2300)
+                    if why:
+                        return ("NOT RUN: " + why + " A build can use up to 2 GB. Ask the user to close other apps, switch "
+                                "chats to the GPU engine (which frees the VM's memory), or unload the model, then try again.")
+            long_job = bool(cap) or "forge-gradle" in command
+            out, _code = ws.run_command(command, float(s("timeout", 900 if long_job else 90) or 90), s("cwd"), memory_cap_mb=cap)
             return out
         if name == "web_fetch":
             return ws.web_fetch(str(need("url")))
@@ -1012,11 +1089,23 @@ class Agent:
             if not found:
                 raise ValueError(f"'{target}' is not an image id from this chat or a readable PNG, JPEG, GIF or WebP file.")
             path, mime = found
-            answer, source = self.vision.ask(path, mime, question, self.settings, lambda t: run.emit("status", text=t))
+            img_id = os.path.splitext(os.path.basename(path))[0]
+            xid = uuid.uuid4().hex[:8]
+            t0 = time.time()
+            run.emit("vision_exchange", id=xid, phase="ask", asker="llama", image_id=img_id,
+                     image_url="/api/image?id=" + img_id, question=question)
+            answer, source = self.vision.ask(path, mime, question, self.settings, lambda t: run.emit("status", text=t),
+                                             lambda kind, **d: run.emit(kind, exchange=xid, **d))
             if answer:
+                run.emit("vision_exchange", id=xid, phase="answer", text=answer, source=source, seconds=round(time.time() - t0, 1))
                 return f"Answer from the vision model ({source}):\n{answer}"
             from .images import run_ocr
+            run.emit("model_activity", exchange=xid, model="ocr", state="working", label="Text recognition (tesseract)",
+                     detail="The vision model is not available, so the words in the image are read instead.")
             ocr = run_ocr(path)
+            run.emit("model_activity", exchange=xid, model="ocr", state="done", label="Text recognition (tesseract)",
+                     detail=f"Found {len(ocr)} characters of text." if ocr else "Found no text.")
+            run.emit("vision_exchange", id=xid, phase="answer", text="", ocr=ocr[:6000], source=source, seconds=round(time.time() - t0, 1))
             return ("The vision model is not available right now, so here is only the text recognized in the image "
                     "(OCR):\n" + (ocr or "(no text found)"))
         if name.startswith("mcp_"):

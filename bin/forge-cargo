@@ -1,0 +1,16 @@
+#!/bin/bash
+# Runs a Cargo command inside a 2 GB memory cap, after Forge's free-memory
+# check, so a build can never squeeze the VM and the Googlebook. Part of Forge IDE.
+need_vm=2350; need_host=4350
+check=$(curl -s -m 5 "http://127.0.0.1:${FORGE_PORT:-8765}/api/memcheck?vm=$need_vm&host=$need_host&what=a%20Cargo%20build" 2>/dev/null)
+if [ -n "$check" ]; then
+  if ! echo "$check" | grep -q '"ok": true'; then
+    echo "Forge: $(echo "$check" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("reason") or "not enough free memory")')"
+    echo "Close other apps, switch chats to the GPU engine, or unload the model, then try again."
+    exit 1
+  fi
+elif [ "$(free -m | awk 'NR==2 {print $7}')" -lt $need_vm ]; then
+  echo "Forge: not enough free memory in the VM for a Cargo build ($need_vm MB needed)."; exit 1
+fi
+G=cargo
+exec systemd-run --user --scope --quiet -p MemoryMax=2048M -p MemorySwapMax=0 nice -n 5 "$G" "$@"

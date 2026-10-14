@@ -50,6 +50,7 @@
       <button class="act" data-view="changes" title="AI changes and checkpoints (Ctrl+Shift+G)"><svg viewBox="0 0 24 24"><path d="M6 3v12M6 15a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9c0 4-4 5-9 6"/></svg></button>
       <button class="act" data-view="git" title="Source control"><svg viewBox="0 0 24 24"><circle cx="6" cy="5" r="2.5"/><circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="9" r="2.5"/><path d="M6 7.5v9M18 11.5c0 3-4 4-9 5"/></svg></button>
       <button class="act" data-view="debug" title="Run and Debug (F5)"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/><circle cx="18.5" cy="17.5" r="3" /></svg></button>
+      <button class="act" data-view="android" title="Android and toolchains"><svg viewBox="0 0 24 24"><path d="M6 10a6 6 0 0 1 12 0v7H6z"/><path d="M8 5L6.5 3M16 5l1.5-2M6 13H3.5M20.5 13H18"/><circle cx="9.5" cy="9" r=".6"/><circle cx="14.5" cy="9" r=".6"/></svg></button>
       <button class="act" data-view="notepads" title="Notepads"><svg viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></svg></button>
       <button class="act" data-view="history" title="Chat history (Ctrl+Shift+H)"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button>
       <div class="act-spacer"></div>
@@ -110,6 +111,13 @@
         <div class="debug" id="debug-panel"></div>
       </section>
 
+      <section class="view" data-view="android">
+        <div class="view-head"><span>Android and toolchains</span>
+          <div class="view-actions"><button class="mini" id="btn-android-refresh" title="Refresh"><svg viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg></button></div>
+        </div>
+        <div class="debug" id="android-panel"></div>
+      </section>
+
       <section class="view" data-view="notepads">
         <div class="view-head"><span>Notepads</span>
           <div class="view-actions"><button class="mini" id="btn-notepad-new" title="New notepad"><svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg></button></div>
@@ -167,6 +175,7 @@
           <button class="ptab" data-panel="output">Agent log</button>
           <button class="ptab" data-panel="problems">Problems <span class="pcount" id="problems-count"></span></button>
           <button class="ptab" data-panel="debug">Debug console</button>
+          <button class="ptab" data-panel="logcat">Logcat</button>
           <div class="panel-actions">
             <button class="mini" id="btn-term-ai" title="Ask AI for a command (Ctrl+K in the terminal)">AI</button>
             <button class="mini" id="btn-term-new" title="New terminal">＋</button>
@@ -187,6 +196,9 @@
           </div>
           <div class="pview" data-panel="output"><pre id="agent-log" class="log"></pre></div>
           <div class="pview" data-panel="debug"><div class="debug-console"><div id="debug-output" class="debug-output"></div><input id="debug-input" class="debug-input" placeholder="Evaluate an expression in the paused program (Enter)" spellcheck="false"></div></div>
+          <div class="pview" data-panel="logcat"><div class="logcat">
+            <div class="logcat-bar"><input id="logcat-app" placeholder="Application id (empty: whole log)" spellcheck="false"><select id="logcat-level" title="Lowest level shown"><option value="V">Verbose</option><option value="D">Debug</option><option value="I">Info</option><option value="W">Warning</option><option value="E">Error</option></select><input id="logcat-filter" placeholder="Filter text" spellcheck="false"><button class="btn sm" id="logcat-toggle">Start</button><button class="btn ghost sm" id="logcat-clear">Clear</button><button class="btn ghost sm" id="logcat-chat" title="Attach the last 200 visible lines to the chat">Add to chat</button></div>
+            <div id="logcat-out" class="logcat-out"></div></div></div>
           <div class="pview" data-panel="problems"><div id="problems" class="problems"><div class="pad muted">Syntax checks after saves and agent edits show up here, with a Fix with AI button.</div></div></div>
         </div>
       </div>
@@ -205,6 +217,7 @@
           <button class="mini" id="btn-verbose" title="Verbose mode: show the raw model traffic">V</button>
         </div>
       </div>
+      <div class="model-strip hidden" id="model-strip" title="Which model is working right now"></div>
       <div class="messages" id="messages">
         <div class="chat-empty" id="chat-empty">
           <div class="ce-logo"><span class="logo-f">F</span></div>
@@ -336,5 +349,6 @@
 <script src="/notebook.js"></script>
 <script src="/preview.js"></script>
 <script src="/split.js"></script>
+<script src="/android.js"></script>
 </body>
 </html>

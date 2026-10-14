@@ -7,12 +7,16 @@
 #   ./install-extras.sh voice      voice input in a browser (whisper.cpp and its base.en speech model)
 #   ./install-extras.sh index      the meaning-based codebase index (a small llama.cpp server and nomic-embed-text)
 #   ./install-extras.sh docs       PDF reading for attachments (pdftotext) and text recognition (tesseract)
+#   ./install-extras.sh android    Android SDK packages, Kotlin, Gradle, bundletool, and the Kotlin, Java and XML
+#                                  language servers (code intelligence for Android projects)
+#   ./install-extras.sh rust       Rust through rustup: rustc, cargo, rust-analyzer, clippy and rustfmt
 #   ./install-extras.sh all        everything above
 #
 # Safety: builds run at low priority inside a systemd scope with a memory cap, and every step first checks that
 # the VM has enough free memory. Downloads are checked against published SHA-256 hashes. Nothing is ever deleted.
 set -euo pipefail
 WANT="${1:-all}"
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 need_mem() {   # need_mem MB: stop if the VM has less free memory than that
   local free
@@ -98,13 +102,79 @@ do_index() {
     3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7 ~/.forge-ide/models/embed/nomic-embed-text-v1.5.Q8_0.gguf
 }
 
+do_android() {
+  echo "== Android and Kotlin"
+  local A=$HOME/.local/lib/forge-android SDK=${ANDROID_HOME:-$HOME/tools/android-sdk}
+  mkdir -p "$A/dl" "$A/bin"
+  if [ ! -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+    echo "The Android SDK command-line tools are needed in $SDK/cmdline-tools/latest (see the hub's GETTING-STARTED guide)."
+    exit 1
+  fi
+  need_mem 1500
+  # Input is closed: if Google ever asks for a new license, sdkmanager stops instead of accepting it for you.
+  capped 1200 "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" "platforms;android-36" "platforms;android-36.1" \
+    "build-tools;36.1.0" "build-tools;37.0.0" "sources;android-35" "sources;android-36" "ndk;29.0.14206865" "cmake;4.1.2" < /dev/null
+  local K=https://download.jetbrains.com/language-server/kotlin-server/263.6379.0/kotlin-server-263.6379.0.tar.gz
+  fetch_checked "$K" "$(curl -fsSL "$K.sha256" | awk '{print $1}')" "$A/dl/kotlin-server-263.6379.0.tar.gz"
+  local J=https://download.eclipse.org/jdtls/milestones/1.61.0/jdt-language-server-1.61.0-202609031315.tar.gz
+  fetch_checked "$J" "$(curl -fsSL "$J.sha256" | awk '{print $1}')" "$A/dl/jdt-language-server-1.61.0.tar.gz"
+  fetch_checked https://github.com/JetBrains/kotlin/releases/download/v2.4.21/kotlin-compiler-2.4.21.zip \
+    7cc140e76daf416a0424a5557f99afd7ca89ebd463ea1101261e3e01c33e75cd "$A/dl/kotlin-compiler-2.4.21.zip"
+  local G=https://services.gradle.org/distributions/gradle-9.8.1-bin.zip
+  fetch_checked "$G" "$(curl -fsSL "$G.sha256" | awk '{print $1}')" "$A/dl/gradle-9.8.1-bin.zip"
+  fetch_checked https://github.com/redhat-developer/vscode-xml/releases/download/0.29.3/lemminx-linux-x86_64.zip \
+    1acc44e24201c1d2f5ccb4e43e7426ed0df6909207a81ff199810e2808104d89 "$A/dl/lemminx-linux-x86_64-0.29.3.zip"
+  fetch_checked https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar \
+    a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29 "$A/bundletool-all-1.18.3.jar"
+  mkdir -p "$A/kotlin-lsp" "$A/jdtls" "$A/lemminx"
+  [ -d "$A/kotlin-lsp/kotlin-server-263.6379.0" ] || tar -xzf "$A/dl/kotlin-server-263.6379.0.tar.gz" -C "$A/kotlin-lsp"
+  [ -d "$A/jdtls/plugins" ] || tar -xzf "$A/dl/jdt-language-server-1.61.0.tar.gz" -C "$A/jdtls"
+  [ -d "$A/kotlinc" ] || unzip -q -o "$A/dl/kotlin-compiler-2.4.21.zip" -d "$A"
+  [ -d "$A/gradle-9.8.1" ] || unzip -q -o "$A/dl/gradle-9.8.1-bin.zip" -d "$A"
+  [ -x "$A/lemminx/lemminx-linux-x86_64" ] || unzip -q -o "$A/dl/lemminx-linux-x86_64-0.29.3.zip" -d "$A/lemminx"
+  # The Kotlin server's own default is a 2 GB Java heap; 1 GB keeps it next to the model on this machine.
+  local VMO="$A/kotlin-lsp/kotlin-server-263.6379.0/bin/intellij-server.vmoptions"
+  [ -f "$VMO.orig" ] || cp "$VMO" "$VMO.orig"
+  sed -i 's/^-Xmx2048m$/-Xmx1024m/; s/^-XX:ReservedCodeCacheSize=512m$/-XX:ReservedCodeCacheSize=240m/' "$VMO"
+  install -m 755 "$HERE/bin/forge-gradle" "$HERE/bin/forge-cargo" "$A/bin/"
+  printf '#!/bin/sh\nexec java -Xmx768m -jar "$HOME/.local/lib/forge-android/bundletool-all-1.18.3.jar" "$@"\n' > "$A/bin/bundletool"
+  chmod +x "$A/bin/bundletool"
+  mkdir -p "$HOME/.gradle"
+  if [ ! -f "$HOME/.gradle/gradle.properties" ]; then
+    cat > "$HOME/.gradle/gradle.properties" <<'GP'
+# Memory limits for Gradle, written by Forge IDE's install-extras.sh. They take precedence over project settings.
+org.gradle.jvmargs=-Xmx1024m -XX:MaxMetaspaceSize=384m -XX:+UseParallelGC -Dfile.encoding=UTF-8
+kotlin.compiler.execution.strategy=in-process
+org.gradle.workers.max=2
+org.gradle.parallel=false
+org.gradle.daemon.idletimeout=900000
+GP
+  else
+    echo "Kept your existing ~/.gradle/gradle.properties. Forge recommends org.gradle.jvmargs=-Xmx1024m on this machine."
+  fi
+}
+
+do_rust() {
+  echo "== Rust"
+  local A=$HOME/.local/lib/forge-android U=https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init
+  mkdir -p "$A/dl"
+  fetch_checked "$U" "$(curl -fsSL "$U.sha256" | awk '{print $1}')" "$A/dl/rustup-init-1.29.1"
+  chmod +x "$A/dl/rustup-init-1.29.1"
+  need_mem 1200
+  # --no-modify-path leaves your shell profile alone; Forge puts ~/.cargo/bin on its own PATH.
+  capped 1200 "$A/dl/rustup-init-1.29.1" -y --no-modify-path --profile minimal --default-toolchain stable \
+    -c rust-analyzer -c rust-src -c clippy -c rustfmt
+}
+
 case "$WANT" in
   lsp) do_lsp ;;
   debug) do_debug ;;
   docs) do_docs ;;
   voice) do_voice ;;
   index) do_index ;;
-  all) do_docs; do_debug; do_lsp; do_voice; do_index ;;
-  *) echo "Usage: $0 [lsp|debug|docs|voice|index|all]"; exit 2 ;;
+  android) do_android ;;
+  rust) do_rust ;;
+  all) do_docs; do_debug; do_lsp; do_voice; do_index; do_android; do_rust ;;
+  *) echo "Usage: $0 [lsp|debug|docs|voice|index|android|rust|all]"; exit 2 ;;
 esac
 echo "Done. Restart Forge with: forge-ide restart"

@@ -146,8 +146,10 @@ class OllamaClient:
 
     def chat_stream(self, model: str, messages: List[dict], options: Optional[dict] = None,
                     tools: Optional[list] = None, keep_alive: str = "30m",
-                    cancel: Optional[threading.Event] = None) -> Iterator[dict]:
+                    cancel: Optional[threading.Event] = None, think: Optional[bool] = None) -> Iterator[dict]:
         body: Dict[str, Any] = {"model": model, "messages": messages, "keep_alive": keep_alive}
+        if think is not None:
+            body["think"] = think
         if options:
             body["options"] = options
         if tools:

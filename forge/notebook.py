@@ -18,11 +18,11 @@ import time
 from typing import Callable, Dict, Optional, Set
 
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel_runner.py")
-KERNEL_MEMORY_MAX = "2G"
+KERNEL_MEMORY_MAX = "1536M"
 IDLE_STOP_S = 30 * 60          # a kernel nobody has used for 30 minutes is stopped
 DETACHED_STOP_S = 10 * 60      # a kernel with no open notebook window is stopped after 10 minutes
-KERNEL_MIN_VM_MB = 700
-KERNEL_MIN_HOST_MB = 2300
+KERNEL_MIN_VM_MB = 1800       # the kernel may grow to its cap, so the cap must fit in free memory
+KERNEL_MIN_HOST_MB = 3800     # the cap plus the 2.3 GB the Googlebook keeps free
 
 
 class Kernel:
@@ -41,9 +41,11 @@ class Kernel:
         env = dict(os.environ, PYTHONUNBUFFERED="1", MPLBACKEND="Agg", FORGE_PARENT_PID=str(os.getpid()),
                    FORGE_NOTEBOOK_DIR=os.path.dirname(self.path))
         cmd = [sys.executable, "-u", RUNNER]
+        self.unit = None
         if shutil.which("systemd-run"):
-            cmd = ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={KERNEL_MEMORY_MAX}",
-                   "-p", "MemorySwapMax=0"] + cmd
+            from .toolchains import scope_argv
+            prefix, self.unit = scope_argv("kernel", KERNEL_MEMORY_MAX)
+            cmd = prefix + cmd
         os.makedirs(self.log_dir, exist_ok=True)
         err = open(os.path.join(self.log_dir, "kernel.log"), "ab")
         self.proc = subprocess.Popen(["nice", "-n", "3"] + cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -70,7 +72,7 @@ class Kernel:
         self.busy = False
         code = proc.poll()
         self.broadcast({"type": "exit", "code": code,
-                        "message": "The kernel stopped" + (" (it ran out of its 2 GB memory limit)" if code in (-9, 137) else "") + "."})
+                        "message": "The kernel stopped" + (" (it ran out of its 1.5 GB memory limit)" if code in (-9, 137) else "") + "."})
 
     def broadcast(self, msg: dict) -> None:
         for l in list(self.listeners):
@@ -101,6 +103,8 @@ class Kernel:
         p, self.proc = self.proc, None
         if p is None:
             return
+        from .toolchains import stop_scope
+        threading.Thread(target=stop_scope, args=(getattr(self, "unit", None),), name="kernel-scope-stop", daemon=True).start()
         try:
             pgid = os.getpgid(p.pid)
         except OSError:

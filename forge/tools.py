@@ -30,7 +30,8 @@ DANGEROUS_COMMAND = re.compile(
     r"(^|[;&|]\s*)(sudo\s+)?(rm\s+-[a-zA-Z]*r|rm\s+-[a-zA-Z]*f|rmdir|mkfs|dd\s+if=|shred|chmod\s+-R\s+777|"
     r":\(\)\s*\{|git\s+(push\s+.*--force|reset\s+--hard|clean\s+-[a-zA-Z]*f)|"
     r"pm\s+(uninstall|clear)|adb\s+.*\b(rm|uninstall|clear)\b|truncate\s|>\s*/dev/sd|killall|pkill\s+-9|"
-    r"shutdown|reboot|poweroff|halt|systemctl\s+(stop|disable|mask))", re.IGNORECASE)
+    r"shutdown|reboot|poweroff|halt|systemctl\s+(stop|disable|mask)|fastboot\s+.*\b(flash|erase|format|oem|flashing|unlock)\b|"
+    r"sdkmanager\s+.*--uninstall|cargo\s+uninstall)", re.IGNORECASE)
 
 
 def is_dangerous_command(cmd: str) -> bool:
@@ -584,16 +585,25 @@ class Workspace:
         return _clip(f"{len(lines)} matches for '{pattern}':\n" + "\n".join(out) + more)
 
     # ------------------------------------------------------------------ commands
-    def run_command(self, command: str, timeout: float = 90.0, cwd: Optional[str] = None) -> Tuple[str, int]:
-        timeout = max(1.0, min(float(timeout or 90.0), 600.0))
+    def run_command(self, command: str, timeout: float = 90.0, cwd: Optional[str] = None,
+                    memory_cap_mb: Optional[int] = None) -> Tuple[str, int]:
+        timeout = max(1.0, min(float(timeout or 90.0), 900.0 if (memory_cap_mb or "forge-gradle" in command) else 600.0))
         wd = self.resolve(cwd, must_exist=True) if cwd else self.root
-        env = dict(os.environ)
+        from .toolchains import tool_env
+        env = tool_env()
         env.setdefault("TERM", "dumb")
         env["FORGE_IDE"] = "1"
         env["NO_AUTO_TMUX"] = "1"
+        argv = ["bash", "-lc", 'export PATH="${FORGE_PATH_PREPEND:+$FORGE_PATH_PREPEND:}$PATH"\n' + command]
+        unit = None
+        if memory_cap_mb and shutil.which("systemd-run"):
+            # Builds run inside a memory cap: a build that grows too large is stopped instead of squeezing the VM.
+            from .toolchains import scope_argv
+            prefix, unit = scope_argv("build", f"{int(memory_cap_mb)}M")
+            argv = prefix + argv
         start = time.monotonic()
         try:
-            proc = subprocess.Popen(["bash", "-lc", command], cwd=wd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            proc = subprocess.Popen(argv, cwd=wd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL, env=env, start_new_session=True)
         except OSError as e:
             return f"Failed to start command: {e}", -1
@@ -627,6 +637,9 @@ class Workspace:
             self._kill(proc)
             chunks.append(f"\n[error while running: {e}]".encode())
         code = proc.returncode if proc.returncode is not None else -1
+        if unit:
+            from .toolchains import stop_scope
+            stop_scope(unit)   # nothing the build started (a daemon, for example) keeps running and holding memory
         text = b"".join(chunks).decode("utf-8", errors="replace")
         if total > cap:
             text += f"\n[output capped at {cap:,} bytes; {total - cap:,} bytes dropped]"
