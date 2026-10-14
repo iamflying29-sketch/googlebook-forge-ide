@@ -1,0 +1,28 @@
+#!/bin/bash
+# forge-ide: start, stop or inspect the Forge IDE server (a local Cursor-style AI coding IDE for Ollama).
+#
+#   forge-ide                 start in the foreground (Ctrl+C stops it)
+#   forge-ide start|stop|restart|status|log    manage the background service (systemd user unit)
+#   forge-ide open [FOLDER]   set the workspace folder and print the URL
+#   forge-ide model           rebuild the tuned "forge-coder" model from model/Modelfile
+#   forge-ide bench           quick speed test of the model on this machine
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+PORT="${FORGE_PORT:-8765}"
+cmd="${1:-run}"
+case "$cmd" in
+  run)        shift || true; exec python3 -m forge --port "$PORT" "$@" ;;
+  start)      systemctl --user start forge-ide.service && echo "Forge IDE started: http://localhost:$PORT" ;;
+  stop)       systemctl --user stop forge-ide.service && echo "Forge IDE stopped" ;;
+  restart)    systemctl --user restart forge-ide.service && echo "Forge IDE restarted: http://localhost:$PORT" ;;
+  status)     systemctl --user --no-pager status forge-ide.service || true
+              echo; echo "URL: http://localhost:$PORT"; timeout 5 curl -s "http://127.0.0.1:$PORT/api/status" | python3 -m json.tool 2>/dev/null || echo "(server not answering)" ;;
+  log)        journalctl --user -u forge-ide.service -n "${2:-50}" --no-pager ;;
+  open)       folder="${2:-$PWD}"; folder="$(cd "$folder" && pwd)"
+              timeout 10 curl -s -X POST "http://127.0.0.1:$PORT/api/workspace" -H 'Content-Type: application/json' \
+                 -d "{\"path\": \"$folder\", \"create\": true}" >/dev/null && echo "Workspace: $folder" || echo "Server not running; start it with: forge-ide start"
+              echo "Open http://localhost:$PORT in Chrome" ;;
+  model)      ( cd "$HERE/model" && timeout 600 ollama create forge-coder -f Modelfile ) ;;
+  bench)      timeout 900 python3 -I "$HERE/model/bench.py" "${2:-forge-coder}" ;;
+  *)          sed -n '2,10p' "$0"; exit 1 ;;
+esac

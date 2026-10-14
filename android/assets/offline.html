@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forge</title>
+<style>
+  body { margin: 0; background: #0f1117; color: #d7dbe7; font: 15px/1.5 -apple-system, Roboto, "Segoe UI", sans-serif; display: grid; place-items: center; height: 100vh; }
+  .box { max-width: 520px; text-align: center; padding: 24px; }
+  .logo { display: inline-grid; place-items: center; width: 64px; height: 64px; border-radius: 16px; background: linear-gradient(135deg, #ff8a3d, #ff5e62); color: #fff; font-weight: 900; font-size: 34px; margin-bottom: 12px; }
+  h1 { font-size: 22px; margin: 6px 0; }
+  p { color: #a7adbf; }
+  .btn { display: inline-block; margin: 8px 6px 0; padding: 10px 18px; border-radius: 8px; background: #ff8a3d; color: #1a1000; font-weight: 600; text-decoration: none; border: 0; font-size: 15px; cursor: pointer; }
+  .btn.ghost { background: #222738; color: #d7dbe7; }
+  .status { margin-top: 14px; font-size: 13px; color: #717896; min-height: 20px; }
+  ol { text-align: left; color: #a7adbf; }
+</style></head>
+<body><div class="box">
+  <div class="logo">F</div>
+  <h1>Forge is not running yet</h1>
+  <p>Forge lives in the Linux Terminal VM. Open the Terminal app once so the VM starts; Forge starts with it automatically. This screen keeps checking and opens the IDE as soon as it answers.</p>
+  <ol>
+    <li>Open the <b>Terminal</b> app (it can stay in the background).</li>
+    <li>Wait a few seconds for the VM to boot.</li>
+    <li>Forge opens here by itself, or press Retry.</li>
+  </ol>
+  <button class="btn" onclick="ForgeApp.retry()">Retry now</button>
+  <button class="btn ghost" onclick="ForgeApp.openTerminal()">Open Terminal app</button>
+  <div class="status" id="status"></div>
+</div>
+<script>
+  let n = 0;
+  function tick() { n++; document.getElementById('status').textContent = 'Checking… (' + n + ')'; ForgeApp.retry(); }
+  setInterval(tick, 3000);
+</script>
+</body></html>

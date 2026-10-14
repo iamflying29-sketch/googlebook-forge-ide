@@ -1,0 +1,16 @@
+[Unit]
+Description=Forge IDE (local Cursor-style AI coding IDE for Ollama)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/forge-ide
+ExecStart=/usr/bin/python3 -m forge --port 8765
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+# Never let a runaway run eat the machine: 2 GB cap for the IDE server itself (the model lives in Ollama).
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target

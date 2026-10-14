@@ -1,0 +1,30 @@
+# Build outputs and packaged binaries
+build/
+*.apk
+*.idsig
+*.dex
+*.class
+res.zip
+android/jni/
+# Vendored browser libraries (download them with static/fetch-vendor.sh)
+static/vendor/
+# Models and engine build trees
+*.gguf
+models/
+llama.cpp/
+android-ndk-*/
+# Keystores, keys and secrets
+*.jks
+*.keystore
+*.p12
+*.pem
+*.pass
+adbkey*
+# Logs, caches, editor files
+*.log
+logs/
+__pycache__/
+*.pyc
+.forge-trash/
+.DS_Store
+*.swp
