@@ -13,9 +13,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import prompts
 from .ollama_client import OllamaClient, OllamaError
-from .tools import NEEDS_APPROVAL, TOOL_NAMES, Workspace, is_dangerous_command, ollama_tool_schemas
+from .tools import NEEDS_APPROVAL, TOOL_NAMES, Workspace, is_dangerous_command, ollama_tool_schemas, outside_change_reason
 
-READ_ONLY_TOOLS = {"read_file", "list_dir", "find_files", "search", "web_fetch", "web_search", "codebase_search", "ask_user"}
+READ_ONLY_TOOLS = {"read_file", "list_dir", "find_files", "search", "web_fetch", "web_search", "codebase_search", "ask_user",
+                   "look_at_image"}
 TAGS = ("<thinking>", "</thinking>", "<tool_call>", "</tool_call>")
 
 
@@ -296,6 +297,7 @@ class Agent:
         self.ws = workspace
         self.settings = settings
         self.session = session          # persisted dict: messages, auto_approve, repo_map ...
+        self.vision: Any = None         # VisionManager: the eyes Llama 3.1 does not have
 
     # ----------------------------------------------------------- helpers
     def _options(self) -> dict:
@@ -405,8 +407,13 @@ class Agent:
             msgs.insert(0, {"role": "system", "content": system})
         elif msgs[0]["content"] != system:
             msgs[0]["content"] = system
-        content = self._compose_user_message(user_text, attachments)
-        msgs.append({"role": "user", "content": content})
+        content = self._compose_user_message(user_text, attachments, run)
+        user_msg: Dict[str, Any] = {"role": "user", "content": content}
+        if self.settings.get("native_images"):
+            imgs = self._native_images(attachments)
+            if imgs:
+                user_msg["images"] = imgs
+        msgs.append(user_msg)
         max_iters = int(self.settings.get("max_iterations", 30))
         native = self.settings.get("tool_mode", "prompt") == "native" and mode != "ask"
         model = self.settings.get("model", "llama3.1")
@@ -455,12 +462,60 @@ class Agent:
                 return
             msgs.append({"role": "tool", "content": result})
 
-    def _compose_user_message(self, text: str, attachments: List[dict]) -> str:
+    def _native_images(self, attachments: List[dict]) -> List[str]:
+        import base64
+        out = []
+        for a in attachments:
+            if a.get("kind") == "image" and self.vision is not None:
+                found = self.vision.images.find(str(a.get("id", "")))
+                if found:
+                    with open(found[0], "rb") as fh:
+                        out.append(base64.b64encode(fh.read()).decode())
+        return out
+
+    def _describe_image(self, a: dict, number: int, run: Optional["Run"]) -> str:
+        """Turn an attached image into text Llama can use: the vision model's description plus the recognized text."""
+        img_id = str(a.get("id", ""))
+        if self.vision is None:
+            return f"\n### Image {number}\n[the image could not be read: no vision helper]"
+        emit = (lambda t: run.emit("status", text=t)) if run is not None else (lambda t: None)
+        res = self.vision.analyze(img_id, self.settings, emit)
+        if res.get("error"):
+            return f"\n### Image {number}\n[the image could not be read: {res['error']}]"
+        desc = (res.get("description") or "").strip()
+        ocr = (res.get("ocr") or "").strip()
+        source = res.get("source", "")
+        if run is not None:
+            run.emit("image_analysis", number=number, id=img_id, source=source, description=desc, ocr=ocr[:6000])
+        name = a.get("name") or "screenshot"
+        lines = [f"\n### Image {number}: {name} (image id: {img_id})",
+                 "You cannot see images yourself. Your vision helper looked at it for you. To ask it anything else about "
+                 f"this image, call look_at_image with image \"{img_id}\" and your question."]
+        if desc:
+            lines.append(f"What the vision model ({source}) sees:\n{desc}")
+        else:
+            lines.append("The vision model was not available for this image, so only the recognized text is below.")
+        if ocr:
+            lines.append("Text recognized in the image (OCR, may contain small mistakes):\n```\n" + ocr[:6000] + "\n```")
+        elif not desc:
+            lines.append("No text was recognized in the image.")
+        return "\n".join(lines)
+
+    def _compose_user_message(self, text: str, attachments: List[dict], run: Optional["Run"] = None) -> str:
         if not attachments:
             return text
         parts = [text, "\n\n## Attached context"]
+        image_no = 0
+        if self.vision is not None and any(a.get("kind") == "image" for a in attachments):
+            with self.vision.hold():
+                for a in attachments:
+                    if a.get("kind") == "image":
+                        image_no += 1
+                        parts.append(self._describe_image(a, image_no, run))
         for a in attachments:
             kind = a.get("kind", "file")
+            if kind == "image":
+                continue
             if kind == "selection":
                 parts.append(f"\n### Selection from {a.get('path')} (lines {a.get('start')}-{a.get('end')})\n```{a.get('language','')}\n{a.get('text','')}\n```")
             elif kind == "file":
@@ -505,6 +560,10 @@ class Agent:
         stats: Optional[dict] = None
         last_obj: Optional[dict] = None
         tools = ollama_tool_schemas() if native else None
+        if hasattr(self.client, "wait_ready") and not self.client.alive():
+            ok = self.client.wait_ready(300, lambda: run.emit("status", text="Waiting for Llama's GPU engine to resume…"), run.cancel)
+            if not ok:
+                raise OllamaError("The GPU engine did not come back. Start it again from the Forge app (Settings, GPU engine card).")
         options = self._options()
         if native:
             options = {k: v for k, v in options.items() if k != "stop"}
@@ -625,6 +684,22 @@ class Agent:
             run.emit("tool_result", call_id=call_id, name=name, result="(waiting for the user's answer)", ok=True)
             self.session["messages"].append({"role": "assistant", "content": f"Question for the user: {q}"})
             return None
+        # Changes outside the project folder (Cursor's External-File Protection): ask first.
+        if name in ("write_file", "edit_file") and args.get("path"):
+            try:
+                target = self.ws.resolve(str(args.get("path")))
+            except Exception:  # noqa: BLE001
+                target = None
+            reason = outside_change_reason(self.ws, target, bool(self.settings.get("external_file_protection", True))) if target else None
+            if reason:
+                decision = run.request_approval(name, self._display_args({**args, "path": target}), reason)
+                if decision.get("decision") not in ("approve", "always"):
+                    run.emit("approval_resolved", call_id=call_id, decision="denied")
+                    res = ("The user declined this change outside the project folder. Ask them how to proceed or keep "
+                           "the change inside the project.")
+                    run.emit("tool_result", call_id=call_id, name=name, result=res, ok=False)
+                    return res
+                run.emit("approval_resolved", call_id=call_id, decision="approved")
         # Approval
         needs = name in NEEDS_APPROVAL or name.startswith("mcp_")
         if needs:
@@ -690,7 +765,7 @@ class Agent:
         if name == "list_dir":
             return ws.list_dir(str(s("path", ".")) or ".")
         if name == "find_files":
-            return ws.find_files(str(need("pattern")))
+            return ws.find_files(str(need("pattern")), path=s("path"))
         if name == "search":
             return ws.search(str(need("pattern")), str(s("path", ".")) or ".", s("glob"), bool(s("regex", False)))
         if name == "write_file":
@@ -720,6 +795,22 @@ class Agent:
             if idx is None:
                 idx = ws.code_index = CodeIndex(ws.root)
             return idx.search_text(str(need("query")))
+        if name == "look_at_image":
+            if self.vision is None:
+                raise ValueError("no vision helper is available")
+            target = str(need("image"))
+            question = str(s("question", "") or "").strip() or "Describe this image precisely."
+            found = self.vision.image_from_target(target, ws)
+            if not found:
+                raise ValueError(f"'{target}' is not an image id from this chat or a readable PNG, JPEG, GIF or WebP file.")
+            path, mime = found
+            answer, source = self.vision.ask(path, mime, question, self.settings, lambda t: run.emit("status", text=t))
+            if answer:
+                return f"Answer from the vision model ({source}):\n{answer}"
+            from .images import run_ocr
+            ocr = run_ocr(path)
+            return ("The vision model is not available right now, so here is only the text recognized in the image "
+                    "(OCR):\n" + (ocr or "(no text found)"))
         if name.startswith("mcp_"):
             from .mcp import MCP
             return MCP.get().call_tool(name, a)

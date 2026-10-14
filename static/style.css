@@ -392,3 +392,43 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .srow textarea { min-height: 110px; padding: 6px 8px; font: 12px var(--mono); resize: vertical; }
 .mcp-server { display: flex; justify-content: space-between; gap: 6px; padding: 4px 0; font-size: 12px; }
 .mcp-server .ok { color: var(--green); } .mcp-server .bad { color: var(--red); }
+
+/* ---------- folders, scopes, runs ---------- */
+.scope-chip { font-size: 10.5px; padding: 1px 8px; margin-right: 4px; text-transform: none; letter-spacing: 0; }
+.scope-tabs { display: flex; gap: 4px; margin: 6px 0 2px; }
+.scope-tab { flex: 1; padding: 5px 8px; border-radius: 6px; background: var(--bg-3); border: 1px solid var(--border); color: var(--fg-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scope-tab.active { border-color: var(--accent); color: var(--accent-2); background: var(--accent-soft); }
+.scope-hint { margin: 4px 0 6px; }
+.srow label .ovr { color: var(--accent-2); cursor: pointer; font-size: 11px; }
+.srow label .ovr:hover { text-decoration: underline; }
+.srow label .inh { color: var(--fg-3); font-size: 11px; }
+.run-head { padding: 8px 12px 4px; border-top: 1px solid var(--border); }
+.run-head .run-title { font-size: 12.5px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-head .run-meta { display: flex; justify-content: space-between; align-items: center; gap: 6px; font-size: 11px; color: var(--fg-3); margin-top: 3px; }
+.fitem.rec { display: flex; justify-content: space-between; gap: 6px; }
+.fitem.rec .rec-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.fitem.rec .rec-new { color: var(--fg-3); padding: 0 4px; border-radius: 4px; }
+.fitem.rec .rec-new:hover { color: var(--accent); background: var(--bg-4); }
+.hist-folder { padding: 8px 12px 3px; font-size: 11px; text-transform: uppercase; letter-spacing: .7px; color: var(--accent-2); display: flex; justify-content: space-between; gap: 6px; }
+.hist-folder .hf-path { color: var(--fg-3); text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hist .hw { color: var(--fg-3); visibility: hidden; padding: 0 3px; }
+.hist:hover .hw { visibility: visible; }
+.hist .hw:hover { color: var(--accent); }
+.files-row { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+
+/* ---------- images in chat ---------- */
+.cchip.img { padding: 2px 6px 2px 2px; }
+.cchip.img img { width: 34px; height: 24px; object-fit: cover; border-radius: 3px; display: block; }
+.cchip.img.busy { opacity: .6; }
+.msg-images { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; max-width: 92%; }
+.msg-images img { max-width: 220px; max-height: 150px; border-radius: 8px; border: 1px solid var(--border-2); cursor: zoom-in; object-fit: cover; background: var(--bg); }
+.vision { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-2); font-size: 12px; }
+.vision summary { list-style: none; display: flex; align-items: center; gap: 6px; padding: 6px 10px; cursor: pointer; color: var(--blue); user-select: none; }
+.vision summary::-webkit-details-marker { display: none; }
+.vision .vbody { padding: 0 12px 8px; color: var(--fg-2); white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow: auto; }
+.vision .vsect { font-size: 10.5px; text-transform: uppercase; letter-spacing: .6px; color: var(--fg-3); margin: 6px 0 2px; }
+.vision pre { margin: 0; font: 11.5px/1.45 var(--mono); white-space: pre-wrap; }
+.lightbox { place-items: center; padding: 0; cursor: zoom-out; background: rgba(5,7,12,.85); }
+.lightbox img { max-width: 94vw; max-height: 88vh; border-radius: 8px; box-shadow: 0 20px 60px rgba(0,0,0,.6); }
+.lightbox .lb-hint { position: fixed; bottom: 18px; left: 0; right: 0; text-align: center; color: var(--fg-3); font-size: 12px; }
+.drop-hint { position: fixed; inset: 12px; border: 2px dashed var(--accent); border-radius: 14px; background: rgba(255,138,61,.08); display: grid; place-items: center; color: var(--accent-2); font-size: 16px; z-index: 150; pointer-events: none; }

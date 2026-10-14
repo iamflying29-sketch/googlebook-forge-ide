@@ -1,6 +1,7 @@
 package local.forge;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.content.Intent;
 import android.graphics.Color;
 import android.os.Bundle;
@@ -10,7 +11,12 @@ import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.net.Uri;
+import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.webkit.ConsoleMessage;
+import android.webkit.ValueCallback;
+import android.widget.FrameLayout;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
@@ -36,6 +42,10 @@ public class MainActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile boolean checking = false;
     private boolean showingOffline = false;
+    /** Path this window opens on the Forge server, for example "/?folder=/home/you/projects". */
+    private String startPath = "/";
+    private ValueCallback<Uri[]> fileCallback;
+    private static final int PICK_FILES = 42;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -57,6 +67,22 @@ public class MainActivity extends Activity {
         s.setUserAgentString(s.getUserAgentString() + " ForgeApp/1.0");
         web.addJavascriptInterface(new Bridge(), "ForgeApp");
         web.setWebChromeClient(new WebChromeClient() {
+            /** Lets the IDE's image button open the system picker (WebView has no file chooser of its own). */
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
+                if (fileCallback != null) fileCallback.onReceiveValue(null);
+                fileCallback = callback;
+                try {
+                    Intent i = params.createIntent();
+                    if (params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE) i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                    startActivityForResult(i, PICK_FILES);
+                    return true;
+                } catch (Exception e) {
+                    fileCallback = null;
+                    return false;
+                }
+            }
+
             @Override
             public boolean onConsoleMessage(ConsoleMessage m) {
                 Log.d(TAG, "console[" + m.messageLevel() + "] " + m.message() + " (" + m.sourceId() + ":" + m.lineNumber() + ")");
@@ -77,7 +103,19 @@ public class MainActivity extends Activity {
                 if (request.isForMainFrame()) showOffline();
             }
         });
-        setContentView(web);
+        // Edge-to-edge (Android 15 and later): keep the IDE clear of the status bar in maximized and full-screen windows.
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(Color.parseColor("#0f1117"));
+        root.addView(web, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        root.setOnApplyWindowInsetsListener((v, insets) -> {
+            android.graphics.Insets i = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
+            v.setPadding(i.left, i.top, i.right, i.bottom);
+            return WindowInsets.CONSUMED;
+        });
+        setContentView(root);
+        VisionControl.ensure(this);
+        String p = getIntent() != null ? getIntent().getStringExtra("path") : null;
+        if (p != null && p.startsWith("/")) startPath = p;
         if (savedInstanceState != null) web.restoreState(savedInstanceState);
         else connect();
         if (getIntent() != null && getIntent().getBooleanExtra("start_engine", false)) EngineService.start(this);
@@ -91,7 +129,7 @@ public class MainActivity extends Activity {
             boolean up = serverUp();
             main.post(() -> {
                 checking = false;
-                if (up) { showingOffline = false; web.loadUrl(SERVER + "/"); }
+                if (up) { showingOffline = false; web.loadUrl(SERVER + startPath); }
                 else showOffline();
             });
         }, "forge-probe").start();
@@ -133,8 +171,31 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public String engineLog() { return EngineService.logTail(); }
 
+
         @JavascriptInterface
-        public String appVersion() { return "1.1"; }
+        public String appVersion() { return "1.3"; }
+
+        /** Opens a separate Forge window (its own task in the taskbar), like Cursor's New Window. */
+        @JavascriptInterface
+        public void newWindow(String path) {
+            if (path == null || !path.startsWith("/")) path = "/";
+            final String target = path;
+            main.post(() -> {
+                Intent i = new Intent(MainActivity.this, MainActivity.class);
+                i.putExtra("path", target);
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
+                startActivity(i);
+            });
+        }
+
+        /** Labels this window in the taskbar and the overview with its folder name. */
+        @JavascriptInterface
+        public void setTitle(String name) {
+            final String label = (name == null || name.isEmpty()) ? "Forge" : name + " · Forge";
+            main.post(() -> {
+                try { setTaskDescription(new ActivityManager.TaskDescription(label)); } catch (Exception ignored) { }
+            });
+        }
 
         @JavascriptInterface
         public void retry() { main.post(() -> { showingOffline = false; connect(); }); }
@@ -158,6 +219,24 @@ public class MainActivity extends Activity {
             return true;
         }
         return super.onKeyDown(keyCode, event);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != PICK_FILES || fileCallback == null) return;
+        Uri[] result = null;
+        if (resultCode == RESULT_OK && data != null) {
+            if (data.getClipData() != null) {
+                int n = data.getClipData().getItemCount();
+                result = new Uri[n];
+                for (int k = 0; k < n; k++) result[k] = data.getClipData().getItemAt(k).getUri();
+            } else if (data.getData() != null) {
+                result = new Uri[]{data.getData()};
+            }
+        }
+        fileCallback.onReceiveValue(result);
+        fileCallback = null;
     }
 
     @Override

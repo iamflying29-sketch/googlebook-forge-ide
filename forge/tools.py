@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -49,35 +50,145 @@ def _is_binary_path(path: str) -> bool:
 
 @dataclass
 class FileChange:
-    path: str                      # relative path
-    kind: str                      # created | modified | deleted
+    path: str                      # display path: relative inside the project, absolute outside it
+    kind: str                      # created | modified | deleted | reverted
     before: Optional[str]          # original content (None when the file did not exist)
     after: Optional[str]           # new content (None when deleted)
     ts: float = field(default_factory=time.time)
+    revertable: bool = True        # False when the snapshot was too large to keep on disk
+
+
+MAX_SNAPSHOT_CHARS = 2_000_000     # larger files are still edited, but their snapshot is not stored on disk
 
 
 class Checkpoints:
     """Remembers the original content of every file an agent run touches so changes can be reviewed
-    and reverted. Only the first snapshot per run and file is kept (the state before the run)."""
+    and reverted. Only the first snapshot per run and file is kept (the state before the run).
 
-    def __init__(self) -> None:
+    Every run is saved to its own JSON file, so checkpoints survive restarts of the server and the VM,
+    and each run remembers the project folder, the chat and the request it belongs to."""
+
+    def __init__(self, store_dir: Optional[str] = None) -> None:
         self.runs: Dict[str, Dict[str, FileChange]] = {}
+        self.meta: Dict[str, dict] = {}
+        self.store_dir = store_dir
+        self.lock = threading.RLock()
+        if store_dir:
+            os.makedirs(store_dir, exist_ok=True)
+            self._load()
+
+    # ---------------------------------------------------------- bookkeeping
+    def begin(self, run_id: str, workspace: str, session_id: str = "", title: str = "") -> None:
+        with self.lock:
+            if run_id not in self.meta:
+                self.meta[run_id] = {"workspace": workspace, "session_id": session_id,
+                                     "title": (title or "").strip()[:160], "ts": time.time()}
 
     def record(self, run_id: str, rel: str, before: Optional[str], after: Optional[str]) -> None:
-        run = self.runs.setdefault(run_id, {})
-        if rel in run:
-            run[rel].after = after
-            if run[rel].kind == "created" and after is None:
-                run[rel].kind = "deleted"
-            return
-        kind = "created" if before is None else ("deleted" if after is None else "modified")
-        run[rel] = FileChange(rel, kind, before, after)
+        with self.lock:
+            run = self.runs.setdefault(run_id, {})
+            if rel in run:
+                run[rel].after = after
+                if run[rel].kind == "created" and after is None:
+                    run[rel].kind = "deleted"
+            else:
+                kind = "created" if before is None else ("deleted" if after is None else "modified")
+                run[rel] = FileChange(rel, kind, before, after)
+            self.save(run_id)
 
     def changes(self, run_id: str) -> List[FileChange]:
-        return list(self.runs.get(run_id, {}).values())
+        with self.lock:
+            return list(self.runs.get(run_id, {}).values())
 
     def get(self, run_id: str, rel: str) -> Optional[FileChange]:
-        return self.runs.get(run_id, {}).get(rel)
+        with self.lock:
+            return self.runs.get(run_id, {}).get(rel)
+
+    def run_meta(self, run_id: str) -> dict:
+        return dict(self.meta.get(run_id, {}))
+
+    def list_runs(self, workspace: Optional[str] = None) -> List[dict]:
+        """Runs that changed files, newest first, optionally only those of one project folder."""
+        with self.lock:
+            out = []
+            for rid, files in self.runs.items():
+                if not files:
+                    continue
+                m = self.meta.get(rid, {})
+                if workspace and m.get("workspace") and m.get("workspace") != workspace:
+                    continue
+                ts = m.get("ts") or max((c.ts for c in files.values()), default=0)
+                out.append({"run_id": rid, "workspace": m.get("workspace", ""), "session_id": m.get("session_id", ""),
+                            "title": m.get("title", ""), "ts": ts, "files": list(files.values())})
+            out.sort(key=lambda r: -r["ts"])
+            return out
+
+    # ---------------------------------------------------------- persistence
+    def save(self, run_id: str) -> None:
+        if not self.store_dir:
+            return
+        with self.lock:
+            files = []
+            for ch in self.runs.get(run_id, {}).values():
+                d = {"path": ch.path, "kind": ch.kind, "ts": ch.ts, "revertable": ch.revertable,
+                     "before": ch.before, "after": ch.after}
+                if (ch.before is not None and len(ch.before) > MAX_SNAPSHOT_CHARS) or \
+                        (ch.after is not None and len(ch.after) > MAX_SNAPSHOT_CHARS):
+                    d["before"] = None if ch.before is None else ""
+                    d["after"] = None if ch.after is None else ""
+                    d["revertable"] = False
+                    d["omitted"] = True
+                files.append(d)
+            data = {"run_id": run_id, **self.meta.get(run_id, {}), "files": files}
+            path = os.path.join(self.store_dir, run_id + ".json")
+            tmp = path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, ensure_ascii=False)
+                os.replace(tmp, path)
+            except OSError:
+                pass
+
+    def _load(self) -> None:
+        try:
+            names = [n for n in os.listdir(self.store_dir) if n.endswith(".json")]
+        except OSError:
+            return
+        for n in names:
+            try:
+                with open(os.path.join(self.store_dir, n), "r", encoding="utf-8") as fh:
+                    d = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            rid = d.get("run_id") or n[:-5]
+            self.meta[rid] = {k: d.get(k) for k in ("workspace", "session_id", "title", "ts")}
+            run = self.runs.setdefault(rid, {})
+            for f in d.get("files", []):
+                run[f["path"]] = FileChange(f["path"], f.get("kind", "modified"), f.get("before"), f.get("after"),
+                                            f.get("ts", time.time()), bool(f.get("revertable", True)) and not f.get("omitted"))
+
+
+# Places outside a project where a change always needs the user's approval, even with protection turned off.
+SYSTEM_PREFIXES = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/boot", "/var", "/opt", "/srv",
+                   "/root", "/proc", "/sys", "/dev", "/run", "/snap")
+SENSITIVE_HOME_DIRS = (".ssh", ".gnupg", ".config/gh", ".claude", ".local/bin", ".android")
+
+
+def outside_change_reason(ws: "Workspace", abs_path: str, protection_on: bool) -> Optional[str]:
+    """Why a change to abs_path needs approval, or None when it may proceed automatically."""
+    p = os.path.realpath(abs_path)
+    if ws.is_inside(p):
+        return None
+    if p == "/" or any(p == pre or p.startswith(pre + os.sep) for pre in SYSTEM_PREFIXES):
+        return f"This changes a system file outside the project: {p}"
+    home = os.path.expanduser("~")
+    for d in SENSITIVE_HOME_DIRS:
+        sp = os.path.join(home, d)
+        if p == sp or p.startswith(sp + os.sep):
+            return f"This changes a sensitive file outside the project: {p}"
+    if protection_on:
+        return f"This changes a file outside the project: {p}"
+    return None
 
 
 class Workspace:
@@ -87,19 +198,30 @@ class Workspace:
         self._file_cache: Tuple[float, List[str]] = (0.0, [])
 
     # ------------------------------------------------------------------ paths
-    def resolve(self, rel: str, must_exist: bool = False) -> str:
-        rel = (rel or ".").strip()
-        if rel.startswith("~"):
-            raise ValueError("Paths must be relative to the workspace (no ~).")
-        p = os.path.realpath(os.path.join(self.root, rel))
-        if p != self.root and not p.startswith(self.root + os.sep):
-            raise ValueError(f"Path '{rel}' is outside the workspace. Only files inside {self.root} may be used.")
+    def resolve(self, path: str, must_exist: bool = False) -> str:
+        """Relative paths are inside the project; absolute paths and ~ paths may point anywhere on the computer."""
+        path = (path or ".").strip()
+        if path.startswith("~"):
+            p = os.path.expanduser(path)
+        elif os.path.isabs(path):
+            p = path
+        else:
+            p = os.path.join(self.root, path)
+        p = os.path.realpath(p)
         if must_exist and not os.path.exists(p):
-            raise FileNotFoundError(f"'{rel}' does not exist in the workspace.")
+            raise FileNotFoundError(f"'{path}' does not exist.")
         return p
 
+    def is_inside(self, abs_path: str) -> bool:
+        p = os.path.realpath(abs_path)
+        return p == self.root or p.startswith(self.root + os.sep)
+
     def relpath(self, abs_path: str) -> str:
-        return os.path.relpath(abs_path, self.root).replace(os.sep, "/")
+        """Display path: relative inside the project, absolute outside it."""
+        p = os.path.realpath(abs_path)
+        if self.is_inside(p):
+            return os.path.relpath(p, self.root).replace(os.sep, "/")
+        return p
 
     # ------------------------------------------------------------------ listing
     def list_dir(self, rel: str = ".") -> str:
@@ -143,9 +265,29 @@ class Workspace:
         self._file_cache = (now, out)
         return out
 
-    def find_files(self, pattern: str, limit: int = 200) -> str:
+    def _walk_files(self, base: str, max_files: int = 20000, seconds: float = 10.0) -> List[str]:
+        out: List[str] = []
+        deadline = time.monotonic() + seconds
+        for dirpath, dirnames, filenames in os.walk(base):
+            if dirpath in ("/proc", "/sys", "/dev", "/run"):
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in sorted(dirnames) if d not in IGNORED_DIRS and not d.startswith(".")]
+            for f in sorted(filenames):
+                out.append(self.relpath(os.path.join(dirpath, f)))
+                if len(out) >= max_files or time.monotonic() > deadline:
+                    return out
+        return out
+
+    def find_files(self, pattern: str, limit: int = 200, path: Optional[str] = None) -> str:
         pattern = pattern.strip()
-        files = self.all_files()
+        if path and path.strip() not in ("", "."):
+            base = self.resolve(path, must_exist=True)
+            if not os.path.isdir(base):
+                raise ValueError(f"'{path}' is not a folder.")
+            files = self._walk_files(base)
+        else:
+            files = self.all_files()
         if "*" not in pattern and "?" not in pattern:
             matches = [f for f in files if pattern.lower() in f.lower()]
         else:
@@ -334,22 +476,29 @@ class Workspace:
         """Move a file or folder to the workspace's .forge-trash folder instead of deleting it."""
         p = self.resolve(rel, must_exist=True)
         rel = self.relpath(p)
-        if p == self.root:
-            raise ValueError("Refusing to remove the workspace root.")
-        trash = os.path.join(self.root, ".forge-trash", time.strftime("%Y%m%d-%H%M%S"))
+        home = os.path.realpath(os.path.expanduser("~"))
+        if p in (self.root, home, "/") or any(p == pre or p.startswith(pre + os.sep) for pre in SYSTEM_PREFIXES):
+            raise ValueError(f"Refusing to move {p} to the trash.")
+        if self.is_inside(p):
+            trash = os.path.join(self.root, ".forge-trash", time.strftime("%Y%m%d-%H%M%S"))
+        else:
+            trash = os.path.join(os.path.expanduser(os.environ.get("FORGE_HOME", "~/.forge-ide")), "trash", "files",
+                                 time.strftime("%Y%m%d-%H%M%S"))
         os.makedirs(trash, exist_ok=True)
-        dest = os.path.join(trash, rel.replace("/", "__"))
+        dest = os.path.join(trash, rel.strip("/").replace("/", "__"))
         before = self._snapshot(run_id, rel)
         shutil.move(p, dest)
         if run_id and before is not None:
             self.checkpoints.record(run_id, rel, before, None)
         self._file_cache = (0.0, [])
-        return f"Moved {rel} to {self.relpath(dest)} (the workspace trash folder; nothing is permanently deleted)."
+        return f"Moved {rel} to {self.relpath(dest)} (a trash folder; nothing is permanently deleted)."
 
     def revert(self, run_id: str, rel: str) -> str:
         ch = self.checkpoints.get(run_id, rel)
         if ch is None:
             raise ValueError("No checkpoint for that file.")
+        if not ch.revertable:
+            raise ValueError(f"{rel} was too large to keep a snapshot, so it cannot be reverted automatically.")
         p = self.resolve(rel)
         if ch.before is None:
             if os.path.exists(p):
@@ -362,6 +511,7 @@ class Workspace:
             msg = f"Restored {rel} to its content before the run."
         ch.after = ch.before
         ch.kind = "reverted"
+        self.checkpoints.save(run_id)
         self._file_cache = (0.0, [])
         return msg
 
@@ -401,9 +551,13 @@ class Workspace:
     def search(self, pattern: str, rel: str = ".", glob: Optional[str] = None, regex: bool = False,
                max_results: int = 200, timeout: float = 25.0) -> str:
         p = self.resolve(rel, must_exist=True)
-        cmd = ["grep", "-rnI", "--color=never", "-m", "50"]
+        # -D skip: never open devices, FIFOs or sockets (reading one could block forever).
+        cmd = ["grep", "-rnI", "-D", "skip", "--color=never", "-m", "50"]
         for d in IGNORED_DIRS:
             cmd += ["--exclude-dir", d]
+        if p == "/":
+            for d in ("proc", "sys", "dev", "run"):
+                cmd += ["--exclude-dir", d]
         if glob:
             for g in str(glob).split(","):
                 g = g.strip()
@@ -425,7 +579,7 @@ class Workspace:
                 l = l[:300] + " ..."
             out.append(l)
         if not out:
-            return f"No matches for '{pattern}' under {rel or '.'}."
+            return f"No matches for '{pattern}' under {self.relpath(p)}."
         more = f"\n... {len(lines) - max_results} more matches not shown (narrow the search)." if len(lines) > max_results else ""
         return _clip(f"{len(lines)} matches for '{pattern}':\n" + "\n".join(out) + more)
 
@@ -538,28 +692,30 @@ class Workspace:
 
 # ---------------------------------------------------------------------- tool schema
 TOOL_SPECS: List[dict] = [
-    {"name": "read_file", "description": "Read a file from the workspace with line numbers. Use start_line/end_line for big files.",
+    {"name": "read_file", "description": "Read a file with line numbers: a path relative to the project, or an absolute or ~ path anywhere on the computer. Use start_line/end_line for big files.",
      "parameters": {"path": "string, relative path", "start_line": "integer, optional", "end_line": "integer, optional"}},
     {"name": "list_dir", "description": "List the files and folders inside a directory.",
      "parameters": {"path": "string, relative path ('.' for the workspace root)"}},
-    {"name": "find_files", "description": "Find files by name or glob pattern (for example 'config', '*.py', 'src/**/*.ts').",
-     "parameters": {"pattern": "string"}},
+    {"name": "find_files", "description": "Find files by name or glob pattern (for example 'config', '*.py', 'src/**/*.ts'). Searches the project unless path names another folder.",
+     "parameters": {"pattern": "string", "path": "string, optional folder to search (relative, absolute or ~)"}},
     {"name": "search", "description": "Search file contents for text (grep). Returns file:line:match. Use it to find where something is defined or used.",
-     "parameters": {"pattern": "string, the text or regex to find", "path": "string, optional folder to search in", "glob": "string, optional file filter such as '*.py'", "regex": "boolean, optional, treat pattern as a regular expression"}},
+     "parameters": {"pattern": "string, the text or regex to find", "path": "string, optional folder to search in (relative, absolute or ~)", "glob": "string, optional file filter such as '*.py'", "regex": "boolean, optional, treat pattern as a regular expression"}},
     {"name": "write_file", "description": "Create a new file or completely overwrite an existing file with the given content. Parent folders are created.",
      "parameters": {"path": "string", "content": "string, the full file content"}},
     {"name": "edit_file", "description": "Make a precise edit: replace old_text (copied exactly from the file, including indentation) with new_text. old_text must be unique in the file unless replace_all is true.",
      "parameters": {"path": "string", "old_text": "string", "new_text": "string", "replace_all": "boolean, optional"}},
-    {"name": "delete_path", "description": "Move a file or folder to the workspace trash folder (.forge-trash). Requires user approval.",
+    {"name": "delete_path", "description": "Move a file or folder to a trash folder (.forge-trash in the project, ~/.forge-ide/trash outside it). Requires user approval.",
      "parameters": {"path": "string"}},
     {"name": "run_command", "description": "Run a shell command in the workspace (bash) and return its output. Use it to run tests, build, install packages, inspect git, or check versions. Non-interactive only; the user is asked for approval unless auto-run is on.",
-     "parameters": {"command": "string", "timeout": "integer seconds, optional (default 90, max 600)", "cwd": "string, optional relative folder"}},
+     "parameters": {"command": "string", "timeout": "integer seconds, optional (default 90, max 600)", "cwd": "string, optional folder to run in (relative, absolute or ~)"}},
     {"name": "web_fetch", "description": "Fetch a web page or API URL and return its text (documentation, error explanations, package info).",
      "parameters": {"url": "string"}},
     {"name": "web_search", "description": "Search the web and get titles, links and snippets. Follow up with web_fetch on a promising link.",
      "parameters": {"query": "string"}},
     {"name": "codebase_search", "description": "Find the code chunks most related to a question or concept across the whole workspace (ranked keyword search). Good first step when you do not know where something lives.",
      "parameters": {"query": "string, a few descriptive words such as 'websocket terminal resize'"}},
+    {"name": "look_at_image", "description": "Your eyes. You cannot see images yourself; this asks the vision model a specific question about an image and returns its answer. Use an image id from the conversation (attached screenshots list their id) or the path of an image file anywhere on the computer (PNG, JPEG, GIF or WebP). Ask focused questions, for example 'What exactly does the error dialog say?' or 'Which button is highlighted?'. Call it again with a new question whenever you need more detail.",
+     "parameters": {"image": "string, an image id from the conversation or a path to an image file", "question": "string, what you want to know about the image"}},
     {"name": "ask_user", "description": "Stop and ask the user a question when a decision is genuinely theirs (requirements, which option to pick). Do not use it for things you can find out with the other tools.",
      "parameters": {"question": "string"}},
 ]

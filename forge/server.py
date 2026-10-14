@@ -22,6 +22,7 @@ from typing import Any, Dict, Optional
 from . import __version__
 from .agent import Agent, Run, complete, inline_edit_stream
 from .llamacpp_client import LlamaCppClient
+from .vision import VisionManager
 from .ollama_client import OllamaClient, OllamaError
 from .terminal import TerminalManager
 from .tools import Checkpoints, Workspace
@@ -49,6 +50,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "tool_mode": "prompt",
     "max_iterations": 30,
     "auto_approve_commands": False,
+    "external_file_protection": True,
+    "vision": "auto",                    # auto (Intel GPU, then CPU, then text recognition) | gpu | cpu | ocr
+    "vision_cpu_model": "qwen3-vl:2b",   # changes outside the project folder ask first (Cursor's External-File Protection)
     "tab_completions": False,
     "completion_delay_ms": 1200,
     "repo_map_chars": 3000,
@@ -66,6 +70,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "gpu_layers": 99,
 }
 
+
+# Settings a project folder may override in <folder>/.forge/settings.json (like .vscode/settings.json in Cursor).
+# Machine-wide things (the engine, Ollama, the GPU engine, how long the model stays loaded) stay user settings.
+FOLDER_SETTING_KEYS = {"vision", "model", "temperature", "top_p", "top_k", "repeat_penalty", "num_ctx", "num_predict", "thinking",
+                       "verbose", "tool_mode", "max_iterations", "auto_approve_commands", "external_file_protection",
+                       "repo_map_chars", "tab_completions", "completion_delay_ms", "font_size", "prewarm"}
 
 MODEL_LOAD_NEED_MB = 5800   # loading llama3.1 8B Q4_K_M needs about 5.2 GB plus headroom
 
@@ -132,8 +142,11 @@ class State:
         self.gpu_client = LlamaCppClient(f"http://{self.host_ip()}:{int(self.settings.get('gpu_engine_port', 8081))}",
                                          self.settings["gpu_engine_key"])
         self.engine_stats: Dict[str, Any] = {}
-        self.checkpoints = Checkpoints()
-        self.workspace = Workspace(self.settings["workspace"], self.checkpoints)
+        self.checkpoints = Checkpoints(os.path.join(DATA_DIR, "checkpoints"))
+        self.vision = VisionManager(self, DATA_DIR)
+        self.workspaces: Dict[str, Workspace] = {}
+        os.makedirs(os.path.realpath(os.path.expanduser(self.settings["workspace"])), exist_ok=True)
+        self.workspace = self.workspace_for(self.settings["workspace"])   # default folder for windows without one
         self.runs: Dict[str, Run] = {}
         self.sessions: Dict[str, dict] = {}
         self.terminals = TerminalManager()
@@ -161,11 +174,17 @@ class State:
         return out
 
     def unload_model(self) -> None:
-        """Ask Ollama to drop the model from memory right away (frees about 5 GB)."""
+        """Ask Ollama to drop every loaded model from memory right away (the main model frees about 5 GB)."""
+        names = []
         try:
-            self.client._json("POST", "/api/generate", {"model": self.resolve_model(), "keep_alive": 0}, timeout=30)
+            names = [m.get("name") for m in self.ollama.running() if m.get("name")]
         except OllamaError:
             pass
+        for n in names or [self.resolve_model()]:
+            try:
+                self.ollama._json("POST", "/api/generate", {"model": n, "keep_alive": 0}, timeout=30)
+            except OllamaError:
+                pass
 
     def _memory_watchdog(self) -> None:
         """If the VM runs out of memory the host kills it (seen 2026-10-14). Before that happens, stop runs and
@@ -265,26 +284,58 @@ class State:
         s["updated"] = time.time()
         _save_json(os.path.join(SESSIONS_DIR, s["id"] + ".json"), s)
 
-    def new_session(self, title: str = "New chat") -> dict:
-        s = {"id": uuid.uuid4().hex[:10], "title": title, "workspace": self.workspace.root, "created": time.time(),
+    # ------------------------------------------------------------ folders (one per window, like Cursor)
+    def workspace_for(self, path: Optional[str]) -> Workspace:
+        p = os.path.realpath(os.path.expanduser(path or self.settings.get("workspace") or "~"))
+        if not os.path.isdir(p):
+            raise ValueError(f"{p} is not a folder")
+        with self.lock:
+            w = self.workspaces.get(p)
+            if w is None:
+                w = Workspace(p, self.checkpoints)
+                self.workspaces[p] = w
+            return w
+
+    @staticmethod
+    def folder_settings_path(root: str) -> str:
+        return os.path.join(root, ".forge", "settings.json")
+
+    def folder_overrides(self, root: Optional[str]) -> Dict[str, Any]:
+        if not root:
+            return {}
+        d = _load_json(self.folder_settings_path(root), {})
+        return {k: v for k, v in d.items() if k in FOLDER_SETTING_KEYS} if isinstance(d, dict) else {}
+
+    def effective_settings(self, root: Optional[str] = None) -> Dict[str, Any]:
+        s = dict(self.settings)
+        s.update(self.folder_overrides(root))
+        return s
+
+    def settings_payload(self, root: str) -> Dict[str, Any]:
+        return {"effective": self.effective_settings(root), "user": self.settings, "folder": self.folder_overrides(root),
+                "folder_keys": sorted(FOLDER_SETTING_KEYS), "folder_path": root}
+
+    def new_session(self, title: str = "New chat", folder: Optional[str] = None) -> dict:
+        s = {"id": uuid.uuid4().hex[:10], "title": title, "workspace": folder or self.workspace.root, "created": time.time(),
              "updated": time.time(), "messages": [], "transcript": [], "auto_approve": False}
         self.sessions[s["id"]] = s
         self.save_session(s)
         return s
 
-    def set_workspace(self, path: str) -> None:
-        path = os.path.realpath(os.path.expanduser(path))
-        if not os.path.isdir(path):
-            raise ValueError(f"{path} is not a folder")
-        self.workspace = Workspace(path, self.checkpoints)
+    def set_workspace(self, path: str) -> Workspace:
+        """Remember a folder as the most recent one (the default for new windows). Open windows keep their own."""
+        w = self.workspace_for(path)
+        path = w.root
+        self.workspace = w
         self.settings["workspace"] = path
         recent = [p for p in self.settings.get("recent_workspaces", []) if p != path]
         self.settings["recent_workspaces"] = [path] + recent[:11]
         self.save_settings()
+        return w
 
-    def resolve_model(self) -> str:
+    def resolve_model(self, want: Optional[str] = None) -> str:
         """Use the configured model when it exists in Ollama, otherwise the fallback."""
-        want = self.settings.get("model", "llama3.1")
+        want = want or self.settings.get("model", "llama3.1")
         try:
             names = {m.get("name") for m in self.client.list_models()}
             names |= {n.split(":")[0] for n in list(names) if n}
@@ -310,16 +361,22 @@ class State:
     # ------------------------------------------------------------ warm-up
     def prewarm(self, session: dict) -> None:
         """Push the stable system prompt through the model so Ollama's prompt cache is hot."""
-        if not self.settings.get("prewarm", True) or self.memory_block_reason():
+        root = session.get("workspace")
+        try:
+            ws = self.workspace_for(root)
+        except ValueError:
+            return
+        settings = self.settings_for_run(ws.root)
+        if not settings.get("prewarm", True) or self.memory_block_reason(settings["model"]):
             return
 
         def go() -> None:
             try:
                 client = self.client_for()
-                agent = Agent(client, self.workspace, self.settings_for_run(), session)
+                agent = Agent(client, ws, settings, session)
                 system = agent._system_prompt("agent")
                 msgs = [{"role": "system", "content": system}, {"role": "user", "content": "Reply with the single word ready."}]
-                for _ in client.chat_stream(self.settings_for_run()["model"], msgs,
+                for _ in client.chat_stream(settings["model"], msgs,
                                                  options={**agent._options(), "num_predict": 1},
                                                  keep_alive=str(self.settings.get("keep_alive", "60m"))):
                     pass
@@ -328,39 +385,67 @@ class State:
 
         threading.Thread(target=go, name="prewarm", daemon=True).start()
 
-    def model_loaded(self) -> bool:
+    def model_loaded(self, model: Optional[str] = None) -> bool:
+        want = (model or self.resolve_model()).split(":")[0]
         try:
-            return any(m.get("name", "").split(":")[0] == self.resolve_model().split(":")[0] for m in self.client.running())
+            return any(m.get("name", "").split(":")[0] == want for m in self.ollama.running())
         except OllamaError:
             return False
 
-    def memory_block_reason(self) -> Optional[str]:
+    def memory_block_reason(self, model: Optional[str] = None) -> Optional[str]:
         """Refuse to load the model when the VM does not have room for it. Loading a 5 GB model into a VM
         that is already nearly full made the host kill the whole VM once (2026-10-14); never again."""
         if self.active_engine() == "gpu":
-            if not self.gpu_client.alive():
+            paused = self.engine_stats.get("state") == "paused" or self.vision.want()
+            if not self.gpu_client.alive() and not paused:
                 return ("The GPU engine is not running. Start it from the Forge app (Engine card in Settings) or switch "
                         "the engine back to Ollama in Settings.")
             return None
-        return self.memory_block_reason_ollama()
+        return self.memory_block_reason_ollama(model)
 
-    def memory_block_reason_ollama(self) -> Optional[str]:
-        if self.model_loaded():
+    def memory_block_reason_ollama(self, model: Optional[str] = None) -> Optional[str]:
+        if self.model_loaded(model):
             return None
         m = mem_info()
+        # The VM's memory comes from the Googlebook: when the Forge app reports the host's free memory, check it too.
+        host = self.vision.app.get("host_mem_mb") if time.time() - self.vision.app_seen < 60 else None
+        if isinstance(host, (int, float)) and 0 <= host < MODEL_LOAD_NEED_MB:
+            return (f"Not enough free memory on the Googlebook to load the model in the VM: {int(host)} MB free, about "
+                    f"{MODEL_LOAD_NEED_MB} MB needed. Close other apps or stop the GPU engine, then try again.")
+        try:
+            other = [x.get("name") for x in self.ollama.running()]
+        except OllamaError:
+            other = []
+        if other and m["available_mb"] and m["available_mb"] < MODEL_LOAD_NEED_MB:
+            return (f"Another model is loaded ({', '.join(other)}), and there is not enough memory for a second one. "
+                    f"Unload it with the command palette (Unload the model from memory), or use the same model in "
+                    f"this folder's settings, then try again.")
         if m["available_mb"] and m["available_mb"] < MODEL_LOAD_NEED_MB:
             return (f"Not enough free memory to load the model safely: {m['available_mb']} MB available, about "
                     f"{MODEL_LOAD_NEED_MB} MB needed. Close other programs in the Linux VM (Waydroid, big builds, other "
                     f"models) and try again. This guard exists because an overfull VM gets killed by GooglebookOS.")
         return None
 
-    def settings_for_run(self) -> dict:
-        s = dict(self.settings)
+    def model_can_see(self, model: Optional[str]) -> bool:
+        """True when an Ollama chat model has its own vision (then images are also passed to it directly)."""
+        if not model:
+            return False
+        cache = getattr(self, "_vision_caps", {})
+        if model not in cache:
+            try:
+                cache[model] = "vision" in (self.ollama.show(model).get("capabilities") or [])
+            except OllamaError:
+                cache[model] = False
+            self._vision_caps = cache
+        return bool(cache[model])
+
+    def settings_for_run(self, root: Optional[str] = None) -> dict:
+        s = self.effective_settings(root)
         if self.active_engine() == "gpu":
             s["model"] = "gpu-model"
             s["num_ctx"] = int(self.settings.get("gpu_ctx", 8192))
         else:
-            s["model"] = self.resolve_model()
+            s["model"] = self.resolve_model(s.get("model"))
         return s
 
 
@@ -396,6 +481,21 @@ class Handler(BaseHTTPRequestHandler):
         if not raw:
             return {}
         return json.loads(raw.decode("utf-8"))
+
+    def _ws(self, q: Optional[Dict[str, list]] = None, b: Optional[dict] = None) -> Workspace:
+        """The project folder of the window that sent this request (X-Forge-Folder header, or ?folder=)."""
+        st = STATE
+        assert st is not None
+        raw = self.headers.get("X-Forge-Folder")
+        val = urllib.parse.unquote(raw) if raw else ""
+        if not val and q:
+            val = q.get("folder", [""])[0]
+        if not val and b:
+            val = str(b.get("folder") or "")
+        if not val:
+            return st.workspace
+        # A window whose folder disappeared must not silently work in another folder.
+        return st.workspace_for(val)
 
     def _check_host(self) -> bool:
         """Reject requests whose Host is not one of ours (DNS rebinding protection)."""
@@ -492,7 +592,16 @@ class Handler(BaseHTTPRequestHandler):
     def _api_get(self, path: str, q: Dict[str, list]) -> None:
         st = STATE
         assert st is not None
-        ws = st.workspace
+        folder_missing = None
+        try:
+            ws = self._ws(q)
+        except ValueError as e:
+            if path not in ("/api/status", "/api/dirs", "/api/events", "/api/run", "/api/engine/config", "/api/engine/model",
+                            "/api/engine/status", "/api/settings", "/api/image", "/api/image/analysis", "/api/engine/control",
+                            "/api/engine/vision_file", "/api/vision/status"):
+                return self._error(400, f"This window's folder is not available ({e}). Open another folder.")
+            folder_missing = str(e)
+            ws = st.workspace
 
         def arg(name: str, default: str = "") -> str:
             return q.get(name, [default])[0]
@@ -508,13 +617,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"version": __version__, "ollama": alive, "workspace": ws.root, "engine": st.active_engine(),
                                     "gpu_engine": {"url": st.gpu_client.base_url, "health": gpu},
                                     "workspace_name": os.path.basename(ws.root) or ws.root,
-                                    "model": st.resolve_model(), "running": running, "pid": os.getpid(),
+                                    "model": st.resolve_model(st.effective_settings(ws.root).get("model")),
+                                    "running": running, "pid": os.getpid(), "default_folder": st.workspace.root,
+                                    "folder_missing": folder_missing,
+                                    "host_mem_mb": (st.vision.app.get("host_mem_mb") if time.time() - st.vision.app_seen < 60 else None),
                                     "home": os.path.expanduser("~"), "mem": mem_info(), "mem_event": st.last_mem_event})
         if path == "/api/settings":
-            return self._json(200, st.settings)
+            return self._json(200, st.settings_payload(ws.root) if not folder_missing else
+                              {**st.settings_payload(ws.root), "folder": {}, "effective": dict(st.settings)})
         if path == "/api/models":
-            models = st.client.list_models()
-            return self._json(200, {"models": models, "active": st.resolve_model(), "running": st.client.running()})
+            models = st.ollama.list_models()
+            return self._json(200, {"models": models, "active": st.resolve_model(st.effective_settings(ws.root).get("model")),
+                                    "running": st.ollama.running()})
         if path == "/api/tree":
             rel = arg("path", ".")
             p = ws.resolve(rel, must_exist=True)
@@ -547,9 +661,11 @@ class Handler(BaseHTTPRequestHandler):
                                                         arg("regex") == "1", max_results=400)})
         if path == "/api/sessions":
             items = sorted(st.sessions.values(), key=lambda s: -s.get("updated", 0))
-            return self._json(200, {"sessions": [{"id": s["id"], "title": s["title"], "updated": s["updated"],
-                                                  "workspace": s.get("workspace"), "messages": len(s.get("messages", []))}
-                                                 for s in items[:200]]})
+            if arg("all") != "1":
+                items = [s for s in items if s.get("workspace") == ws.root]
+            return self._json(200, {"folder": ws.root, "sessions": [{"id": s["id"], "title": s["title"], "updated": s["updated"],
+                                    "workspace": s.get("workspace"), "messages": len(s.get("messages", []))}
+                                    for s in items[:300]]})
         if path == "/api/session":
             s = st.sessions.get(arg("id"))
             if not s:
@@ -564,16 +680,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"id": r.id, "status": r.status, "done": r.done, "events": len(r.events),
                                     "approval": r.approval})
         if path == "/api/changes":
+            # One run's changes with file contents (for diffs), or a light list of this folder's runs (or all folders).
             rid = arg("run_id")
+            runs = st.checkpoints.list_runs(None if (rid or arg("all") == "1") else ws.root)
+            if rid:
+                runs = [r for r in runs if r["run_id"] == rid]
             out = []
-            for run_id, files in st.checkpoints.runs.items():
-                if rid and run_id != rid:
-                    continue
-                for ch in files.values():
-                    out.append({"run_id": run_id, "path": ch.path, "kind": ch.kind, "ts": ch.ts,
-                                "before": ch.before, "after": ch.after})
-            out.sort(key=lambda c: -c["ts"])
-            return self._json(200, {"changes": out[:200]})
+            for r in runs[:80]:
+                for ch in r["files"]:
+                    item = {"run_id": r["run_id"], "path": ch.path, "kind": ch.kind, "ts": ch.ts, "revertable": ch.revertable,
+                            "workspace": r["workspace"], "title": r["title"], "run_ts": r["ts"], "session_id": r["session_id"]}
+                    if rid:
+                        item["before"] = ch.before
+                        item["after"] = ch.after
+                    out.append(item)
+            return self._json(200, {"changes": out, "folder": ws.root})
         if path == "/api/git":
             return self._json(200, _git_status(ws.root))
         if path == "/api/git/diff":
@@ -600,6 +721,47 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"engine": st.active_engine(), "url": st.gpu_client.base_url, "health": h,
                                     "props": {k: props.get(k) for k in ("model_path", "build_info", "total_slots", "default_generation_settings") if k in props},
                                     "model_file": {k: v for k, v in (mf or {}).items() if k != "path"}})
+        if path == "/api/image":
+            found = st.vision.images.find(arg("id"))
+            if not found:
+                return self._error(404, "no such image")
+            fp, mime = found
+            size = os.path.getsize(fp)
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "private, max-age=31536000, immutable")
+            self.end_headers()
+            with open(fp, "rb") as fh:
+                self.wfile.write(fh.read())
+            return None
+        if path == "/api/image/analysis":
+            return self._json(200, st.vision.images.cached_analysis(arg("id")))
+        if path == "/api/engine/control":
+            report = {k: arg(k) for k in ("vstate", "vtier", "vdetail") if arg(k)}
+            try:
+                report["host_mem_mb"] = int(arg("host_mem_mb") or -1)
+            except ValueError:
+                pass
+            return self._json(200, st.vision.control(report, float(arg("wait", "20") or 20)))
+        if path == "/api/engine/vision_file":
+            fp = st.vision.file_path(arg("name"))
+            if not fp:
+                return self._error(404, "no such vision model file")
+            size = os.path.getsize(fp)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            with open(fp, "rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            return None
+        if path == "/api/vision/status":
+            return self._json(200, st.vision.status())
         if path == "/api/engine/config":
             # Read by the Forge app (host side) to launch llama-server with the right arguments.
             mf = st.gpu_model_file()
@@ -650,21 +812,43 @@ class Handler(BaseHTTPRequestHandler):
     def _api_post(self, path: str, b: dict) -> None:
         st = STATE
         assert st is not None
-        ws = st.workspace
+        try:
+            ws = self._ws(None, b)
+        except ValueError:
+            # A window whose folder disappeared may still open another folder and use machine-wide actions.
+            if not (path in ("/api/workspace", "/api/approve", "/api/cancel", "/api/unload", "/api/notepads",
+                             "/api/terminal/kill", "/api/image") or path.startswith("/api/engine/")
+                    or (path == "/api/settings" and b.get("_scope", "user") == "user")):
+                raise
+            ws = st.workspace
         if path == "/api/settings":
-            allowed = set(DEFAULT_SETTINGS) - {"recent_workspaces", "workspace"}
-            for k, v in b.items():
-                if k in allowed:
-                    st.settings[k] = v
-            st.save_settings()
-            st.client = OllamaClient(st.settings.get("ollama_url", "http://127.0.0.1:11434"))
-            return self._json(200, st.settings)
+            scope = str(b.pop("_scope", "user"))
+            unset = [str(k) for k in (b.pop("_unset", []) or [])]
+            if scope == "folder":
+                fp = st.folder_settings_path(ws.root)
+                cur = _load_json(fp, {})
+                cur = cur if isinstance(cur, dict) else {}
+                for k, v in b.items():
+                    if k in FOLDER_SETTING_KEYS:
+                        cur[k] = v
+                for k in unset:
+                    cur.pop(k, None)
+                _save_json(fp, cur)
+            else:
+                allowed = set(DEFAULT_SETTINGS) - {"recent_workspaces", "workspace"}
+                for k, v in b.items():
+                    if k in allowed:
+                        st.settings[k] = v
+                st.save_settings()
+                st.client = OllamaClient(st.settings.get("ollama_url", "http://127.0.0.1:11434"))
+                st.ollama = st.client
+            return self._json(200, st.settings_payload(ws.root))
         if path == "/api/workspace":
             p = str(b.get("path", "")).strip()
             if b.get("create") and p and not os.path.exists(os.path.expanduser(p)):
                 os.makedirs(os.path.expanduser(p), exist_ok=True)
-            st.set_workspace(p)
-            return self._json(200, {"workspace": st.workspace.root})
+            w = st.set_workspace(p)
+            return self._json(200, {"workspace": w.root})
         if path == "/api/file":
             rel = str(b["path"])
             content = str(b.get("content", ""))
@@ -697,7 +881,7 @@ class Handler(BaseHTTPRequestHandler):
             msg = ws.delete_path(str(b["path"]))
             return self._json(200, {"ok": True, "message": msg})
         if path == "/api/session/new":
-            s = st.new_session(str(b.get("title") or "New chat"))
+            s = st.new_session(str(b.get("title") or "New chat"), ws.root)
             st.prewarm(s)
             return self._json(200, s)
         if path == "/api/session/delete":
@@ -750,7 +934,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/inline_edit":
             run = Run("inline:" + str(b.get("session_id") or ""), "edit")
             st.runs[run.id] = run
-            settings = st.settings_for_run()
+            settings = st.settings_for_run(ws.root)
             t = threading.Thread(target=inline_edit_stream, name="inline-edit", daemon=True,
                                  args=(st.client_for(), settings, run, str(b.get("path", "")), str(b.get("language", "")),
                                        str(b.get("selection", "")), str(b.get("instruction", "")),
@@ -759,19 +943,21 @@ class Handler(BaseHTTPRequestHandler):
             t.start()
             return self._json(200, {"run_id": run.id})
         if path == "/api/complete":
-            text = complete(st.client_for(), st.settings_for_run(), str(b.get("path", "")), str(b.get("language", "")),
+            text = complete(st.client_for(), st.settings_for_run(ws.root), str(b.get("path", "")), str(b.get("language", "")),
                             str(b.get("prefix", "")), str(b.get("suffix", "")))
             return self._json(200, {"text": text})
         if path == "/api/revert":
-            msg = ws.revert(str(b["run_id"]), str(b["path"]))
+            rid = str(b["run_id"])
+            msg = self._run_ws(rid, ws).revert(rid, str(b["path"]))
             return self._json(200, {"ok": True, "message": msg})
         if path == "/api/revert_all":
             rid = str(b["run_id"])
+            rws = self._run_ws(rid, ws)
             msgs = []
             for ch in list(st.checkpoints.changes(rid)):
                 if ch.kind != "reverted":
                     try:
-                        msgs.append(ws.revert(rid, ch.path))
+                        msgs.append(rws.revert(rid, ch.path))
                     except Exception as e:  # noqa: BLE001
                         msgs.append(f"{ch.path}: {e}")
             return self._json(200, {"ok": True, "messages": msgs})
@@ -795,7 +981,9 @@ class Handler(BaseHTTPRequestHandler):
             code, out = _git(ws.root, ["checkout", "--", rel])
             if code == 0 and before is not None:
                 after = ws.read_text(rel) if os.path.exists(ws.resolve(rel)) else None
-                st.checkpoints.record("git-discard", rel, before, after)
+                did = "git-discard-" + uuid.uuid4().hex[:8]
+                st.checkpoints.begin(did, ws.root, "", f"Discarded with git: {rel}")
+                st.checkpoints.record(did, rel, before, after)
             return self._json(200, {"ok": code == 0, "output": out})
         if path == "/api/git/commit":
             msg = str(b.get("message", "")).strip()
@@ -817,7 +1005,8 @@ class Handler(BaseHTTPRequestHandler):
             code, out = _git(ws.root, ["init"])
             return self._json(200, {"ok": code == 0, "output": out})
         if path == "/api/git/commit_message":
-            blocked = st.memory_block_reason()
+            settings = st.settings_for_run(ws.root)
+            blocked = st.memory_block_reason(settings["model"])
             if blocked:
                 return self._error(503, blocked)
             code, diff = _git(ws.root, ["diff", "--cached", "--no-color", "--stat", "-p"])
@@ -828,7 +1017,6 @@ class Handler(BaseHTTPRequestHandler):
             prompt = ("Write a git commit message for the following diff. First line: a short imperative summary under 70 "
                       "characters. Then a blank line and two to five short bullet points if the change has several parts. "
                       "Plain text only, no markdown fences, no quotes around it.\n\n```diff\n" + diff[:14000] + "\n```")
-            settings = st.settings_for_run()
             r = st.client_for().generate(settings["model"], prompt, options={"num_ctx": 8192, "temperature": 0.2, "num_predict": 200},
                                    keep_alive=str(settings.get("keep_alive", "20m")), timeout=600,
                                    system="You are a senior engineer writing precise, conventional git commit messages.")
@@ -859,13 +1047,13 @@ class Handler(BaseHTTPRequestHandler):
             from .mcp import MCP
             return self._json(200, {"servers": MCP.get().connect_all()})
         if path == "/api/terminal_command":
-            blocked = st.memory_block_reason()
+            settings = st.settings_for_run(ws.root)
+            blocked = st.memory_block_reason(settings["model"])
             if blocked:
                 return self._error(503, blocked)
             instruction = str(b.get("instruction", "")).strip()
             if not instruction:
                 raise ValueError("instruction required")
-            settings = st.settings_for_run()
             prompt = (f"Operating system: Debian Linux in a VM, shell: bash, current folder: {b.get('cwd') or ws.root}.\n"
                       f"Task: {instruction}\n\nReply with exactly one shell command line that does this, and nothing else: "
                       f"no explanation, no markdown, no backticks.")
@@ -881,6 +1069,40 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"command": cmd, "dangerous": is_dangerous_command(cmd)})
         if path == "/api/ollama/pull":
             return self._pull_model(str(b.get("model", "")))
+        if path == "/api/image":
+            import base64 as _b64
+            data = str(b.get("data", ""))
+            if data.startswith("data:"):
+                data = data.split(",", 1)[-1]
+            try:
+                raw = _b64.b64decode(data, validate=False)
+            except ValueError:
+                raise ValueError("the image data is not valid base64")
+            meta = st.vision.images.save(raw, str(b.get("name") or ""))
+            meta["url"] = "/api/image?id=" + meta["id"]
+            return self._json(200, meta)
+        if path == "/api/image/analyze":
+            # What the vision helper sees in an image (also used to test the vision path without the chat model).
+            settings = st.effective_settings(ws.root)
+            img_id = str(b.get("id", ""))
+            question = str(b.get("question") or "").strip()
+            notes: list = []
+            t0 = time.time()
+            if question:
+                found = st.vision.images.find(img_id)
+                if not found:
+                    return self._error(404, "no such image")
+                answer, source = st.vision.ask(found[0], found[1], question, settings, notes.append)
+                return self._json(200, {"answer": answer, "source": source, "notes": notes, "seconds": round(time.time() - t0, 1)})
+            res = st.vision.analyze(img_id, settings, notes.append)
+            return self._json(200, {**res, "notes": notes, "seconds": round(time.time() - t0, 1)})
+        if path == "/api/vision/stop":
+            st.vision.holds = 0
+            st.vision.release()
+            return self._json(200, {"ok": True})
+        if path == "/api/engine/vision_status":
+            st.vision.report({k: b.get(k) for k in ("vstate", "vtier", "vdetail", "host_mem_mb") if k in b})
+            return self._json(200, {"ok": True})
         if path == "/api/engine/prepare":
             return self._json(200, st.shrink_vm_memory())
         if path == "/api/engine/select":
@@ -889,6 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(503, "The GPU engine is not reachable. Start it in the Forge app first.")
             st.settings["engine"] = eng
             st.save_settings()
+            st.vision.wanted_until = 0.0
             if eng == "gpu":
                 st.unload_model()      # the VM must not hold a second copy of the model
             for sess in st.sessions.values():
@@ -911,16 +1134,30 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "unknown API endpoint")
 
     # ------------------------------------------------------------ chat
+    def _run_ws(self, run_id: str, fallback: Workspace) -> Workspace:
+        """The project folder a checkpointed run belongs to (falls back to the window's folder)."""
+        st = STATE
+        assert st is not None
+        root = st.checkpoints.run_meta(run_id).get("workspace")
+        try:
+            return st.workspace_for(root) if root else fallback
+        except ValueError:
+            return fallback
+
     def _start_chat(self, b: dict) -> None:
         st = STATE
         assert st is not None
+        win_ws = self._ws(None, b)
         sid = str(b.get("session_id") or "")
         s = st.sessions.get(sid)
         if not s:
-            s = st.new_session()
-        if s.get("workspace") != st.workspace.root:
-            s["workspace"] = st.workspace.root
-            s["repo_map"] = None
+            s = st.new_session("New chat", win_ws.root)
+        if not s.get("workspace"):
+            s["workspace"] = win_ws.root
+        try:
+            ws = st.workspace_for(s["workspace"])     # a chat always works in its own project folder
+        except ValueError:
+            return self._error(400, f"This chat's folder no longer exists: {s.get('workspace')}")
         text = str(b.get("message", "")).strip()
         if not text:
             return self._error(400, "empty message")
@@ -932,31 +1169,33 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(409, "a run is already active for this session")
         fallback_note = None
         if st.active_engine() == "gpu" and not st.gpu_client.alive():
-            fallback_note = "The GPU engine is not running, so this reply comes from Ollama on the CPU. Start the engine from the Forge app to use the GPU again."
-        blocked = None if fallback_note else st.memory_block_reason()
+            # Never load the 5 GB CPU model automatically here: the engine usually stopped because memory was short.
+            paused = st.engine_stats.get("state") == "paused" or st.vision.want()
+            if not paused:
+                return self._error(503, "The GPU engine is not running. Start it from the Forge app (Settings, GPU engine "
+                                        "card), or switch the engine to Ollama in Settings.")
+        if fallback_note:
+            settings = st.effective_settings(ws.root)
+            settings["model"] = st.resolve_model(settings.get("model"))
+            blocked = st.memory_block_reason_ollama(settings["model"])
+        else:
+            settings = st.settings_for_run(ws.root)
+            blocked = st.memory_block_reason(settings["model"])
         if blocked:
             return self._error(503, blocked)
         if s["title"] in ("New chat", "") and text:
             s["title"] = text[:60]
         run = Run(s["id"], mode)
         st.runs[run.id] = run
-        if fallback_note:
-            settings = dict(st.settings)
-            settings["model"] = st.resolve_model()
-            blocked = st.memory_block_reason_ollama()
-            if blocked:
-                st.runs.pop(run.id, None)
-                return self._error(503, blocked)
-            agent = Agent(st.ollama, st.workspace, settings, s)
-            if s.get("engine_used") != "ollama":
-                s["messages"] = []          # different engine, different prompt cache: fresh context
-            s["engine_used"] = "ollama"
-        else:
-            settings = st.settings_for_run()
-            agent = Agent(st.client_for(), st.workspace, settings, s)
-            if s.get("engine_used") not in (None, st.active_engine()):
-                s["messages"] = []
-            s["engine_used"] = st.active_engine()
+        st.checkpoints.begin(run.id, ws.root, s["id"], text)
+        engine = "ollama" if fallback_note else st.active_engine()
+        if s.get("engine_used") not in (None, engine):
+            s["messages"] = []          # different engine, different prompt cache: fresh context
+        s["engine_used"] = engine
+        agent = Agent(st.ollama if fallback_note else st.client_for(), ws, settings, s)
+        agent.vision = st.vision
+        if engine == "ollama":
+            settings["native_images"] = st.model_can_see(settings.get("model"))
 
         def go() -> None:
             if fallback_note:
@@ -966,7 +1205,7 @@ class Handler(BaseHTTPRequestHandler):
 
         run.thread = threading.Thread(target=go, name=f"run-{run.id}", daemon=True)
         run.thread.start()
-        return self._json(200, {"run_id": run.id, "session_id": s["id"], "model": settings["model"]})
+        return self._json(200, {"run_id": run.id, "session_id": s["id"], "model": settings["model"], "folder": ws.root})
 
     def _sse(self, run_id: str, since: int) -> None:
         st = STATE
@@ -1021,13 +1260,28 @@ class Handler(BaseHTTPRequestHandler):
     def _ws_terminal(self, q: Dict[str, list]) -> None:
         st = STATE
         assert st is not None
-        ws = handshake(self)
-        if ws is None:
+        # Browsers send Origin on WebSocket upgrades and WebSockets are not covered by CORS, so without this check
+        # any web page open in Chrome could connect to ws://localhost:8765 and get a shell.
+        origin = self.headers.get("Origin")
+        if origin and urllib.parse.urlparse(origin).netloc.lower() != (self.headers.get("Host") or "").lower():
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        try:
+            folder = self._ws(q).root
+        except ValueError:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        sock = handshake(self)
+        if sock is None:
             return
         term_id = q.get("id", ["main"])[0][:40]
         cols = int(q.get("cols", ["120"])[0] or 120)
         rows = int(q.get("rows", ["30"])[0] or 30)
-        st.terminals.serve(ws, term_id, st.workspace.root, cols, rows)
+        st.terminals.serve(sock, term_id, folder, cols, rows)
 
 
 def _fuzzy(needle: str, hay: str) -> bool:

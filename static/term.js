@@ -11,7 +11,7 @@
 
   function wsUrl(id, cols, rows) {
     const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    return proto + location.host + '/ws/term?id=' + encodeURIComponent(id) + '&cols=' + cols + '&rows=' + rows;
+    return proto + location.host + '/ws/term?id=' + encodeURIComponent(id) + '&cols=' + cols + '&rows=' + rows + '&folder=' + encodeURIComponent(F.folder || '');
   }
 
   T.create = function (id) {

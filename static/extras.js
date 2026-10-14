@@ -196,13 +196,19 @@
         if (app.state === 'downloading' && app.downloadTotal) { bar.style.display = 'block'; bar.firstChild.style.width = Math.round(100 * app.downloaded / app.downloadTotal) + '%'; } else bar.style.display = 'none';
         if (app.hostMemAvailableMb >= 0) parts.push('Googlebook free RAM: ' + (app.hostMemAvailableMb / 1024).toFixed(1) + ' GB');
         if (!app.binary) parts.push('This app build has no engine binary.');
-        btnStart.disabled = app.state === 'running' || app.state === 'downloading' || app.state === 'starting' || !app.binary;
+        btnStart.disabled = app.state === 'running' || app.state === 'downloading' || app.state === 'starting' || app.state === 'paused' || !app.binary;
         btnStop.disabled = app.state === 'stopped';
       } else {
         parts.push('Open Forge in the Forge app to start or stop the engine; this page only shows its status.');
         btnStart.disabled = btnStop.disabled = true;
       }
       parts.push('Server sees the engine as: ' + h + ' at ' + (server.url || ''));
+      try {
+        const v = await get('/api/vision/status');
+        const vs = (v.app && v.app.vstate) || 'stopped';
+        const tiers = (v.tiers_available || []).join(' and ') || 'none installed';
+        parts.push('Vision model: ' + (v.app_connected ? vs + (v.app && v.app.vtier ? ' (' + v.app.vtier + ')' : '') + (v.app && v.app.vdetail && vs !== 'running' ? ' · ' + v.app.vdetail : '') : 'needs the Forge app to run on the GPU') + '. Available: ' + tiers + '. Text recognition: ' + (v.ocr ? 'ready' : 'not installed') + '.');
+      } catch (e) { /* older server */ }
       if (server.props && server.props.model_path) parts.push('Model: ' + String(server.props.model_path).split('/').pop());
       parts.push('Chats use: ' + (server.engine === 'gpu' ? 'GPU engine' : 'Ollama (CPU in the VM)'));
       statusEl.textContent = parts.join('\n');

@@ -55,6 +55,21 @@ class LlamaCppClient:
         except OllamaError:
             return False
 
+    def wait_ready(self, timeout: float = 300.0, on_wait=None, cancel: Optional[threading.Event] = None) -> bool:
+        """Wait until the engine answers (it pauses while the vision model uses the GPU)."""
+        deadline = time.monotonic() + timeout
+        told = False
+        while time.monotonic() < deadline:
+            if self.alive():
+                return True
+            if cancel is not None and cancel.is_set():
+                return False
+            if not told and on_wait is not None:
+                on_wait()
+                told = True
+            time.sleep(1.0)
+        return False
+
     def health(self) -> dict:
         try:
             return self._json("GET", "/health", timeout=5)

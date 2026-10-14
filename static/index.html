@@ -19,6 +19,7 @@
         <svg viewBox="0 0 16 16"><path d="M1.5 3h4l1.5 1.5H14.5v8.5h-13z"/></svg>
         <span id="workspace-name">workspace</span>
       </button>
+      <button class="tb-btn icon" id="btn-new-window" title="New window (Ctrl+Shift+N)"><svg viewBox="0 0 16 16"><rect x="1.5" y="4.5" width="10" height="9" rx="1.5"/><path d="M5 2.5h9.5V11"/></svg></button>
     </div>
     <div class="tb-center">
       <button class="palette-btn" id="btn-palette" title="Command palette (Ctrl+Shift+P)  /  Quick open (Ctrl+P)">
@@ -82,14 +83,14 @@
 
       <section class="view" data-view="changes">
         <div class="view-head"><span>AI Changes</span>
-          <div class="view-actions"><button class="mini" id="btn-refresh-changes" title="Refresh"><svg viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg></button></div>
+          <div class="view-actions"><button class="chip scope-chip" id="btn-changes-scope" title="Switch between this folder and all folders">This folder</button><button class="mini" id="btn-refresh-changes" title="Refresh"><svg viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg></button></div>
         </div>
         <div class="changes" id="changes"><div class="muted pad">Files the agent edits appear here with diffs, Keep and Revert.</div></div>
       </section>
 
       <section class="view" data-view="history">
         <div class="view-head"><span>Chats</span>
-          <div class="view-actions"><button class="mini" id="btn-new-chat-side" title="New chat (Ctrl+N)"><svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg></button></div>
+          <div class="view-actions"><button class="chip scope-chip" id="btn-chats-scope" title="Switch between this folder and all folders">This folder</button><button class="mini" id="btn-new-chat-side" title="New chat (Ctrl+N)"><svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg></button></div>
         </div>
         <div class="history" id="history"></div>
       </section>
@@ -220,6 +221,8 @@
             </select>
             <button class="chip" id="btn-add-context" title="Add a file to context (@)">@ Add context</button>
             <button class="chip" id="btn-add-selection" title="Add editor selection (Ctrl+L)">+ Selection</button>
+            <button class="chip" id="btn-add-image" title="Attach screenshots or images (you can also paste or drop them here)">+ Image</button>
+            <input type="file" id="image-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
             <label class="chip toggle" title="Show the model's thinking process"><input type="checkbox" id="thinking-toggle" checked> Thinking</label>
             <label class="chip toggle" title="Run commands without asking (destructive commands still ask)"><input type="checkbox" id="auto-toggle"> Auto-run</label>
           </div>
@@ -277,14 +280,17 @@
 
   <div id="folder-modal" class="overlay hidden">
     <div class="folder-modal">
-      <div class="dm-head"><span>Open folder</span><button class="mini" id="folder-close">✕</button></div>
-      <div class="fm-path"><input id="folder-path" spellcheck="false"><button class="btn" id="folder-open">Open</button></div>
+      <div class="dm-head"><span id="folder-modal-title">Open folder</span><button class="mini" id="folder-close">✕</button></div>
+      <div class="fm-path"><input id="folder-path" spellcheck="false"><button class="btn" id="folder-open">Open</button><button class="btn ghost" id="folder-open-new" title="Open this folder in a new window">New window</button></div>
       <div class="fm-body">
         <div class="fm-list" id="folder-list"></div>
         <div class="fm-recent"><div class="muted small">Recent</div><div id="folder-recent"></div></div>
       </div>
     </div>
   </div>
+
+  <div id="lightbox" class="overlay lightbox hidden"><img id="lightbox-img" alt="Attached image"><div class="lb-hint">Click anywhere or press Esc to close</div></div>
+  <div id="drop-hint" class="drop-hint hidden">Drop images to attach them to your message</div>
 
   <div id="toast-host" class="toast-host"></div>
 </div>

@@ -65,9 +65,18 @@
   function renderUser(turn) {
     const m = el('div', { class: 'msg user' });
     if (turn.attachments && turn.attachments.length) {
-      const ctx = el('div', { class: 'ctx' });
-      for (const a of turn.attachments) ctx.append(el('span', { class: 'cchip', text: a.kind === 'selection' ? a.path + ':' + a.start + '-' + a.end : (a.kind === 'terminal' ? 'terminal output' : a.path || a.title) }));
-      m.append(ctx);
+      const imgs = turn.attachments.filter((a) => a.kind === 'image');
+      const others = turn.attachments.filter((a) => a.kind !== 'image');
+      if (imgs.length) {
+        const wrap = el('div', { class: 'msg-images' });
+        for (const a of imgs) wrap.append(el('img', { src: a.url, alt: a.name || 'image', title: (a.name || 'Image') + (a.width ? ' (' + a.width + ' by ' + a.height + ')' : ''), onclick: () => openLightbox(a.url) }));
+        m.append(wrap);
+      }
+      if (others.length) {
+        const ctx = el('div', { class: 'ctx' });
+        for (const a of others) ctx.append(el('span', { class: 'cchip', text: a.kind === 'selection' ? a.path + ':' + a.start + '-' + a.end : (a.kind === 'terminal' ? 'terminal output' : a.path || a.title) }));
+        m.append(ctx);
+      }
     }
     m.append(el('div', { class: 'bubble', text: turn.text }));
     return m;
@@ -92,7 +101,7 @@
     colorize(d);
     return d;
   }
-  const TOOL_ICONS = { read_file: '📄', write_file: '✎', edit_file: '✎', list_dir: '▤', find_files: '🔍', search: '🔍', run_command: '$', web_fetch: '🌐', delete_path: '🗑', ask_user: '?' };
+  const TOOL_ICONS = { read_file: '📄', write_file: '✎', edit_file: '✎', list_dir: '▤', find_files: '🔍', search: '🔍', run_command: '$', web_fetch: '🌐', delete_path: '🗑', ask_user: '?', look_at_image: '👁', web_search: '🌐', codebase_search: '🔍' };
   function argSummary(name, a) {
     a = a || {};
     if (name === 'run_command') return a.command || '';
@@ -100,6 +109,7 @@
     if (name === 'find_files') return a.pattern || '';
     if (name === 'web_fetch') return a.url || '';
     if (name === 'read_file') return (a.path || '') + (a.start_line ? ':' + a.start_line + '-' + (a.end_line || '') : '');
+    if (name === 'look_at_image') return (a.question || '') + (a.image ? '  [' + a.image + ']' : '');
     return a.path || JSON.stringify(a);
   }
   function toolCard(t) {
@@ -126,10 +136,10 @@
     return card;
   }
   function labelFor(name) {
-    return { read_file: 'Read file', write_file: 'Write file', edit_file: 'Edit file', list_dir: 'List folder', find_files: 'Find files', search: 'Search code', run_command: 'Run command', web_fetch: 'Fetch URL', delete_path: 'Move to trash', ask_user: 'Question' }[name] || name;
+    return { read_file: 'Read file', write_file: 'Write file', edit_file: 'Edit file', list_dir: 'List folder', find_files: 'Find files', search: 'Search code', run_command: 'Run command', web_fetch: 'Fetch URL', delete_path: 'Move to trash', ask_user: 'Question', look_at_image: 'Look at image', web_search: 'Web search', codebase_search: 'Search codebase' }[name] || name;
   }
   function fileChangeChip(ch) {
-    return el('span', { class: 'filechange', title: 'Review diff', onclick: async () => {
+    return el('span', { class: 'filechange', title: 'Review diff', 'data-path': ch.path, onclick: async () => {
       try {
         const r = await get('/api/changes', { run_id: ch.run_id });
         const c = r.changes.find((x) => x.path === ch.path);
@@ -138,6 +148,19 @@
           onReject: async () => { await post('/api/revert', { run_id: ch.run_id, path: ch.path }); F.refreshFile(ch.path); F.loadTree(); toast('Reverted ' + ch.path, 'ok'); } });
       } catch (e) { toast(e.message, 'error'); }
     } }, F.fileIcon(ch.path), el('span', { text: ch.path }), el('span', { class: 'badge ' + ch.kind, text: ch.kind }));
+  }
+  /** The row of changed-file chips under a reply, with a Revert all button (a Cursor-style checkpoint restore). */
+  function filesRow(runId) {
+    const chips = el('span', { class: 'files-row' });
+    const btn = el('button', { class: 'btn ghost sm', text: 'Revert all', title: 'Undo every file change of this reply', onclick: async () => {
+      if (!runId || !confirm('Undo every file change of this reply?')) return;
+      try { const r = await post('/api/revert_all', { run_id: runId }); toast((r.messages || []).length + ' file(s) restored.', 'ok'); } catch (e) { toast(e.message, 'error'); }
+      F.loadTree(); F.loadChanges && F.loadChanges();
+      chips.querySelectorAll('.filechange').forEach((c) => { if (c.dataset.path) F.refreshFile(c.dataset.path); });
+    } });
+    const row = el('div', { class: 'files-row' }, chips, btn);
+    row._chips = chips;
+    return row;
   }
   function statLine(s) {
     const parts = [];
@@ -160,18 +183,40 @@
       else if (b.type === 'tool') m.append(toolCard(b));
       else if (b.type === 'approval') m.append(approvalCard(b, true));
       else if (b.type === 'ask') m.append(askCard(b.question));
+      else if (b.type === 'vision') m.append(visionBlock(b));
       else if (b.type === 'status') m.append(el('div', { class: 'status-line' + (b.error ? ' error' : ''), text: b.text }));
-      else if (b.type === 'files') { const w = el('div', { style: 'display:flex;flex-wrap:wrap;gap:4px' }); for (const ch of b.files) w.append(fileChangeChip(ch)); m.append(w); }
+      else if (b.type === 'files') { const w = filesRow(b.files[0] && b.files[0].run_id); for (const ch of b.files) w._chips.append(fileChangeChip(ch)); m.append(w); }
       else if (b.type === 'verbose' && verbose) m.append(el('div', { class: 'verbose', text: '[' + b.kind + '] ' + b.text }));
     }
     if (turn.stats) m.append(statLine(turn.stats));
     return m;
   }
+  /** What the vision model saw in an attached image, so you can check what Llama was told. */
+  function visionBlock(b) {
+    const d = el('details', { class: 'vision' });
+    d.append(el('summary', { text: '👁 What the vision model sees in image ' + b.number + (b.source && b.source !== 'unavailable' && b.source !== 'off' ? ' (' + b.source + ')' : '') }));
+    const body = el('div', { class: 'vbody' });
+    if (b.description) body.append(el('div', { class: 'vsect', text: 'Description' }), el('div', { text: b.description }));
+    else body.append(el('div', { class: 'muted', text: 'The vision model was not available, so only the recognized text was used.' }));
+    if (b.ocr) body.append(el('div', { class: 'vsect', text: 'Recognized text' }), el('pre', { text: b.ocr }));
+    d.append(body);
+    return d;
+  }
+  function openLightbox(url) { $('#lightbox-img').src = url; $('#lightbox').classList.remove('hidden'); }
+  $('#lightbox').addEventListener('click', () => $('#lightbox').classList.add('hidden'));
+  window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#lightbox').classList.contains('hidden')) $('#lightbox').classList.add('hidden'); });
   function askCard(q) { return el('div', { class: 'ask-card' }, el('div', { class: 'atitle', text: 'Forge asks' }), el('div', { text: q })); }
   function approvalCard(a, resolved) {
     const card = el('div', { class: 'approval' + (resolved ? ' resolved' : '') });
-    card.append(el('div', { class: 'atitle', text: (a.tool === 'run_command' ? 'Run this command?' : a.tool === 'delete_path' ? 'Move to trash?' : 'Allow ' + a.tool + '?') + (a.reason ? ' · ' + a.reason : '') }));
-    const cmd = a.tool === 'run_command' ? (a.arguments.command || '') : JSON.stringify(a.arguments);
+    const isWrite = a.tool === 'write_file' || a.tool === 'edit_file';
+    const title = a.tool === 'run_command' ? 'Run this command?' : a.tool === 'delete_path' ? 'Move to trash?' : isWrite ? 'Change a file outside this project?' : 'Allow ' + a.tool + '?';
+    card.append(el('div', { class: 'atitle', text: title }));
+    if (a.reason) card.append(el('div', { class: 'muted small', text: a.reason }));
+    const args = a.arguments || {};
+    const cmd = a.tool === 'run_command' ? (args.command || '')
+      : isWrite ? (args.path + '\n\n' + (a.tool === 'write_file' ? 'New content:\n' + String(args.content || '').slice(0, 1500)
+        : 'Replace:\n' + String(args.old_text || '').slice(0, 700) + '\n\nWith:\n' + String(args.new_text || '').slice(0, 700)))
+      : JSON.stringify(args);
     let ta = null;
     if (!resolved && a.tool === 'run_command') { ta = el('textarea', { spellcheck: 'false' }); ta.value = cmd; card.append(ta); }
     else card.append(el('pre', { text: cmd }));
@@ -186,7 +231,7 @@
         if (ta) ta.replaceWith(el('pre', { text: ta.value }));
       };
       card.append(el('div', { class: 'aactions' },
-        el('button', { class: 'btn sm', text: 'Run', onclick: () => decide('approve') }),
+        el('button', { class: 'btn sm', text: a.tool === 'run_command' ? 'Run' : 'Allow', onclick: () => decide('approve') }),
         el('button', { class: 'btn ghost sm', text: 'Always allow this chat', onclick: () => decide('always') }),
         el('button', { class: 'btn ghost sm', text: 'Skip', onclick: () => decide('deny') })));
       setTimeout(() => { const b = card.querySelector('.btn'); if (b) b.focus(); }, 50);
@@ -203,12 +248,19 @@
 
   // ------------------------------------------------------------------ sessions
   C.sessionId = () => (session ? session.id : '');
+  const sessionKey = () => 'forge.session.' + F.folder;
   async function loadSession(id) {
     if (run) { toast('A run is still active in this chat.', 'error'); return; }
     try {
-      session = await get('/api/session', { id });
+      const s = await get('/api/session', { id });
+      if (s.workspace && s.workspace !== F.folder) {
+        // A chat always works in its own folder, like in Cursor: switch this window to that folder.
+        F.goToFolder(s.workspace, s.id);
+        return;
+      }
+      session = s;
       transcript = session.transcript || [];
-      localStorage.setItem('forge.session', session.id);
+      try { localStorage.setItem(sessionKey(), session.id); } catch (e) { /* storage blocked */ }
       $('#chat-title-text').textContent = session.title || 'New chat';
       renderTranscript();
     } catch (e) { await newChat(); }
@@ -217,7 +269,7 @@
     if (run) stopRun();
     session = await post('/api/session/new', {});
     transcript = [];
-    localStorage.setItem('forge.session', session.id);
+    try { localStorage.setItem(sessionKey(), session.id); } catch (e) { /* storage blocked */ }
     $('#chat-title-text').textContent = 'New chat';
     renderTranscript();
     contexts = []; renderContexts();
@@ -232,19 +284,32 @@
   }
   async function loadHistory(host) {
     if (!host) return;
+    const all = !!F.ui.chatsAll;
+    const scopeBtn = $('#btn-chats-scope');
+    if (scopeBtn) scopeBtn.textContent = all ? 'All folders' : 'This folder';
     try {
-      const r = await get('/api/sessions');
+      const r = await get('/api/sessions', all ? { all: '1' } : null);
       host.innerHTML = '';
-      if (!r.sessions.length) host.append(el('div', { class: 'muted pad', text: 'No chats yet.' }));
-      for (const s of r.sessions) {
-        const row = el('div', { class: 'hist' + (session && s.id === session.id ? ' active' : ''), onclick: () => loadSession(s.id) },
-          el('span', { class: 'ht', text: s.title, title: s.title + '\n' + (s.workspace || '') }),
-          el('span', { class: 'hd', text: timeAgo(s.updated) }),
-          el('span', { class: 'hx', text: '✕', title: 'Delete chat', onclick: async (e) => { e.stopPropagation(); if (!confirm('Delete chat "' + s.title + '"?')) return; await post('/api/session/delete', { id: s.id }); if (session && session.id === s.id) await newChat(); else loadHistory(host); } }));
-        host.append(row);
+      if (!r.sessions.length) { host.append(el('div', { class: 'muted pad', text: all ? 'No chats yet.' : 'No chats in this folder yet. Chats from your other folders are under "This folder", switched to "All folders".' })); return; }
+      const groups = new Map();
+      for (const s of r.sessions) { const k = s.workspace || ''; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(s); }
+      const keys = [...groups.keys()].sort((a, b) => (a === F.folder ? -1 : b === F.folder ? 1 : 0));
+      for (const folder of keys) {
+        if (all) host.append(el('div', { class: 'hist-folder', title: folder }, el('span', { text: F.folderName(folder) + (folder === F.folder ? ' (this window)' : '') }), el('span', { class: 'hf-path', text: folder })));
+        for (const s of groups.get(folder)) {
+          const other = s.workspace && s.workspace !== F.folder;
+          const row = el('div', { class: 'hist' + (session && s.id === session.id ? ' active' : ''), title: s.title + '\n' + (s.workspace || ''),
+                                  onclick: () => (other ? F.goToFolder(s.workspace, s.id) : loadSession(s.id)) },
+            el('span', { class: 'ht', text: s.title }),
+            el('span', { class: 'hd', text: timeAgo(s.updated) }),
+            el('span', { class: 'hw', text: '↗', title: 'Open in a new window', onclick: (e) => { e.stopPropagation(); F.newWindow(s.workspace || F.folder, s.id); } }),
+            el('span', { class: 'hx', text: '✕', title: 'Delete chat', onclick: async (e) => { e.stopPropagation(); if (!confirm('Delete chat "' + s.title + '"?')) return; await post('/api/session/delete', { id: s.id }); if (session && session.id === s.id) await newChat(); else loadHistory(host); } }));
+          host.append(row);
+        }
       }
     } catch (e) { host.innerHTML = '<div class="muted pad">' + esc(e.message) + '</div>'; }
   }
+  { const b = document.querySelector('#btn-chats-scope'); if (b) b.onclick = () => { F.ui.chatsAll = !F.ui.chatsAll; try { localStorage.setItem('forge.ui', JSON.stringify(F.ui)); } catch (e) { /* ignore */ } loadHistory($('#history')); }; }
   C.loadHistory = loadHistory;
   function timeAgo(ts) {
     const d = (Date.now() / 1000 - ts);
@@ -262,6 +327,12 @@
     host.innerHTML = '';
     contexts.forEach((c, i) => {
       const label = c.kind === 'selection' ? c.path + ':' + c.start + '-' + c.end : c.kind === 'terminal' ? 'Terminal output' : (c.path || c.title);
+      if (c.kind === 'image') {
+        host.append(el('span', { class: 'cchip img' + (c.busy ? ' busy' : ''), title: (c.name || 'image') + (c.busy ? ' (uploading)' : '') },
+          c.url ? el('img', { src: c.url, alt: '', onclick: () => openLightbox(c.url) }) : el('span', { text: '…' }),
+          el('span', { class: 'n', text: c.name || 'image' }), el('span', { class: 'x', text: '✕', onclick: () => { contexts.splice(i, 1); renderContexts(); } })));
+        return;
+      }
       host.append(el('span', { class: 'cchip', title: label }, c.kind === 'file' ? F.fileIcon(c.path) : el('span', { text: c.kind === 'selection' ? '⌶' : '▣' }), el('span', { class: 'n', text: label }), el('span', { class: 'x', text: '✕', onclick: () => { contexts.splice(i, 1); renderContexts(); } })));
     });
   }
@@ -284,6 +355,49 @@
   C.sendMessage = (text, mode, attach) => { if (attach) contexts.push(attach); if (mode) $('#mode-select').value = mode; promptEl.value = text; if (F.ui.chat === false) F.toggle('chat'); send(); };
   C.quickAsk = (text, mode) => { C.addSelectionAndFocus(); if (mode) $('#mode-select').value = mode; promptEl.value = text; send(); };
   $('#btn-add-selection').onclick = C.addSelectionAndFocus;
+
+  // ------------------------------------------------------------------ images: paste, drop or pick, like in Cursor
+  async function addImageFile(file) {
+    if (!file || !/^image\/(png|jpeg|gif|webp)$/.test(file.type)) { toast('Only PNG, JPEG, GIF and WebP images can be attached.', 'error'); return; }
+    if (file.size > 15 * 1024 * 1024) { toast('That image is larger than 15 MB.', 'error'); return; }
+    const chip = { kind: 'image', name: file.name && file.name !== 'image.png' ? file.name : 'Screenshot', busy: true };
+    contexts.push(chip); renderContexts();
+    try {
+      const dataUrl = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(file); });
+      const meta = await post('/api/image', { data: dataUrl, name: chip.name });
+      Object.assign(chip, { id: meta.id, url: meta.url, width: meta.width, height: meta.height, busy: false });
+    } catch (e) {
+      contexts.splice(contexts.indexOf(chip), 1);
+      toast('Could not attach the image: ' + e.message, 'error');
+    }
+    renderContexts();
+    if (F.ui.chat === false) F.toggle('chat');
+    promptEl.focus();
+  }
+  C.addImageFile = addImageFile;
+  $('#btn-add-image').onclick = () => $('#image-input').click();
+  $('#image-input').addEventListener('change', (e) => { for (const f of e.target.files) addImageFile(f); e.target.value = ''; });
+  function imagesFrom(dt) {
+    const out = [];
+    if (!dt) return out;
+    for (const it of dt.items || []) if (it.kind === 'file' && it.type.startsWith('image/')) { const f = it.getAsFile(); if (f) out.push(f); }
+    if (!out.length) for (const f of dt.files || []) if (f.type.startsWith('image/')) out.push(f);
+    return out;
+  }
+  promptEl.addEventListener('paste', (e) => {
+    const files = imagesFrom(e.clipboardData);
+    if (files.length) { e.preventDefault(); for (const f of files) addImageFile(f); }
+  });
+  let dragDepth = 0;
+  const chatEl = $('#chat');
+  chatEl.addEventListener('dragenter', (e) => { if ([...(e.dataTransfer.types || [])].includes('Files')) { dragDepth++; $('#drop-hint').classList.remove('hidden'); } });
+  chatEl.addEventListener('dragleave', () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) $('#drop-hint').classList.add('hidden'); });
+  chatEl.addEventListener('dragover', (e) => { if ([...(e.dataTransfer.types || [])].includes('Files')) e.preventDefault(); });
+  chatEl.addEventListener('drop', (e) => {
+    dragDepth = 0; $('#drop-hint').classList.add('hidden');
+    const files = imagesFrom(e.dataTransfer);
+    if (files.length) { e.preventDefault(); for (const f of files) addImageFile(f); }
+  });
   $('#btn-add-context').onclick = () => { promptEl.focus(); promptEl.value += (promptEl.value && !promptEl.value.endsWith(' ') ? ' ' : '') + '@'; promptEl.dispatchEvent(new Event('input')); };
   for (const b of $$('.tip')) b.onclick = () => { promptEl.value = b.dataset.tip; if (F.activePath && /current file/.test(b.dataset.tip)) C.addFileContext(F.activePath); promptEl.focus(); };
 
@@ -346,7 +460,9 @@
   // ------------------------------------------------------------------ sending and streaming
   let initDone = null;   // resolves when the first session exists; send() waits for it
   async function send() {
-    const text = promptEl.value.trim();
+    let text = promptEl.value.trim();
+    if (contexts.some((c) => c.busy)) { toast('Wait a moment: an image is still uploading.', 'error'); return; }
+    if (!text && contexts.some((c) => c.kind === 'image')) text = 'Look at the attached image.';
     if (!text || run) return;
     if (initDone) await initDone;
     if (!session) await newChat();
@@ -478,8 +594,8 @@
         const ch = { path: ev.path, kind: ev.kind, run_id: ev.run_id };
         run.files.push(ch);
         let fb = run.turn.blocks.find((b) => b.type === 'files');
-        if (!fb) { fb = { type: 'files', files: [] }; run.turn.blocks.push(fb); run.filesEl = el('div', { style: 'display:flex;flex-wrap:wrap;gap:4px' }); run.msgEl.append(run.filesEl); }
-        if (!fb.files.some((f) => f.path === ch.path)) { fb.files.push(ch); run.filesEl.append(fileChangeChip(ch)); }
+        if (!fb) { fb = { type: 'files', files: [] }; run.turn.blocks.push(fb); run.filesEl = filesRow(ch.run_id); run.msgEl.append(run.filesEl); }
+        if (!fb.files.some((f) => f.path === ch.path)) { fb.files.push(ch); run.filesEl._chips.append(fileChangeChip(ch)); }
         else { const i = fb.files.findIndex((f) => f.path === ch.path); fb.files[i] = ch; }
         F.refreshFile(ev.path);
         break;
@@ -497,6 +613,13 @@
         closeCurrent();
         run.turn.blocks.push({ type: 'ask', question: ev.question });
         run.msgEl.append(askCard(ev.question)); promptEl.focus(); break;
+      }
+      case 'image_analysis': {
+        closeCurrent(); run.spinner.remove();
+        const b = { type: 'vision', number: ev.number, source: ev.source, description: ev.description, ocr: ev.ocr };
+        run.turn.blocks.push(b);
+        run.msgEl.append(visionBlock(b)); scrollToBottom();
+        break;
       }
       case 'tool_error':
         run.turn.blocks.push({ type: 'status', text: ev.message, error: true });
@@ -547,7 +670,11 @@
   C.init = async () => {
     verbose = !!F.settings.verbose;
     $('#mode-select').value = localStorage.getItem('forge.mode') || 'agent';
-    const sid = localStorage.getItem('forge.session');
+    const params = new URLSearchParams(location.search);
+    const urlChat = params.get('chat');
+    let sid = urlChat;
+    if (!sid) { try { sid = localStorage.getItem(sessionKey()); } catch (e) { sid = null; } }
+    if (urlChat) { params.delete('chat'); history.replaceState(null, '', '/?' + params.toString()); }
     // If the user already sent a message before startup finished, keep that live session untouched.
     initDone = (async () => { if (session || run) return; if (sid) await loadSession(sid); else await newChat(); })();
     await initDone;

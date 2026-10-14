@@ -48,6 +48,9 @@ public class EngineService extends Service {
     private static volatile String state = "stopped";      // stopped | downloading | starting | running | error
     private static volatile String detail = "";
     private static volatile long downloaded = 0, downloadTotal = 0;
+    /** True while the engine is paused so the vision model can use the GPU (one model on the GPU at a time). */
+    static volatile boolean pausing = false;
+    static volatile boolean pausedForVision = false;
 
     private Process proc;
     private Thread worker;
@@ -68,6 +71,9 @@ public class EngineService extends Service {
             o.put("models", names.toString());
             o.put("hostMemAvailableMb", memAvailableMb());
             o.put("binary", new File(ctx.getApplicationInfo().nativeLibraryDir, "libllama-server.so").exists());
+            o.put("vision", VisionControl.state());
+            o.put("visionTier", VisionControl.tier());
+            o.put("visionDetail", VisionControl.detail());
         } catch (Exception ignored) { }
         return o;
     }
@@ -105,6 +111,7 @@ public class EngineService extends Service {
     public void onCreate() {
         super.onCreate();
         instance = this;
+        VisionControl.ensure(this);
         NotificationManager nm = getSystemService(NotificationManager.class);
         NotificationChannel ch = new NotificationChannel(CHANNEL, "Forge GPU engine", NotificationManager.IMPORTANCE_LOW);
         ch.setDescription("Runs the AI model on the Intel graphics while Forge is in use.");
@@ -177,20 +184,19 @@ public class EngineService extends Service {
             File bin = new File(getApplicationInfo().nativeLibraryDir, "libllama-server.so");
             if (!bin.exists()) throw new Exception("Engine binary missing from this build of the app.");
             long needMb = size / (1024 * 1024) + 1200;   // weights + KV cache + compute buffers + margin
-            // Ask the VM to hand memory back to the Googlebook (unload Ollama, drop caches, compact), then wait for room.
-            long avail = memAvailableMb();
-            for (int attempt = 0; avail >= 0 && avail < needMb && attempt < 120 && !stopping; attempt++) {
+            // The free-memory check (GpuBudget), never bypassed. Ask the VM to hand memory back while waiting.
+            String why = GpuBudget.check(this, needMb);
+            for (int attempt = 0; why != null && attempt < 120 && !stopping; attempt++) {
                 if (attempt % 12 == 0) { try { httpPost(FORGE + "/api/engine/prepare", "{}", 90000); } catch (Exception e) { log("prepare: " + e.getMessage()); } }
                 state = "starting";
-                notifyText("Waiting for free memory: " + avail + " MB free, " + needMb + " MB needed. Closing other apps helps.");
+                notifyText("Waiting for free memory (" + why + "). Closing other apps helps.");
                 Thread.sleep(5000);
-                avail = memAvailableMb();
+                why = GpuBudget.check(this, needMb);
             }
-            if (avail >= 0 && avail < needMb) {
-                throw new Exception("Not enough free memory on the Googlebook for the engine: " + avail + " MB free, about "
-                        + needMb + " MB needed. Close other apps and try again.");
+            if (why != null) {
+                throw new Exception("Not enough free memory on the Googlebook for the engine (" + why + "). Close other apps and try again.");
             }
-            log("memory check passed: " + avail + " MB available on the host, " + needMb + " MB needed");
+            log("memory check passed: " + GpuBudget.effectiveMb(this) + " MB usable, " + needMb + " MB needed");
             state = "starting";
             notifyText("Loading the model on the GPU…");
             int ctx = cfg.optInt("ctx", 8192);
@@ -220,9 +226,11 @@ public class EngineService extends Service {
             pb.environment().put("HOME", getFilesDir().getAbsolutePath());
             pb.environment().put("TMPDIR", getCacheDir().getAbsolutePath());
             pb.environment().put("LLAMA_CACHE", getCacheDir().getAbsolutePath());
+            GpuBudget.beforeStart(this, "engine");
             proc = pb.start();
             // Make the engine the first thing the system reclaims under memory pressure, never the VM.
-            try (FileOutputStream adj = new FileOutputStream("/proc/" + pidOf(proc) + "/oom_score_adj")) { adj.write("900".getBytes()); } catch (Exception e) { log("oom_score_adj not set: " + e.getMessage()); }
+            int epid = pidOf(proc);
+            try (FileOutputStream adj = new FileOutputStream("/proc/" + epid + "/oom_score_adj")) { adj.write("900".getBytes()); log("engine pid " + epid + " marked oom_score_adj 900"); } catch (Exception e) { log("oom_score_adj not set for pid " + epid + ": " + e.getMessage()); }
             try (BufferedReader r = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
                 String line;
                 while ((line = r.readLine()) != null) {
@@ -233,7 +241,15 @@ public class EngineService extends Service {
                 }
             }
             int code = proc.waitFor();
-            if (!stopping) {
+            GpuBudget.afterStop(this, "engine");
+            if (pausing) {
+                pausing = false;
+                pausedForVision = true;
+                state = "paused";
+                detail = "Paused while the vision model reads an image";
+                notifyText(detail);
+                postStats("paused");
+            } else if (!stopping) {
                 state = "error";
                 detail = "Engine exited with code " + code + ". See the engine log.";
                 log(detail);
@@ -249,13 +265,18 @@ public class EngineService extends Service {
             notifyText(detail);
         } finally {
             proc = null;
-            stopForeground(STOP_FOREGROUND_DETACH);
-            if (!"error".equals(state)) stopSelf();
+            if (!"paused".equals(state)) {
+                stopForeground(STOP_FOREGROUND_DETACH);
+                if (!"error".equals(state)) stopSelf();
+            }
         }
     }
 
-    private static int pidOf(Process p) {
-        try { return (int) (long) p.getClass().getMethod("pid").invoke(p); } catch (Exception e) { return -1; }
+    /** Android's Process has no pid() method; its implementation keeps the pid in a private field. */
+    static int pidOf(Process p) {
+        try { return (int) (long) p.getClass().getMethod("pid").invoke(p); } catch (Exception e) {
+            try { java.lang.reflect.Field f = p.getClass().getDeclaredField("pid"); f.setAccessible(true); return f.getInt(p); } catch (Exception e2) { return -1; }
+        }
     }
 
     private void postStats(String what) {
@@ -332,6 +353,33 @@ public class EngineService extends Service {
             byte[] buf = in.readAllBytes();
             return new String(buf);
         } finally { c.disconnect(); }
+    }
+
+    // ------------------------------------------------------------ taking turns with the vision model
+    static boolean engineRunning() { EngineService s = instance; return s != null && s.proc != null; }
+
+    /** Stops the engine process (keeping the service) so the vision model can use the GPU. True if it was running. */
+    static boolean pauseForVision() {
+        EngineService s = instance;
+        if (s == null || s.proc == null) return false;
+        pausing = true;
+        Process p = s.proc;
+        log("pausing the engine for the vision model");
+        p.destroy();
+        try { if (!p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); } catch (InterruptedException ignored) { }
+        for (int i = 0; i < 50 && !pausedForVision; i++) { try { Thread.sleep(100); } catch (InterruptedException ignored) { } }
+        return true;
+    }
+
+    /** Starts the engine again after the vision model is done (through the normal free-memory check). */
+    static void resumeAfterVision() {
+        EngineService s = instance;
+        if (s == null || !pausedForVision) return;
+        pausedForVision = false;
+        log("resuming the engine after the vision model");
+        s.stopping = false;
+        s.worker = new Thread(s::run, "forge-engine");
+        s.worker.start();
     }
 
     // ------------------------------------------------------------ control from the activity bridge

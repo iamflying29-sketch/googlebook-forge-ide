@@ -20,6 +20,9 @@
 
   // ------------------------------------------------------------------ API
   async function api(path, opts) {
+    opts = Object.assign({}, opts || {});
+    opts.headers = Object.assign({}, opts.headers || {});
+    if (window.Forge && window.Forge.folder) opts.headers['X-Forge-Folder'] = encodeURIComponent(window.Forge.folder);
     const r = await fetch(path, opts);
     let data = null;
     try { data = await r.json(); } catch (e) { data = { error: 'bad response' }; }
@@ -49,6 +52,25 @@
     hooks: { onSelectionChanged: [], onActiveFileChanged: [] },
   };
   const saveUi = () => localStorage.setItem('forge.ui', JSON.stringify(Forge.ui));
+
+  // ------------------------------------------------------------------ this window's folder (one folder per window, like Cursor)
+  Forge.folder = new URLSearchParams(location.search).get('folder') || '';
+  function folderUrl(folder, chat) {
+    const q = new URLSearchParams();
+    q.set('folder', folder);
+    if (chat) q.set('chat', chat);
+    return '/?' + q.toString();
+  }
+  Forge.folderUrl = folderUrl;
+  Forge.folderName = (f) => (f || '').replace(/\/+$/, '').split('/').pop() || f;
+  /** Open a folder (and optionally a chat) in a new window: a new app window in the Forge app, a new tab in Chrome. */
+  Forge.newWindow = (folder, chat) => {
+    const url = folderUrl(folder || Forge.folder, chat);
+    if (window.ForgeApp && typeof window.ForgeApp.newWindow === 'function') window.ForgeApp.newWindow(url);
+    else window.open(url, '_blank');
+  };
+  /** Switch this window to another folder (reloads the window, like Cursor's Open Folder). */
+  Forge.goToFolder = (folder, chat) => { location.href = folderUrl(folder, chat); };
 
   // ------------------------------------------------------------------ layout
   function applyLayout() {
@@ -207,7 +229,7 @@
       let data;
       try { data = await get('/api/file', { path }); } catch (e) { toast('Cannot open ' + path + ': ' + e.message, 'error'); return null; }
       const lang = langFor(path);
-      const model = monaco.editor.createModel(data.content, lang, monaco.Uri.file('/' + path));
+      const model = monaco.editor.createModel(data.content, lang, monaco.Uri.file(path.startsWith('/') ? '/__abs' + path : '/__project/' + path));
       f = { path, model, viewState: null, dirty: false, mtime: data.mtime, language: lang, savedVersion: model.getAlternativeVersionId() };
       model.onDidChangeContent(() => {
         const d = model.getAlternativeVersionId() !== f.savedVersion;
@@ -259,7 +281,8 @@
   function renderBreadcrumbs(path) {
     const b = $('#breadcrumbs');
     b.innerHTML = '';
-    const parts = path.split('/');
+    const parts = path.split('/').filter(Boolean);
+    if (path.startsWith('/')) parts.unshift('/');
     parts.forEach((part, i) => {
       if (i) b.append(el('span', { class: 'muted', text: '›' }));
       b.append(el('span', { text: part }));
@@ -311,9 +334,16 @@
   Object.assign(Forge, { openFile, closeFile, saveActive, saveAll, refreshFile, activate });
 
   // ------------------------------------------------------------------ explorer tree
-  const treeState = { open: new Set(JSON.parse(localStorage.getItem('forge.treeOpen') || '[]')) };
-  function saveTree() { localStorage.setItem('forge.treeOpen', JSON.stringify([...treeState.open])); }
+  const treeState = { open: new Set(), key: null };
+  function ensureTreeState() {
+    const k = 'forge.treeOpen.' + Forge.folder;
+    if (treeState.key === k) return;
+    treeState.key = k;
+    try { treeState.open = new Set(JSON.parse(localStorage.getItem(k) || '[]')); } catch (e) { treeState.open = new Set(); }
+  }
+  function saveTree() { ensureTreeState(); try { localStorage.setItem(treeState.key, JSON.stringify([...treeState.open])); } catch (e) { /* storage full or blocked */ } }
   async function loadTree() {
+    ensureTreeState();
     const host = $('#tree');
     host.innerHTML = '';
     await renderDir(host, '.', 0);
@@ -440,33 +470,47 @@
     } catch (e) { host.innerHTML = '<div class="muted pad">' + esc(e.message) + '</div>'; }
   }
 
-  // ------------------------------------------------------------------ changes view (checkpoints)
+  // ------------------------------------------------------------------ changes view (checkpoints, saved across restarts)
+  const changePath = (c) => (c.path.startsWith('/') || !c.workspace || c.workspace === Forge.folder) ? c.path : c.workspace.replace(/\/+$/, '') + '/' + c.path;
+  async function fetchChange(c) {
+    const r = await get('/api/changes', { run_id: c.run_id });
+    return r.changes.find((x) => x.path === c.path) || c;
+  }
   async function loadChanges() {
     const host = $('#changes');
+    const all = !!Forge.ui.changesAll;
+    $('#btn-changes-scope').textContent = all ? 'All folders' : 'This folder';
     try {
-      const r = await get('/api/changes');
+      const r = await get('/api/changes', all ? { all: '1' } : null);
       host.innerHTML = '';
-      if (!r.changes.length) { host.innerHTML = '<div class="muted pad">No AI changes yet. When the agent edits files you can review each diff here, keep it or revert it.</div>'; return; }
+      if (!r.changes.length) { host.innerHTML = '<div class="muted pad">No AI changes ' + (all ? 'yet' : 'in this folder yet') + '. When the agent edits files you can review each diff here, keep it or revert it, even after a restart.</div>'; return; }
       const byRun = new Map();
       for (const c of r.changes) { if (!byRun.has(c.run_id)) byRun.set(c.run_id, []); byRun.get(c.run_id).push(c); }
       for (const [rid, list] of byRun) {
-        const head = el('div', { class: 'view-head' }, el('span', { text: 'Run ' + rid + ' · ' + new Date(list[0].ts * 1000).toLocaleTimeString() }),
-          el('button', { class: 'btn ghost sm', text: 'Revert all', onclick: async () => { if (!confirm('Revert every file this run changed?')) return; await post('/api/revert_all', { run_id: rid }); for (const c of list) refreshFile(c.path); loadChanges(); loadTree(); } }));
+        const c0 = list[0];
+        const when = new Date((c0.run_ts || c0.ts) * 1000);
+        const label = (c0.title || 'Agent run') ;
+        const head = el('div', { class: 'run-head' },
+          el('div', { class: 'run-title', text: label, title: label }),
+          el('div', { class: 'run-meta' }, el('span', { text: when.toLocaleDateString() + ' ' + when.toLocaleTimeString() + (all && c0.workspace ? ' · ' + Forge.folderName(c0.workspace) : ''), title: c0.workspace || '' }),
+            el('button', { class: 'btn ghost sm', text: 'Revert all', onclick: async () => { if (!confirm('Revert every file this run changed?')) return; try { await post('/api/revert_all', { run_id: rid }); } catch (e) { toast(e.message, 'error'); } for (const c of list) refreshFile(changePath(c)); loadChanges(); loadTree(); } })));
         host.append(head);
         for (const c of list) {
+          const p = changePath(c);
           const card = el('div', { class: 'change' },
-            el('div', { class: 'cpath', onclick: () => openFile(c.path) }, fileIcon(c.path), el('span', { text: c.path }), el('span', { class: 'badge ' + c.kind, text: c.kind })),
+            el('div', { class: 'cpath', onclick: () => openFile(p), title: p }, fileIcon(c.path), el('span', { text: c.path }), el('span', { class: 'badge ' + c.kind, text: c.kind })),
             el('div', { class: 'cactions' },
-              el('button', { class: 'btn ghost sm', text: 'Diff', onclick: () => openDiff({ title: c.path, original: c.before || '', modified: c.after || '', language: langFor(c.path), acceptLabel: 'Keep', rejectLabel: 'Revert', onReject: () => revertChange(c) }) }),
-              c.kind !== 'reverted' ? el('button', { class: 'btn ghost sm', text: 'Revert', onclick: () => revertChange(c) }) : null));
+              el('button', { class: 'btn ghost sm', text: 'Diff', onclick: async () => { try { const full = await fetchChange(c); openDiff({ title: c.path, original: full.before || '', modified: full.after || '', language: langFor(c.path), acceptLabel: 'Keep', rejectLabel: 'Revert', onReject: () => revertChange(c) }); } catch (e) { toast(e.message, 'error'); } } }),
+              c.kind !== 'reverted' ? el('button', { class: 'btn ghost sm', text: 'Revert', disabled: c.revertable === false ? '' : null, title: c.revertable === false ? 'The file was too large to keep a snapshot.' : '', onclick: () => revertChange(c) }) : null));
           host.append(card);
         }
       }
     } catch (e) { host.innerHTML = '<div class="muted pad">' + esc(e.message) + '</div>'; }
   }
   async function revertChange(c) {
-    try { const r = await post('/api/revert', { run_id: c.run_id, path: c.path }); toast(r.message, 'ok'); refreshFile(c.path); loadChanges(); loadTree(); } catch (e) { toast(e.message, 'error'); }
+    try { const r = await post('/api/revert', { run_id: c.run_id, path: c.path }); toast(r.message, 'ok'); refreshFile(changePath(c)); loadChanges(); loadTree(); } catch (e) { toast(e.message, 'error'); }
   }
+  $('#btn-changes-scope').onclick = () => { Forge.ui.changesAll = !Forge.ui.changesAll; saveUi(); loadChanges(); };
   $('#btn-refresh-changes').onclick = loadChanges;
   Forge.loadChanges = loadChanges;
 
@@ -591,7 +635,7 @@
   }
   let manualTrigger = false;
   function triggerCompletion(manual) { manualTrigger = !!manual; Forge.editor.trigger('forge', 'editor.action.inlineSuggest.trigger', {}); }
-  $('#sb-tab').onclick = () => { Forge.settings.tab_completions = !Forge.settings.tab_completions; post('/api/settings', { tab_completions: Forge.settings.tab_completions }); updateStatusBar(); };
+  $('#sb-tab').onclick = () => Forge.saveSetting('tab_completions', !Forge.settings.tab_completions);
 
   // ------------------------------------------------------------------ palette / quick open
   const COMMANDS = [
@@ -601,6 +645,12 @@
     { label: 'Toggle terminal', hint: 'Ctrl `', run: () => Forge.toggle('panel') },
     { label: 'New terminal', run: () => { showPanel('terminal'); window.ForgeTerm && window.ForgeTerm.create(); } },
     { label: 'Open folder', hint: 'Ctrl O', run: () => openFolderModal() },
+    { label: 'New window', hint: 'Ctrl Shift N', run: () => Forge.newWindow(Forge.folder) },
+    { label: 'Open folder in a new window', run: () => openFolderModal(null, true) },
+    { label: 'Open a file anywhere on this computer (type a path starting with / or ~)', run: () => openPalette('/') },
+    { label: 'Show chats from all folders', run: () => { Forge.ui.chatsAll = true; saveUi(); showView('history'); } },
+    { label: 'Show AI changes from all folders', run: () => { Forge.ui.changesAll = true; saveUi(); showView('changes'); } },
+    { label: 'Settings for this folder', run: () => { Forge.ui.settingsScope = 'folder'; saveUi(); showView('settings'); } },
     { label: 'New file', run: () => newFilePrompt('') },
     { label: 'Save file', hint: 'Ctrl S', run: () => saveActive() },
     { label: 'Save all files', run: () => saveAll() },
@@ -651,6 +701,12 @@
     } else if (q.startsWith(':')) {
       const n = parseInt(q.slice(1), 10);
       palItems = isNaN(n) ? [] : [{ label: 'Go to line ' + n, hint: '', run: () => { Forge.editor.revealLineInCenter(n); Forge.editor.setPosition({ lineNumber: n, column: 1 }); Forge.editor.focus(); } }];
+    } else if (q.startsWith('/') || q.startsWith('~')) {
+      palItems = [
+        { label: 'Open file ' + q, hint: 'anywhere on this computer', run: () => openFile(q) },
+        { label: 'Open folder ' + q + ' in this window', hint: '', run: () => setWorkspace(q) },
+        { label: 'Open folder ' + q + ' in a new window', hint: '', run: () => setWorkspace(q, true) },
+      ];
     } else {
       try {
         const r = await get('/api/files', { q });
@@ -679,10 +735,13 @@
   });
 
   // ------------------------------------------------------------------ open folder modal
-  async function openFolderModal(path) {
+  let folderModalNewWindow = false;
+  async function openFolderModal(path, newWindow) {
+    if (newWindow !== undefined) folderModalNewWindow = !!newWindow;
     $('#folder-modal').classList.remove('hidden');
+    $('#folder-modal-title').textContent = folderModalNewWindow ? 'Open folder in a new window' : 'Open folder';
     try {
-      const r = await get('/api/dirs', { path: path || Forge.status.workspace || '~' });
+      const r = await get('/api/dirs', { path: path || Forge.folder || '~' });
       $('#folder-path').value = r.path;
       const list = $('#folder-list');
       list.innerHTML = '';
@@ -690,26 +749,27 @@
       for (const d of r.dirs) list.append(el('div', { class: 'fitem', onclick: () => openFolderModal(r.path.replace(/\/$/, '') + '/' + d) }, fileIcon(d, true), el('span', { text: d })));
       const rec = $('#folder-recent');
       rec.innerHTML = '';
-      for (const p of r.recent) rec.append(el('div', { class: 'fitem rec', text: p, title: p, onclick: () => setWorkspace(p) }));
+      for (const p of r.recent) rec.append(el('div', { class: 'fitem rec', title: p },
+        el('span', { class: 'rec-name', text: p, onclick: () => setWorkspace(p, folderModalNewWindow) }),
+        el('span', { class: 'rec-new', text: '↗', title: 'Open in a new window', onclick: () => setWorkspace(p, true) })));
     } catch (e) { toast(e.message, 'error'); }
   }
-  $('#btn-open-workspace').onclick = () => openFolderModal();
-  $('#welcome-open').onclick = () => openFolderModal();
+  Forge.openFolderModal = openFolderModal;
+  $('#btn-open-workspace').onclick = () => openFolderModal(null, false);
+  $('#btn-new-window').onclick = () => Forge.newWindow(Forge.folder);
+  $('#welcome-open').onclick = () => openFolderModal(null, false);
   $('#folder-close').onclick = () => $('#folder-modal').classList.add('hidden');
   $('#folder-modal').addEventListener('mousedown', (e) => { if (e.target === e.currentTarget) $('#folder-modal').classList.add('hidden'); });
-  $('#folder-open').onclick = () => setWorkspace($('#folder-path').value.trim());
-  $('#folder-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') setWorkspace(e.target.value.trim()); });
-  async function setWorkspace(p) {
+  $('#folder-open').onclick = () => setWorkspace($('#folder-path').value.trim(), folderModalNewWindow);
+  $('#folder-open-new').onclick = () => setWorkspace($('#folder-path').value.trim(), true);
+  $('#folder-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') setWorkspace(e.target.value.trim(), folderModalNewWindow); });
+  async function setWorkspace(p, inNewWindow) {
     try {
-      await post('/api/workspace', { path: p, create: true });
+      const r = await post('/api/workspace', { path: p, create: true });
       $('#folder-modal').classList.add('hidden');
-      for (const q of [...Forge.tabOrder]) { const f = Forge.files.get(q); if (f) f.dirty = false; await closeFile(q); }
-      treeState.open.clear(); saveTree();
-      await refreshStatus();
-      await loadTree();
-      if (window.ForgeChat) window.ForgeChat.newChat();
-      if (window.ForgeTerm) window.ForgeTerm.resetAll();
-      toast('Opened ' + p, 'ok');
+      if (inNewWindow) { Forge.newWindow(r.workspace); return; }
+      if (r.workspace === Forge.folder) return;
+      Forge.goToFolder(r.workspace);
     } catch (e) { toast(e.message, 'error'); }
   }
 
@@ -730,8 +790,12 @@
     { key: 'tool_mode', label: 'Tool calling', type: 'select', options: ['prompt', 'native'], hint: 'prompt: Forge\'s robust tagged format (recommended for 8B models). native: Ollama\'s JSON tool API.' },
     { key: 'max_iterations', label: 'Max tool steps per message', type: 'number' },
     { key: 'auto_approve_commands', label: 'Auto-run commands', type: 'bool', hint: 'Destructive commands and deletions still ask.' },
+    { key: 'external_file_protection', label: 'External-file protection', type: 'bool', hint: 'The agent may read and change files anywhere on this computer. With this on, it asks before changing a file outside the project folder. System files and keys always ask.' },
     { key: 'repo_map_chars', label: 'Repo map size (characters)', type: 'number', hint: 'Outline of your workspace given to the model. Smaller is faster.' },
     { key: 'prewarm', label: 'Pre-warm model on new chat', type: 'bool', hint: 'Processes the system prompt in the background so the first reply is fast.' },
+    { group: 'Images' },
+    { key: 'vision', label: 'Vision for screenshots', type: 'select', options: ['auto', 'gpu', 'cpu', 'ocr'], hint: 'auto: Qwen3-VL on the Intel GPU (4B when memory allows, otherwise 2B), then the CPU model, then text recognition only. ocr: text recognition only.' },
+    { key: 'vision_cpu_model', label: 'CPU vision model (Ollama)', type: 'text', hint: 'Used when the GPU is not available, only when memory allows.' },
     { group: 'Editor' },
     { key: 'tab_completions', label: 'Tab completions while typing', type: 'bool', hint: 'Slow on CPU; Alt+\\ triggers one manually any time.' },
     { key: 'completion_delay_ms', label: 'Completion delay (ms)', type: 'number' },
@@ -745,40 +809,71 @@
     host.innerHTML = '';
     let models = [];
     try { models = (await get('/api/models')).models.map((m) => m.name); } catch (e) { /* offline */ }
+    try { const sp = await get('/api/settings'); Forge.settingsPayload = sp; Forge.settings = sp.effective; } catch (e) { /* keep what we have */ }
+    const pl = Forge.settingsPayload || { user: Forge.settings, folder: {}, folder_keys: [] };
+    const scope = Forge.ui.settingsScope === 'folder' ? 'folder' : 'user';
+    const fkeys = new Set(pl.folder_keys || []);
+    host.append(el('div', { class: 'scope-tabs' },
+      el('button', { class: 'scope-tab' + (scope === 'user' ? ' active' : ''), text: 'User', title: 'Your settings for every folder', onclick: () => { Forge.ui.settingsScope = 'user'; saveUi(); renderSettings(); } }),
+      el('button', { class: 'scope-tab' + (scope === 'folder' ? ' active' : ''), text: 'Folder: ' + Forge.folderName(Forge.folder), title: 'Overrides for this folder only, saved in .forge/settings.json inside it', onclick: () => { Forge.ui.settingsScope = 'folder'; saveUi(); renderSettings(); } })));
+    host.append(el('div', { class: 'hint scope-hint', text: scope === 'user'
+      ? 'These settings apply to every folder unless a folder overrides them.'
+      : 'Changes here apply only to ' + Forge.folder + ' and are saved in .forge/settings.json inside it. Settings without an override follow your User settings. Engine and connection settings are machine-wide and appear only under User.' }));
+    let groupHeader = null;
     for (const s of SETTINGS_SCHEMA) {
-      if (s.group) { host.append(el('div', { class: 'sgroup', text: s.group })); continue; }
-      const val = Forge.settings[s.key];
+      if (s.group) { groupHeader = el('div', { class: 'sgroup', text: s.group }); continue; }
+      if (scope === 'folder' && !fkeys.has(s.key)) continue;
+      if (groupHeader) { host.append(groupHeader); groupHeader = null; }
+      const overridden = Object.prototype.hasOwnProperty.call(pl.folder || {}, s.key);
+      const val = scope === 'folder' ? (overridden ? pl.folder[s.key] : (pl.user || {})[s.key]) : (pl.user || Forge.settings)[s.key];
       const row = el('div', { class: 'srow' + (s.type === 'bool' ? ' inline' : '') });
-      row.append(el('label', { text: s.label }));
+      const lab = el('label', { text: s.label });
+      if (scope === 'folder' && overridden) lab.append(el('span', { class: 'ovr', text: ' Reset', title: 'Remove this folder override', onclick: (e) => { e.preventDefault(); resetFolderSetting(s.key); } }));
+      if (scope === 'folder' && !overridden) lab.append(el('span', { class: 'inh', text: ' (from User)' }));
+      if (scope === 'user' && overridden) lab.append(el('span', { class: 'inh', text: ' (overridden in this folder)' }));
+      row.append(lab);
       let input;
       if (s.type === 'bool') {
-        input = el('div', { class: 'switch' + (val ? ' on' : ''), onclick: async () => { input.classList.toggle('on'); await saveSetting(s.key, input.classList.contains('on')); } });
+        input = el('div', { class: 'switch' + (val ? ' on' : ''), onclick: async () => { input.classList.toggle('on'); await saveSetting(s.key, input.classList.contains('on'), scope); renderSettings(); } });
       } else if (s.type === 'select' || s.type === 'model') {
         input = el('select');
         const opts = s.type === 'model' ? (models.length ? models : [val]) : s.options;
         if (s.type === 'model' && val && !opts.includes(val) && !opts.includes(val + ':latest')) opts.unshift(val);
         for (const o of opts) input.append(el('option', { value: o, text: o }));
         input.value = opts.includes(val) ? val : (opts.includes(val + ':latest') ? val + ':latest' : opts[0]);
-        input.onchange = () => saveSetting(s.key, input.value);
+        input.onchange = async () => { await saveSetting(s.key, input.value, scope); renderSettings(); };
       } else {
         input = el('input', { type: s.type, value: val === undefined ? '' : val, step: s.step || (s.type === 'number' ? 1 : null) });
-        input.onchange = () => saveSetting(s.key, s.type === 'number' ? Number(input.value) : input.value);
+        input.onchange = async () => { await saveSetting(s.key, s.type === 'number' ? Number(input.value) : input.value, scope); renderSettings(); };
       }
       row.append(input);
       if (s.hint) row.append(el('div', { class: 'hint', text: s.hint }));
       host.append(row);
     }
-    if (window.ForgeExtras) await window.ForgeExtras.renderSettingsExtras(host);
+    if (window.ForgeExtras && scope === 'user') await window.ForgeExtras.renderSettingsExtras(host);
     host.append(el('div', { class: 'sgroup', text: 'Shortcuts' }));
     const sc = [['Ctrl P', 'Quick open'], ['Ctrl Shift P', 'Command palette'], ['Ctrl L', 'Add selection to chat'], ['Ctrl K', 'Edit selection with AI'], ['Ctrl I', 'Toggle AI panel'], ['Ctrl Enter', 'Send message'], ['Esc', 'Stop the agent'], ['Ctrl `', 'Terminal'], ['Ctrl B', 'Sidebar'], ['Ctrl S', 'Save'], ['Ctrl N', 'New chat'], ['Alt \\', 'Trigger completion']];
     for (const [k, v] of sc) host.append(el('div', { class: 'srow inline' }, el('span', { class: 'muted', text: v }), el('kbd', { text: k })));
   }
-  async function saveSetting(key, value) {
+  /** Save a setting. Without an explicit scope it goes where it is defined: the folder when this folder overrides
+   *  it, otherwise your User settings (so quick toggles always change what you see). */
+  async function saveSetting(key, value, scope) {
     try {
       if (key === 'engine') { await post('/api/engine/select', { engine: value }); }
-      Forge.settings = await post('/api/settings', { [key]: value });
+      const pl = Forge.settingsPayload || {};
+      if (!scope) scope = (pl.folder && Object.prototype.hasOwnProperty.call(pl.folder, key)) ? 'folder' : 'user';
+      if (scope === 'folder' && !(pl.folder_keys || []).includes(key)) scope = 'user';
+      const r = await post('/api/settings', { [key]: value, _scope: scope });
+      Forge.settingsPayload = r; Forge.settings = r.effective;
       applySettings();
-      toast('Saved ' + key, 'ok', 1000);
+      toast('Saved ' + key + (scope === 'folder' ? ' for this folder' : ''), 'ok', 1000);
+    } catch (e) { toast(e.message, 'error'); }
+  }
+  async function resetFolderSetting(key) {
+    try {
+      const r = await post('/api/settings', { _scope: 'folder', _unset: [key] });
+      Forge.settingsPayload = r; Forge.settings = r.effective;
+      applySettings(); renderSettings();
     } catch (e) { toast(e.message, 'error'); }
   }
   function applySettings() {
@@ -800,7 +895,11 @@
       const s = await get('/api/status');
       Forge.status = s;
       $('#workspace-name').textContent = s.workspace_name;
-      document.title = s.workspace_name + ' · Forge IDE';
+      $('#workspace-name').parentElement.title = s.workspace + ' (click to open another folder)';
+      if (document.title !== s.workspace_name + ' · Forge IDE') {
+        document.title = s.workspace_name + ' · Forge IDE';
+        try { if (window.ForgeApp && typeof window.ForgeApp.setTitle === 'function') window.ForgeApp.setTitle(s.workspace_name); } catch (e) { /* older app */ }
+      }
       $('#ollama-dot').className = 'dot ' + (s.ollama ? 'ok' : 'bad');
       $('#sb-ollama').textContent = s.ollama ? 'Ollama connected' : 'Ollama offline';
       $('#sb-ollama').className = 'sb-item ' + (s.ollama ? 'ok' : 'bad');
@@ -812,8 +911,9 @@
       $('#sb-model').title = loaded ? 'Loaded in memory: ' + loaded : 'Not loaded yet';
       if (s.mem && s.mem.total_mb) {
         const avail = s.mem.available_mb, el2 = $('#sb-mem');
-        el2.textContent = 'RAM ' + (avail / 1024).toFixed(1) + ' GB free' + (s.mem.swap_used_mb > 200 ? ' · swap ' + s.mem.swap_used_mb + ' MB' : '') + (s.mem.balloon_mb > 100 ? ' · host took ' + (s.mem.balloon_mb / 1024).toFixed(1) + ' GB' : '');
-        el2.style.color = avail < 700 ? 'var(--red)' : avail < 1500 ? 'var(--yellow)' : '';
+        const host = (typeof s.host_mem_mb === 'number' && s.host_mem_mb >= 0) ? s.host_mem_mb : null;
+        el2.textContent = 'VM ' + (avail / 1024).toFixed(1) + ' GB free' + (host !== null ? ' · Googlebook ' + (host / 1024).toFixed(1) + ' GB free' : '') + (s.mem.swap_used_mb > 200 ? ' · swap ' + s.mem.swap_used_mb + ' MB' : '');
+        el2.style.color = (avail < 700 || (host !== null && host < 2500)) ? 'var(--red)' : (avail < 1500 || (host !== null && host < 3500)) ? 'var(--yellow)' : '';
         el2.title = 'Free memory in the Linux VM (' + (s.mem.total_mb / 1024).toFixed(1) + ' GB total). The model needs about 5.2 GB while loaded. "Host took" is memory GooglebookOS reclaimed from the VM; it comes back when the host has room.';
         if (s.mem_event && s.mem_event.ts !== Forge.lastMemEvent) { Forge.lastMemEvent = s.mem_event.ts; toast('Memory watchdog unloaded the model (' + s.mem_event.available_mb + ' MB were free). Close other programs before the next message.', 'error', 9000); }
       }
@@ -847,13 +947,14 @@
     const inEditor = Forge.editor && Forge.editor.hasTextFocus();
     if (mod && e.shiftKey && e.key.toLowerCase() === 'p') { e.preventDefault(); openPalette('>'); return; }
     if (mod && !e.shiftKey && e.key.toLowerCase() === 'p') { e.preventDefault(); openPalette(''); return; }
-    if (mod && e.key.toLowerCase() === 'o') { e.preventDefault(); openFolderModal(); return; }
+    if (mod && e.shiftKey && e.key.toLowerCase() === 'n') { e.preventDefault(); Forge.newWindow(Forge.folder); return; }
+    if (mod && e.key.toLowerCase() === 'o') { e.preventDefault(); openFolderModal(null, false); return; }
     if (mod && e.key.toLowerCase() === 'i' && !inEditor) { e.preventDefault(); Forge.toggle('chat'); return; }
     if (mod && e.key.toLowerCase() === 'b' && !inEditor) { e.preventDefault(); Forge.toggle('sidebar'); return; }
     if (mod && e.key === '`') { e.preventDefault(); Forge.toggle('panel'); return; }
     if (mod && e.key === ',') { e.preventDefault(); showView('settings'); return; }
     if (mod && e.key.toLowerCase() === 's' && !inEditor) { e.preventDefault(); saveActive(); return; }
-    if (mod && e.key.toLowerCase() === 'n') { e.preventDefault(); window.ForgeChat && window.ForgeChat.newChat(); return; }
+    if (mod && !e.shiftKey && e.key.toLowerCase() === 'n') { e.preventDefault(); window.ForgeChat && window.ForgeChat.newChat(); return; }
     if (mod && e.key.toLowerCase() === 'l' && !inEditor) { e.preventDefault(); window.ForgeChat && window.ForgeChat.addSelectionAndFocus(); return; }
     if (mod && e.key.toLowerCase() === 'k' && !inEditor && !e.target.closest('.chat')) { e.preventDefault(); openInlineEdit(); return; }
     if (mod && e.shiftKey && e.key.toLowerCase() === 'f') { e.preventDefault(); showView('search'); return; }
@@ -866,21 +967,35 @@
 
   // ------------------------------------------------------------------ boot
   async function boot() {
-    try { Forge.settings = await get('/api/settings'); } catch (e) { toast('Cannot reach the Forge server: ' + e.message, 'error', 8000); }
+    if (!Forge.folder) {
+      // A window opened without a folder uses the most recent one, and remembers it in its address.
+      try {
+        const s0 = await get('/api/status');
+        Forge.folder = s0.default_folder;
+        const q = new URLSearchParams(location.search); q.set('folder', Forge.folder);
+        history.replaceState(null, '', '/?' + q.toString());
+      } catch (e) { toast('Cannot reach the Forge server: ' + e.message, 'error', 8000); }
+    }
+    try { const sp = await get('/api/settings'); Forge.settingsPayload = sp; Forge.settings = sp.effective; } catch (e) { toast('Cannot reach the Forge server: ' + e.message, 'error', 8000); }
     applyLayout();
     await initMonaco();
     applySettings();
     await refreshStatus();
+    if (Forge.status && Forge.status.folder_missing) {
+      toast('This window\'s folder is not available: ' + Forge.folder + '. Choose another folder.', 'error', 12000);
+      openFolderModal('~', false);
+      return;
+    }
     await loadTree();
     showView(Forge.ui.view || 'explorer');
     if (Forge.ui.panel !== false) showPanel('terminal');
     if (window.ForgeChat) window.ForgeChat.init();
     if (window.ForgeTerm) window.ForgeTerm.ensure();
     setInterval(refreshStatus, 20000);
-    const open = JSON.parse(localStorage.getItem('forge.openFiles.' + (Forge.status.workspace || '')) || '[]');
+    const open = JSON.parse(localStorage.getItem('forge.openFiles.' + Forge.folder) || '[]');
     for (const p of open) await openFile(p, { background: true });
     if (open.length) activate(open[open.length - 1]);
-    setInterval(() => localStorage.setItem('forge.openFiles.' + (Forge.status.workspace || ''), JSON.stringify(Forge.tabOrder)), 3000);
+    setInterval(() => localStorage.setItem('forge.openFiles.' + Forge.folder, JSON.stringify(Forge.tabOrder)), 3000);
   }
   boot();
 })();
