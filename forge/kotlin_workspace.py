@@ -48,6 +48,32 @@ def _source_roots(mod: str, loose: bool) -> List[dict]:
     return roots
 
 
+R_JAR_PATTERNS = (  # where the Android Gradle Plugin puts the compiled R class after a build (newest layouts first)
+    "build/intermediates/compile_r_class_jar/*/*/R.jar",
+    "build/intermediates/compile_and_runtime_r_class_jar/*/*/R.jar",
+    "build/intermediates/compile_and_runtime_not_namespaced_r_class_jar/*/*/R.jar",
+    "build/intermediates/compile_and_runtime_not_namespaced_r_class_jar/*/R.jar",
+)
+GENERATED_SOURCES = ("build/generated/source/buildConfig/*", "build/generated/ksp/*/kotlin", "build/generated/ksp/*/java",
+                     "build/generated/source/kapt/*", "build/generated/ap_generated_sources/*/out")
+
+
+def _android_generated(mod: str) -> Tuple[List[str], List[dict]]:
+    """The R class jar and generated source folders of an Android module that was built at least once (the debug
+    variant is preferred, as Forge's builds use it)."""
+    # AGP keeps several R jars (an app's current one is in compile_and_runtime_r_class_jar in AGP 9); the newest
+    # debug one is the one the last build produced.
+    found = [p for pattern in R_JAR_PATTERNS for p in glob.glob(os.path.join(mod, pattern))]
+    found.sort(key=lambda p: ("/debug/" not in p, -os.path.getmtime(p)))
+    jars = found[:1]
+    roots = []
+    for pattern in GENERATED_SOURCES:
+        dirs = sorted(glob.glob(os.path.join(mod, pattern)), key=lambda p: "/debug" not in p)
+        if dirs and os.path.isdir(dirs[0]):
+            roots.append({"path": dirs[0], "type": "java-source", "generated": True})
+    return jars, roots
+
+
 def _coordinates(root: str) -> List[Tuple[str, str, str]]:
     """group:artifact:version strings in build files and the version catalog."""
     coords = set()
@@ -120,9 +146,10 @@ def build_model(root: str) -> Tuple[dict, dict]:
     if android and tp["sdk"]:
         jars = sorted(glob.glob(os.path.join(tp["sdk"], "platforms", "android-*", "android.jar")))
         if jars:
-            level = os.path.basename(os.path.dirname(jars[-1]))
-            src = os.path.join(tp["sdk"], "sources", level)
-            add_lib("android-sdk", [jars[-1]], [src] if os.path.isdir(src) else [])
+            # Classes only: the Android sources are thousands of files, and indexing them pushed the server past its
+            # memory cap (2026-10-14). Every Android class still resolves; only hover documentation for Android's
+            # own methods is shorter.
+            add_lib("android-sdk", [jars[-1]])
     found_coords, missing_coords = [], []
     for g, a, v in _coordinates(root):
         jars = _find_jars(g, a, v)
@@ -147,11 +174,19 @@ def build_model(root: str) -> Tuple[dict, dict]:
         roots = _source_roots(mod, loose)
         if not roots and not loose and len(mods) > 1:
             continue   # a folder with only build settings (the root of a multi-module project) has no code
+        mod_deps = list(deps)
+        if android:
+            r_jars, gen_roots = _android_generated(mod)
+            roots = roots + gen_roots
+            if r_jars:
+                lib = "R:" + (os.path.relpath(mod, root) if mod != root else "app")
+                add_lib(lib, r_jars)
+                mod_deps.append({"type": "library", "name": lib, "scope": "compile"})
         name = os.path.relpath(mod, root).replace(os.sep, ".") if mod != root else os.path.basename(root) or "project"
         while name in used:
             name += "_"
         used.add(name)
-        modules.append({"name": name, "type": "JAVA_MODULE", "dependencies": deps,
+        modules.append({"name": name, "type": "JAVA_MODULE", "dependencies": mod_deps,
                         "contentRoots": [{"path": mod, "sourceRoots": roots}]})
     sdks = []
     if tp["java_home"]:

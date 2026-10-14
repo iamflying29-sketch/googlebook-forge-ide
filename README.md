@@ -115,7 +115,7 @@ Edit the code, then `forge-ide restart`. For the app, `android/build.sh` and `ad
 - Tab completions are slow on the CPU and off by default.
 - The debugger supports Python only. Notebooks run Python kernels only.
 - There is no Android emulator, because the Linux VM has no virtualization support; the Googlebook itself is the test device over Wireless debugging. Kotlin language support for Android projects is still experimental in JetBrains' server.
-- A Gradle build needs about 3.8 GB free on the Googlebook and the Kotlin language server about 4.1 GB (4.7 GB with a full Gradle import), so with many apps open Forge may ask me to free memory first. Kotlin's light project model may miss libraries that Gradle has not downloaded yet; building once, or the full Gradle import, fixes that.
+- A Gradle build needs about 3.8 GB free on the Googlebook and the Kotlin language server about 4.1 GB (4.7 GB in an Android project, and 5.5 GB for an Android project with the full Gradle import), so with many apps open Forge may ask me to free memory first. Kotlin's light project model may miss libraries that Gradle has not downloaded yet; building once, or the full Gradle import, fixes that.
 - Indexing a large folder takes a while on the CPU (about one to two pieces of code per second), so a folder is limited to 4,000 pieces, newest files first.
 - Not included: the VS Code extension marketplace, cloud models and cloud agents.
 

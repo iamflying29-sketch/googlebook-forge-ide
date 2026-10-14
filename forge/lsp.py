@@ -167,17 +167,24 @@ def _read_message(stream) -> Optional[bytes]:
     return data
 
 
-KOTLIN_GRADLE_NEEDS = (2600, 4700, "2400M")   # the server plus its Gradle import (a second Java process)
-KOTLIN_LIGHT_NEEDS = (2000, 4100, "1800M")    # the server alone (measured peak about 1 GB on a small project)
+# (free VM MB, free Googlebook MB, memory cap), measured on 2026-10-14. The server's indexes live in native memory
+# outside its Java heap, so an Android project (android.jar) needs clearly more than a plain Kotlin project.
+KOTLIN_LIGHT_NEEDS = (2000, 4100, "1800M")            # server alone, plain Kotlin: peak about 1.0 GB
+KOTLIN_LIGHT_ANDROID_NEEDS = (2700, 4700, "2400M")    # server alone, Android project: peak about 1.7 GB
+KOTLIN_GRADLE_NEEDS = (2600, 4700, "2400M")           # server plus its Gradle import, plain Kotlin
+KOTLIN_GRADLE_ANDROID_NEEDS = (3500, 5500, "3200M")   # server plus the Android Gradle Plugin import, about 3 GB
 
 
 def kotlin_plan(root: str, preference: str, host_free_mb: Optional[float]) -> tuple:
     """(use_gradle_import, needs). Auto uses the full Gradle import when the Googlebook has room for it and the
     light project model otherwise; loose folders always use the light model, which also gives them error checking."""
+    from .toolchains import is_android_project
+    android = is_android_project(root)
+    gradle_needs = KOTLIN_GRADLE_ANDROID_NEEDS if android else KOTLIN_GRADLE_NEEDS
     gradle_project = bool(_build_files(root))
-    if gradle_project and (preference == "gradle" or (preference == "auto" and (host_free_mb or 0) >= KOTLIN_GRADLE_NEEDS[1])):
-        return True, KOTLIN_GRADLE_NEEDS
-    return False, KOTLIN_LIGHT_NEEDS
+    if gradle_project and (preference == "gradle" or (preference == "auto" and (host_free_mb or 0) >= gradle_needs[1])):
+        return True, gradle_needs
+    return False, (KOTLIN_LIGHT_ANDROID_NEEDS if android else KOTLIN_LIGHT_NEEDS)
 
 
 def serve(ws: WebSocket, lang: str, root: str, memory_ok, log_dir: str, cmd: Optional[List[str]] = None,
