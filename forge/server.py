@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import os
 import posixpath
 import socket
@@ -17,12 +18,13 @@ import traceback
 import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from typing import List, Any, Dict, Optional
 
 from . import __version__
 from .agent import Agent, Run, complete, inline_edit_stream
 from .llamacpp_client import LlamaCppClient
 from .vision import VisionManager
+from .features import Attachments, Docs, Hooks, Memories, BUILTIN_COMMANDS, custom_commands
 from .ollama_client import OllamaClient, OllamaError
 from .terminal import TerminalManager
 from .tools import Checkpoints, Workspace
@@ -51,6 +53,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "max_iterations": 30,
     "auto_approve_commands": False,
     "external_file_protection": True,
+    "semantic_index": True,
+    "custom_modes": [],
+    "command_allowlist": [],             # commands starting with these run without asking (unless destructive)
+    "command_denylist": [],              # commands starting with these always ask
+    "lsp": True,                         # language servers for code intelligence in the editor
     "vision": "auto",                    # auto (Intel GPU, then CPU, then text recognition) | gpu | cpu | ocr
     "vision_cpu_model": "qwen3-vl:2b",   # changes outside the project folder ask first (Cursor's External-File Protection)
     "tab_completions": False,
@@ -73,9 +80,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 
 # Settings a project folder may override in <folder>/.forge/settings.json (like .vscode/settings.json in Cursor).
 # Machine-wide things (the engine, Ollama, the GPU engine, how long the model stays loaded) stay user settings.
-FOLDER_SETTING_KEYS = {"vision", "model", "temperature", "top_p", "top_k", "repeat_penalty", "num_ctx", "num_predict", "thinking",
+FOLDER_SETTING_KEYS = {"command_allowlist", "command_denylist", "vision", "model", "temperature", "top_p", "top_k", "repeat_penalty", "num_ctx", "num_predict", "thinking",
                        "verbose", "tool_mode", "max_iterations", "auto_approve_commands", "external_file_protection",
-                       "repo_map_chars", "tab_completions", "completion_delay_ms", "font_size", "prewarm"}
+                       "repo_map_chars", "tab_completions", "completion_delay_ms", "font_size", "prewarm", "lsp",
+                       "semantic_index", "custom_modes"}
 
 MODEL_LOAD_NEED_MB = 5800   # loading llama3.1 8B Q4_K_M needs about 5.2 GB plus headroom
 
@@ -144,6 +152,17 @@ class State:
         self.engine_stats: Dict[str, Any] = {}
         self.checkpoints = Checkpoints(os.path.join(DATA_DIR, "checkpoints"))
         self.vision = VisionManager(self, DATA_DIR)
+        self.attachments = Attachments(os.path.join(DATA_DIR, "attachments"))
+        self.memories = Memories(DATA_DIR)
+        self.hooks = Hooks(DATA_DIR)
+        self.docs = Docs(DATA_DIR)
+        from .semantic import EmbedServer, EMBED_MIN_VM_MB, EMBED_MIN_HOST_MB
+        self.embed_server = EmbedServer(lambda: self.small_memory_block("the code index", EMBED_MIN_VM_MB, EMBED_MIN_HOST_MB),
+                                        os.path.join(DATA_DIR, "logs"))
+        self.semantic: Dict[str, Any] = {}
+        from .notebook import KernelManager, KERNEL_MIN_VM_MB, KERNEL_MIN_HOST_MB
+        self.kernels = KernelManager(lambda: self.small_memory_block("a notebook kernel", KERNEL_MIN_VM_MB, KERNEL_MIN_HOST_MB),
+                                     os.path.join(DATA_DIR, "logs"))
         self.workspaces: Dict[str, Workspace] = {}
         os.makedirs(os.path.realpath(os.path.expanduser(self.settings["workspace"])), exist_ok=True)
         self.workspace = self.workspace_for(self.settings["workspace"])   # default folder for windows without one
@@ -392,10 +411,10 @@ class State:
         except OllamaError:
             return False
 
-    def memory_block_reason(self, model: Optional[str] = None) -> Optional[str]:
+    def memory_block_reason(self, model: Optional[str] = None, engine: Optional[str] = None) -> Optional[str]:
         """Refuse to load the model when the VM does not have room for it. Loading a 5 GB model into a VM
         that is already nearly full made the host kill the whole VM once (2026-10-14); never again."""
-        if self.active_engine() == "gpu":
+        if (engine or self.active_engine()) == "gpu":
             paused = self.engine_stats.get("state") == "paused" or self.vision.want()
             if not self.gpu_client.alive() and not paused:
                 return ("The GPU engine is not running. Start it from the Forge app (Engine card in Settings) or switch "
@@ -426,6 +445,43 @@ class State:
                     f"models) and try again. This guard exists because an overfull VM gets killed by GooglebookOS.")
         return None
 
+    def extra_roots(self, root: str) -> List[str]:
+        """More folders shown in this folder's windows (multi-root, like Cursor's Add Folder to Workspace)."""
+        d = _load_json(self.folder_settings_path(root), {})
+        out: List[str] = []
+        for p in (d.get("workspace_folders") or []) if isinstance(d, dict) else []:
+            p = os.path.realpath(os.path.expanduser(str(p)))
+            if os.path.isdir(p) and p != root and p not in out:
+                out.append(p)
+        return out
+
+    def set_extra_roots(self, root: str, roots: List[str]) -> None:
+        fp = self.folder_settings_path(root)
+        cur = _load_json(fp, {})
+        cur = cur if isinstance(cur, dict) else {}
+        cur["workspace_folders"] = roots
+        _save_json(fp, cur)
+
+    def semantic_for(self, root: str):
+        """The meaning-based index of a folder, or None when it is turned off or not installed."""
+        from .semantic import SemanticIndex, available
+        if not available() or not self.effective_settings(root).get("semantic_index", True):
+            return None
+        if root not in self.semantic:
+            self.semantic[root] = SemanticIndex(root, self.embed_server, lambda: any(not r.done for r in self.runs.values()))
+        return self.semantic[root]
+
+    def small_memory_block(self, what: str, vm_need_mb: int, host_need_mb: int) -> Optional[str]:
+        """The memory gate for helper processes (speech, debugger, notebook kernels, embeddings): refuse when the VM
+        or the Googlebook is short, so a helper never pushes the system toward a crash."""
+        m = mem_info()
+        if m.get("available_mb", 99999) < vm_need_mb:
+            return f"Not enough free memory in the VM for {what} ({m.get('available_mb')} MB free, {vm_need_mb} MB needed)."
+        host = self.vision.app.get("host_mem_mb") if time.time() - self.vision.app_seen < 60 else None
+        if isinstance(host, (int, float)) and 0 <= host < host_need_mb:
+            return f"Not enough free memory on the Googlebook for {what} ({int(host)} MB free, {host_need_mb} MB needed)."
+        return None
+
     def model_can_see(self, model: Optional[str]) -> bool:
         """True when an Ollama chat model has its own vision (then images are also passed to it directly)."""
         if not model:
@@ -439,13 +495,14 @@ class State:
             self._vision_caps = cache
         return bool(cache[model])
 
-    def settings_for_run(self, root: Optional[str] = None) -> dict:
+    def settings_for_run(self, root: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None) -> dict:
+        """Settings for one reply. A chat may choose its own engine and model (the composer's model picker)."""
         s = self.effective_settings(root)
-        if self.active_engine() == "gpu":
+        if (engine or self.active_engine()) == "gpu":
             s["model"] = "gpu-model"
             s["num_ctx"] = int(self.settings.get("gpu_ctx", 8192))
         else:
-            s["model"] = self.resolve_model(s.get("model"))
+            s["model"] = self.resolve_model(model or s.get("model"))
         return s
 
 
@@ -516,6 +573,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if u.path == "/ws/term":
                 return self._ws_terminal(q)
+            if u.path == "/ws/lsp":
+                return self._ws_lsp(q)
+            if u.path == "/ws/dap":
+                return self._ws_dap(q)
+            if u.path == "/ws/kernel":
+                return self._ws_kernel(q)
             if u.path.startswith("/api/"):
                 return self._api_get(u.path, q)
             return self._static(u.path)
@@ -644,8 +707,30 @@ class Handler(BaseHTTPRequestHandler):
                         size = 0
                     items.append({"name": e.name, "path": ws.relpath(e.path), "dir": is_dir, "size": size})
             return self._json(200, {"path": rel, "items": items})
+        if path == "/api/roots":
+            return self._json(200, {"primary": ws.root, "extra": st.extra_roots(ws.root)})
+        if path == "/api/raw":
+            # Image files for the editor's image viewer (images only, so this never serves arbitrary files as pages).
+            p = ws.resolve(arg("path"), must_exist=True)
+            kinds = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+                     ".bmp": "image/bmp", ".ico": "image/x-icon", ".avif": "image/avif"}
+            ctype = kinds.get(os.path.splitext(p)[1].lower())
+            if not ctype or not os.path.isfile(p) or os.path.getsize(p) > 40_000_000:
+                return self._error(400, "not an image file Forge can show")
+            with open(p, "rb") as fh:
+                data = fh.read()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return None
         if path == "/api/files":
             files = ws.all_files(refresh=arg("refresh") == "1")
+            for extra in st.extra_roots(ws.root):
+                files = files + [extra + "/" + f for f in st.workspace_for(extra).all_files(refresh=arg("refresh") == "1")]
             needle = arg("q").lower()
             if needle:
                 files = [f for f in files if _fuzzy(needle, f.lower())]
@@ -657,8 +742,13 @@ class Handler(BaseHTTPRequestHandler):
             p = ws.resolve(rel)
             return self._json(200, {"path": rel, "content": text, "mtime": os.path.getmtime(p), "size": len(text)})
         if path == "/api/search":
-            return self._json(200, {"result": ws.search(arg("q"), arg("path", ".") or ".", arg("glob") or None,
-                                                        arg("regex") == "1", max_results=400)})
+            result = ws.search(arg("q"), arg("path", ".") or ".", arg("glob") or None, arg("regex") == "1", max_results=400)
+            if (arg("path", ".") or ".") == ".":
+                for extra in st.extra_roots(ws.root):
+                    more = ws.search(arg("q"), extra, arg("glob") or None, arg("regex") == "1", max_results=200)
+                    if more and not more.startswith("No matches"):
+                        result = (result + "\n" + more) if result and not result.startswith("No matches") else more
+            return self._json(200, {"result": result})
         if path == "/api/sessions":
             items = sorted(st.sessions.values(), key=lambda s: -s.get("updated", 0))
             if arg("all") != "1":
@@ -760,6 +850,27 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
             return None
+        if path == "/api/memories":
+            return self._json(200, st.memories.list(ws.root))
+        if path == "/api/commands":
+            return self._json(200, {"commands": BUILTIN_COMMANDS + custom_commands(DATA_DIR, ws.root)})
+        if path == "/api/docs":
+            return self._json(200, {"docs": st.docs.list()})
+        if path == "/api/hooks":
+            return self._json(200, {"global": _read_text(st.hooks.global_path) or '{\n}\n',
+                                    "project": _read_text(os.path.join(ws.root, ".forge", "hooks.json")) or '{\n}\n',
+                                    "events": list(st.hooks.EVENTS)})
+        if path == "/api/index/status":
+            from .semantic import available
+            sem = st.semantic_for(ws.root)
+            return self._json(200, {"available": available(), "enabled": bool(st.effective_settings(ws.root).get("semantic_index", True)),
+                                    "status": dict(sem.status) if sem else None, "server_running": st.embed_server.running()})
+        if path == "/api/voice/status":
+            from . import voice
+            return self._json(200, voice.status())
+        if path == "/api/lsp/status":
+            from . import lsp
+            return self._json(200, {"available": lsp.available()})
         if path == "/api/vision/status":
             return self._json(200, st.vision.status())
         if path == "/api/engine/config":
@@ -1081,6 +1192,148 @@ class Handler(BaseHTTPRequestHandler):
             meta = st.vision.images.save(raw, str(b.get("name") or ""))
             meta["url"] = "/api/image?id=" + meta["id"]
             return self._json(200, meta)
+        if path == "/api/replace":
+            import fnmatch
+            q = str(b.get("q", ""))
+            if not q:
+                return self._error(400, "nothing to search for")
+            rep = str(b.get("replacement", ""))
+            try:
+                pat = re.compile(q if b.get("regex") else re.escape(q), 0 if b.get("case", True) else re.IGNORECASE)
+            except re.error as e:
+                return self._error(400, f"invalid regular expression: {e}")
+            glob = str(b.get("glob") or "").strip()
+            dry = bool(b.get("dry_run"))
+            files = list(ws.all_files(refresh=True))
+            for extra in st.extra_roots(ws.root):
+                files += [extra + "/" + f for f in st.workspace_for(extra).all_files(refresh=True)]
+            if glob:
+                pats = [g.strip() for g in glob.split(",") if g.strip()]
+                files = [f for f in files if any(fnmatch.fnmatch(f, g) or fnmatch.fnmatch(os.path.basename(f), g) for g in pats)]
+            run_id = "replace-" + uuid.uuid4().hex[:10]
+            found, total = [], 0
+            for rel in files[:20000]:
+                try:
+                    p = ws.resolve(rel, must_exist=True)
+                    if os.path.getsize(p) > 2_000_000:
+                        continue
+                    text = ws.read_text(rel)
+                except (ValueError, OSError):
+                    continue
+                new, n = pat.subn(rep if b.get("regex") else (lambda _m: rep), text)
+                if not n:
+                    continue
+                if not dry:
+                    if not found:
+                        st.checkpoints.begin(run_id, ws.root, "", f"Replace '{q[:40]}' with '{rep[:40]}'")
+                    ws.write_file(rel, new, run_id)
+                found.append({"path": rel, "count": n})
+                total += n
+            return self._json(200, {"files": found, "total": total, "run_id": None if dry or not found else run_id})
+        if path == "/api/roots":
+            roots = st.extra_roots(ws.root)
+            target = os.path.realpath(os.path.expanduser(str(b.get("path", ""))))
+            if b.get("action") == "remove":
+                roots = [r for r in roots if r != target]
+            else:
+                if not os.path.isdir(target):
+                    return self._error(400, f"{target} is not a folder")
+                if target == ws.root or target in roots:
+                    return self._error(400, "That folder is already in this window.")
+                roots.append(target)
+            st.set_extra_roots(ws.root, roots)
+            return self._json(200, {"primary": ws.root, "extra": st.extra_roots(ws.root)})
+        if path == "/api/index":
+            sem = st.semantic_for(ws.root)
+            if sem is None:
+                return self._error(400, "The code index is turned off in Settings or not installed.")
+            if b.get("action") == "pause":
+                sem.pause()
+            else:
+                sem.start()
+            return self._json(200, {"status": dict(sem.status)})
+        if path == "/api/voice/transcribe":
+            import base64 as _b64
+            from . import voice
+            why = st.small_memory_block("speech recognition", voice.VOICE_MIN_VM_MB, voice.VOICE_MIN_HOST_MB)
+            if why:
+                return self._error(503, why)
+            data = str(b.get("data", ""))
+            if data.startswith("data:"):
+                data = data.split(",", 1)[-1]
+            try:
+                text = voice.transcribe(_b64.b64decode(data, validate=False), str(b.get("language", "en")))
+            except RuntimeError as e:
+                return self._error(503, str(e))
+            return self._json(200, {"text": text})
+        if path == "/api/attachment":
+            import base64 as _b64
+            from .images import sniff
+            data = str(b.get("data", ""))
+            if data.startswith("data:"):
+                data = data.split(",", 1)[-1]
+            raw = _b64.b64decode(data, validate=False)
+            name = str(b.get("name") or "file")
+            if sniff(raw):
+                meta = st.vision.images.save(raw, name)
+                return self._json(200, {**meta, "kind": "image", "url": "/api/image?id=" + meta["id"]})
+            meta = st.attachments.save(raw, name)
+            return self._json(200, meta)
+        if path == "/api/memories":
+            action = str(b.get("action", "add"))
+            if action == "add":
+                st.memories.add(ws.root, str(b.get("text", "")), str(b.get("scope", "project")))
+            elif action == "remove":
+                st.memories.remove(ws.root, str(b.get("id", "")))
+            elif action == "update":
+                st.memories.update(ws.root, str(b.get("id", "")), str(b.get("text", "")))
+            return self._json(200, st.memories.list(ws.root))
+        if path == "/api/docs":
+            if str(b.get("action", "add")) == "add":
+                st.docs.add(str(b.get("name", "")), str(b.get("url", "")), int(b.get("max_pages", 40) or 40))
+            elif b.get("action") == "remove":
+                st.docs.remove(str(b.get("name", "")))
+            return self._json(200, {"docs": st.docs.list()})
+        if path == "/api/hooks":
+            text = str(b.get("config", "{}"))
+            json.loads(text)
+            target = st.hooks.global_path if b.get("scope") == "global" else os.path.join(ws.root, ".forge", "hooks.json")
+            _write_text(target, text)
+            return self._json(200, {"ok": True})
+        if path == "/api/session/rewind":
+            # Restore checkpoint: undo the file changes of this reply and every later one, and cut the model's context.
+            s = st.sessions.get(str(b.get("id")))
+            if not s:
+                return self._error(404, "no such session")
+            rid = str(b.get("run_id", ""))
+            runs = s.get("runs", [])
+            idx = next((i for i, r in enumerate(runs) if r.get("run_id") == rid), None)
+            if idx is None:
+                return self._error(404, "that reply has no checkpoint")
+            msgs = []
+            for r in reversed(runs[idx:]):
+                rws = self._run_ws(r["run_id"], ws)
+                for ch in list(st.checkpoints.changes(r["run_id"])):
+                    if ch.kind != "reverted":
+                        try:
+                            msgs.append(rws.revert(r["run_id"], ch.path))
+                        except Exception as e:  # noqa: BLE001
+                            msgs.append(f"{ch.path}: {e}")
+            s["messages"] = s.get("messages", [])[: runs[idx]["msg_index"]]
+            s["runs"] = runs[:idx]
+            st.save_session(s)
+            return self._json(200, {"ok": True, "messages": msgs})
+        if path == "/api/session/export":
+            s = st.sessions.get(str(b.get("id")))
+            if not s:
+                return self._error(404, "no such session")
+            md = str(b.get("markdown") or "")
+            base = "/mnt/shared/Documents/Forge/Chats" if os.path.isdir("/mnt/shared/Documents") else os.path.join(DATA_DIR, "exports")
+            os.makedirs(base, exist_ok=True)
+            safe = re.sub(r"[^A-Za-z0-9 _.-]+", "", s.get("title") or "chat").strip()[:60] or "chat"
+            target = os.path.join(base, f"{safe} {time.strftime('%Y-%m-%d %H%M')}.md")
+            _write_text(target, md)
+            return self._json(200, {"ok": True, "path": target})
         if path == "/api/image/analyze":
             # What the vision helper sees in an image (also used to test the vision path without the chat model).
             settings = st.effective_settings(ws.root)
@@ -1162,13 +1415,24 @@ class Handler(BaseHTTPRequestHandler):
         if not text:
             return self._error(400, "empty message")
         mode = str(b.get("mode", "agent"))
+        custom_mode = None
         if mode not in ("agent", "ask", "plan"):
+            # A custom mode (like Cursor's): your own instructions and tool access on top of Agent mode.
+            modes = st.effective_settings(ws.root).get("custom_modes") or []
+            custom_mode = next((m for m in modes if isinstance(m, dict) and str(m.get("name", "")).strip() == mode), None)
             mode = "agent"
         active = [r for r in st.runs.values() if r.session_id == s["id"] and not r.done]
         if active:
             return self._error(409, "a run is already active for this session")
         fallback_note = None
-        if st.active_engine() == "gpu" and not st.gpu_client.alive():
+        # The chat's own model choice (composer picker): "__gpu" for the GPU engine, an Ollama model name, or empty
+        # for the window's setting. It is remembered with the chat.
+        choice = str(b.get("model") or s.get("model_choice") or "")[:120]
+        if b.get("model"):
+            s["model_choice"] = choice
+        run_engine = "gpu" if choice == "__gpu" else ("ollama" if choice else st.active_engine())
+        run_model = choice if choice and choice != "__gpu" else None
+        if run_engine == "gpu" and not st.gpu_client.alive():
             # Never load the 5 GB CPU model automatically here: the engine usually stopped because memory was short.
             paused = st.engine_stats.get("state") == "paused" or st.vision.want()
             if not paused:
@@ -1179,21 +1443,29 @@ class Handler(BaseHTTPRequestHandler):
             settings["model"] = st.resolve_model(settings.get("model"))
             blocked = st.memory_block_reason_ollama(settings["model"])
         else:
-            settings = st.settings_for_run(ws.root)
-            blocked = st.memory_block_reason(settings["model"])
+            settings = st.settings_for_run(ws.root, run_engine, run_model)
+            blocked = st.memory_block_reason(settings["model"], run_engine)
         if blocked:
             return self._error(503, blocked)
+        hook = st.hooks.run(ws.root, "beforeSubmitPrompt", {"prompt": text, "session": s["id"]})
+        if hook["permission"] == "deny":
+            return self._error(400, "A hook blocked this message: " + ("; ".join(hook["messages"]) or "no reason given"))
         if s["title"] in ("New chat", "") and text:
             s["title"] = text[:60]
         run = Run(s["id"], mode)
         st.runs[run.id] = run
         st.checkpoints.begin(run.id, ws.root, s["id"], text)
-        engine = "ollama" if fallback_note else st.active_engine()
-        if s.get("engine_used") not in (None, engine):
-            s["messages"] = []          # different engine, different prompt cache: fresh context
-        s["engine_used"] = engine
-        agent = Agent(st.ollama if fallback_note else st.client_for(), ws, settings, s)
+        engine = "ollama" if fallback_note else run_engine
+        used = f"{engine}:{settings.get('model')}"
+        if s.get("engine_used") not in (None, engine, used):
+            s["messages"] = []          # different engine or model, different prompt cache: fresh context
+        s["engine_used"] = used
+        agent = Agent(st.ollama if fallback_note else st.client_for(engine), ws, settings, s)
         agent.vision = st.vision
+        agent.state = st
+        agent.custom_mode = custom_mode
+        if custom_mode and custom_mode.get("auto_run"):
+            settings["auto_approve_commands"] = True
         if engine == "ollama":
             settings["native_images"] = st.model_can_see(settings.get("model"))
 
@@ -1202,6 +1474,7 @@ class Handler(BaseHTTPRequestHandler):
                 run.emit("status", text=fallback_note)
             agent.run_turn(run, text, list(b.get("attachments") or []), mode)
             st.save_session(s)
+            threading.Thread(target=lambda: st.hooks.run(ws.root, "stop", {"session": s["id"], "status": run.status}), daemon=True).start()
 
         run.thread = threading.Thread(target=go, name=f"run-{run.id}", daemon=True)
         run.thread.start()
@@ -1257,6 +1530,119 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     # ------------------------------------------------------------ terminal
+    def _ws_lsp(self, q: Dict[str, list]) -> None:
+        """A language server for this window (code intelligence in the editor)."""
+        st = STATE
+        assert st is not None
+        from . import lsp
+        if not _origin_ok(self):
+            self.send_response(403); self.send_header("Content-Length", "0"); self.end_headers()
+            return
+        try:
+            folder = self._ws(q).root
+        except ValueError:
+            self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+            return
+        lang = q.get("lang", [""])[0][:20]
+
+        def memory_ok() -> Optional[str]:
+            m = mem_info()
+            if m.get("available_mb", 99999) < lsp.LSP_MIN_VM_MB:
+                return f"Not enough free memory in the VM for a language server ({m.get('available_mb')} MB free)."
+            host = st.vision.app.get("host_mem_mb") if time.time() - st.vision.app_seen < 60 else None
+            if isinstance(host, (int, float)) and 0 <= host < lsp.LSP_MIN_HOST_MB:
+                return f"Not enough free memory on the Googlebook for a language server ({int(host)} MB free)."
+            return None
+
+        sock = handshake(self)
+        if sock is None:
+            return
+        lsp.serve(sock, lang, folder, memory_ok, os.path.join(DATA_DIR, "logs"))
+
+    def _ws_dap(self, q: Dict[str, list]) -> None:
+        """The debugger for this window: the browser speaks the Debug Adapter Protocol to debugpy."""
+        st = STATE
+        assert st is not None
+        from . import lsp
+        if not _origin_ok(self):
+            self.send_response(403); self.send_header("Content-Length", "0"); self.end_headers()
+            return
+        try:
+            folder = self._ws(q).root
+        except ValueError:
+            self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+            return
+        sock = handshake(self)
+        if sock is None:
+            return
+        import importlib.util
+        cmd = [sys.executable, "-m", "debugpy.adapter"] if importlib.util.find_spec("debugpy") else None
+        lsp.serve(sock, "python", folder, lambda: st.small_memory_block("the debugger", 600, 2200),
+                  os.path.join(DATA_DIR, "logs"), cmd=cmd, what="debugger (debugpy)")
+
+    def _ws_kernel(self, q: Dict[str, list]) -> None:
+        """A notebook window's connection to its Python kernel."""
+        st = STATE
+        assert st is not None
+        from .notebook import Listener
+        if not _origin_ok(self):
+            self.send_response(403); self.send_header("Content-Length", "0"); self.end_headers()
+            return
+        try:
+            ws = self._ws(q)
+            path = ws.resolve(q.get("path", [""])[0], must_exist=True)
+        except (ValueError, OSError):
+            self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+            return
+        sock = handshake(self)
+        if sock is None:
+            return
+        listener = Listener(sock.send_text)
+        kernel = None
+        try:
+            try:
+                kernel = st.kernels.get(path)
+                kernel.listeners.add(listener)
+                listener.put({"type": "attached", "busy": kernel.busy, "info": kernel.info})
+            except RuntimeError as e:
+                sock.send_text(json.dumps({"type": "exit", "message": str(e)}))
+            while True:
+                op, data = sock.recv()
+                if op == 8:
+                    break
+                if op != 1 or not data:
+                    continue
+                try:
+                    msg = json.loads(data.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                cmd = msg.get("op")
+                try:
+                    if cmd == "restart" or (cmd == "execute" and (kernel is None or not kernel.alive())):
+                        if kernel is not None:
+                            kernel.listeners.discard(listener)
+                        kernel = st.kernels.restart(path) if cmd == "restart" else st.kernels.get(path)
+                        kernel.listeners.add(listener)
+                        listener.put({"type": "restarted"})
+                    if cmd == "execute":
+                        kernel.execute(str(msg.get("id", "")), str(msg.get("code", "")))
+                    elif cmd == "interrupt" and kernel is not None:
+                        kernel.interrupt()
+                    elif cmd == "complete" and kernel is not None:
+                        kernel.send({"op": "complete", "id": str(msg.get("id", "")), "prefix": str(msg.get("prefix", ""))})
+                    elif cmd == "shutdown":
+                        st.kernels.stop(path)
+                        listener.put({"type": "exit", "message": "The kernel was shut down."})
+                except RuntimeError as e:
+                    listener.put({"type": "exit", "message": str(e), "id": msg.get("id")})
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            if kernel is not None:
+                kernel.listeners.discard(listener)
+            listener.close()
+            sock.close()
+
     def _ws_terminal(self, q: Dict[str, list]) -> None:
         st = STATE
         assert st is not None
@@ -1282,6 +1668,11 @@ class Handler(BaseHTTPRequestHandler):
         cols = int(q.get("cols", ["120"])[0] or 120)
         rows = int(q.get("rows", ["30"])[0] or 30)
         st.terminals.serve(sock, term_id, folder, cols, rows)
+
+
+def _origin_ok(handler) -> bool:
+    origin = handler.headers.get("Origin")
+    return not origin or urllib.parse.urlparse(origin).netloc.lower() == (handler.headers.get("Host") or "").lower()
 
 
 def _fuzzy(needle: str, hay: str) -> bool:

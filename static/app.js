@@ -49,7 +49,7 @@
     activePath: null,
     tabOrder: [],
     ui: JSON.parse(localStorage.getItem('forge.ui') || '{}'),
-    hooks: { onSelectionChanged: [], onActiveFileChanged: [] },
+    hooks: { onSelectionChanged: [], onActiveFileChanged: [], onEditorCreated: [] },
   };
   const saveUi = () => localStorage.setItem('forge.ui', JSON.stringify(Forge.ui));
 
@@ -127,6 +127,7 @@
     if (name === 'search') setTimeout(() => $('#search-input').focus(), 0);
     if (name === 'git' && window.ForgeExtras) window.ForgeExtras.loadGit();
     if (name === 'notepads' && window.ForgeExtras) window.ForgeExtras.renderNotepads();
+    if (name === 'debug' && window.ForgeDebug) window.ForgeDebug.render();
   }
   Forge.showView = showView;
   for (const b of $$('.act')) b.onclick = () => showView(b.dataset.view);
@@ -192,7 +193,7 @@
           fontLigatures: true, minimap: { enabled: true, scale: 1 }, smoothScrolling: true, cursorBlinking: 'smooth', cursorSmoothCaretAnimation: 'on',
           renderWhitespace: 'selection', bracketPairColorization: { enabled: true }, scrollBeyondLastLine: false, wordWrap: 'off', tabSize: 4,
           padding: { top: 8 }, inlineSuggest: { enabled: true, showToolbar: 'onHover' }, quickSuggestions: true, suggest: { preview: true },
-          stickyScroll: { enabled: true }, lineNumbersMinChars: 4, model: null,
+          stickyScroll: { enabled: true }, lineNumbersMinChars: 4, glyphMargin: true, model: null,
         });
         Forge.editor = editor;
         editor.onDidChangeCursorPosition((e) => {
@@ -215,28 +216,55 @@
         editor.addAction({ id: 'forge.explain', label: 'Forge: Explain selection', contextMenuGroupId: 'navigation', contextMenuOrder: 2, run: () => window.ForgeChat && window.ForgeChat.quickAsk('Explain this code clearly.') });
         editor.addAction({ id: 'forge.fix', label: 'Forge: Fix problems in selection', contextMenuGroupId: 'navigation', contextMenuOrder: 3, run: () => window.ForgeChat && window.ForgeChat.quickAsk('Find and fix any bugs or problems in this code. Edit the file directly.', 'agent') });
         registerCompletions();
+        if (window.ForgeLSP) window.ForgeLSP.installOpener();
         resolve(editor);
       });
     });
   }
 
   // ------------------------------------------------------------------ files and tabs
+  /** Paths inside this window's folder are shown relative, everything else absolute; ~ is expanded. */
+  function relPath(p) {
+    if (!p) return p;
+    if (p.startsWith('~') && Forge.status && Forge.status.home) p = Forge.status.home + p.slice(1);
+    const root = (Forge.folder || '').replace(/\/+$/, '');
+    if (root && p.startsWith(root + '/')) return p.slice(root.length + 1);
+    return p;
+  }
+  function absPath(p) { return p.startsWith('/') ? p : (Forge.folder || '').replace(/\/+$/, '') + '/' + p; }
+  Forge.relPath = relPath; Forge.absPath = absPath;
   async function openFile(path, opts) {
     opts = opts || {};
     const monaco = Forge.monaco;
+    path = relPath(path);
     let f = Forge.files.get(path);
+    if (!f && /\.(png|jpe?g|gif|webp|bmp|ico|avif)$/i.test(path)) {
+      // Images open in the image viewer (static/preview.js); the tab keeps an empty placeholder model.
+      const model = monaco.editor.createModel('', 'plaintext', monaco.Uri.parse('forge-image:' + encodeURIComponent(absPath(path))));
+      f = { path, model, viewState: null, dirty: false, mtime: 0, language: 'image', image: true, savedVersion: model.getAlternativeVersionId() };
+      Forge.files.set(path, f);
+      Forge.tabOrder.push(path);
+    }
     if (!f) {
       let data;
       try { data = await get('/api/file', { path }); } catch (e) { toast('Cannot open ' + path + ': ' + e.message, 'error'); return null; }
       const lang = langFor(path);
-      const model = monaco.editor.createModel(data.content, lang, monaco.Uri.file(path.startsWith('/') ? '/__abs' + path : '/__project/' + path));
+      // The model's URI is the real file path, so language servers recognize it. A model may already exist
+      // (created for a peek, references or a rename by the language client); then it is adopted.
+      const uri = monaco.Uri.file(absPath(path));
+      let model = monaco.editor.getModel(uri);
+      const adopted = !!model;
+      if (!model) model = monaco.editor.createModel(data.content, lang, uri);
       f = { path, model, viewState: null, dirty: false, mtime: data.mtime, language: lang, savedVersion: model.getAlternativeVersionId() };
+      if (adopted && model.getValue() !== data.content) { f.savedVersion = -1; f.dirty = true; }
       model.onDidChangeContent(() => {
         const d = model.getAlternativeVersionId() !== f.savedVersion;
         if (d !== f.dirty) { f.dirty = d; renderTabs(); }
       });
       Forge.files.set(path, f);
       Forge.tabOrder.push(path);
+      if (window.ForgeLSP) window.ForgeLSP.attach(model);
+      if (window.ForgeReview) window.ForgeReview.onOpen(path);
     }
     if (!opts.background) activate(path);
     if (opts.line) {
@@ -272,7 +300,7 @@
         fileIcon(p), el('span', { text: p.split('/').pop() }),
         el('span', { class: 'tclose', onclick: (e) => { e.stopPropagation(); closeFile(p); } }));
       t.addEventListener('contextmenu', (e) => { e.preventDefault(); contextMenu(e, [
-        { label: 'Close', run: () => closeFile(p) }, { label: 'Close others', run: () => { for (const q of [...Forge.tabOrder]) if (q !== p) closeFile(q); } },
+        { label: 'Open to the side', run: () => window.ForgeSplit && window.ForgeSplit.open(p) }, { label: 'Close', run: () => closeFile(p) }, { label: 'Close others', run: () => { for (const q of [...Forge.tabOrder]) if (q !== p) closeFile(q); } },
         { label: 'Close all', run: () => { for (const q of [...Forge.tabOrder]) closeFile(q); } }, { label: 'Copy path', run: () => navigator.clipboard.writeText(p) },
         { label: 'Add to chat', run: () => window.ForgeChat && window.ForgeChat.addFileContext(p) }, { label: 'Reveal in explorer', run: () => revealInTree(p) }]); });
       host.append(t);
@@ -292,6 +320,7 @@
     const f = Forge.files.get(path);
     if (!f) return;
     if (f.dirty && !confirm('Close ' + path + ' without saving?')) return;
+    if (window.ForgeLSP) window.ForgeLSP.detach(f.model);
     f.model.dispose();
     Forge.files.delete(path);
     Forge.tabOrder = Forge.tabOrder.filter((p) => p !== path);
@@ -303,18 +332,20 @@
     }
     renderTabs();
   }
-  async function saveActive() {
-    const f = Forge.activePath && Forge.files.get(Forge.activePath);
+  async function saveActive() { return saveFile(Forge.activePath); }
+  async function saveFile(path, quiet) {
+    const f = path && Forge.files.get(path);
     if (!f) return;
     try {
       const r = await post('/api/file', { path: f.path, content: f.model.getValue() });
       f.savedVersion = f.model.getAlternativeVersionId(); f.dirty = false; f.mtime = r.mtime;
+      if (window.ForgeLSP) window.ForgeLSP.saved(f.model);
       renderTabs();
       if (window.ForgeExtras) window.ForgeExtras.reportCheck(f.path, r.check || '');
-      toast('Saved ' + f.path, 'ok', 1200);
+      if (!quiet) toast('Saved ' + f.path, 'ok', 1200);
     } catch (e) { toast('Save failed: ' + e.message, 'error'); }
   }
-  async function saveAll() { for (const f of Forge.files.values()) if (f.dirty) { await post('/api/file', { path: f.path, content: f.model.getValue() }); f.savedVersion = f.model.getAlternativeVersionId(); f.dirty = false; } renderTabs(); }
+  async function saveAll() { if (window.ForgeNotebook) window.ForgeNotebook.flushAll(); for (const f of Forge.files.values()) if (f.dirty) { await post('/api/file', { path: f.path, content: f.model.getValue() }); f.savedVersion = f.model.getAlternativeVersionId(); f.dirty = false; } renderTabs(); }
   /** Reload a file from disk when the agent changed it (keeps unsaved local edits if dirty). */
   async function refreshFile(path) {
     const f = Forge.files.get(path);
@@ -331,7 +362,7 @@
       }
     } catch (e) { /* file may have been removed */ }
   }
-  Object.assign(Forge, { openFile, closeFile, saveActive, saveAll, refreshFile, activate });
+  Object.assign(Forge, { openFile, closeFile, saveActive, saveFile, saveAll, refreshFile, activate });
 
   // ------------------------------------------------------------------ explorer tree
   const treeState = { open: new Set(), key: null };
@@ -346,8 +377,39 @@
     ensureTreeState();
     const host = $('#tree');
     host.innerHTML = '';
-    await renderDir(host, '.', 0);
+    let roots = { extra: [] };
+    try { roots = await get('/api/roots'); } catch (e) { /* older server */ }
+    Forge.extraRoots = roots.extra || [];
+    if (!Forge.extraRoots.length) { await renderDir(host, '.', 0); return; }
+    // Several folders in this window: one collapsible section per folder, like Cursor's multi-root workspaces.
+    const sections = [{ path: '.', full: Forge.folder, primary: true }].concat(Forge.extraRoots.map((r) => ({ path: r, full: r })));
+    for (const sct of sections) {
+      const key = '!collapsed:' + sct.full;
+      const chev = el('svg', { class: 'chev' });
+      chev.innerHTML = '<path d="M5 3l5 5-5 5" />';
+      chev.setAttribute('viewBox', '0 0 16 16');
+      const kids = el('div', { class: 'root-kids' });
+      const head = el('div', { class: 'root-head' + (treeState.open.has(key) ? '' : ' open'), title: sct.full },
+        chev, el('span', { class: 'rname', text: Forge.folderName(sct.full) }), el('span', { class: 'rpath', text: sct.primary ? 'project' : sct.full }));
+      if (!sct.primary) head.append(el('span', { class: 'rx', text: '✕', title: 'Remove this folder from the window (the folder itself is not touched)', onclick: async (e) => {
+        e.stopPropagation();
+        try { await post('/api/roots', { action: 'remove', path: sct.full }); loadTree(); } catch (err) { toast(err.message, 'error'); }
+      } }));
+      head.onclick = async () => {
+        const open = !head.classList.contains('open');
+        head.classList.toggle('open', open);
+        if (open) { treeState.open.delete(key); kids.innerHTML = ''; await renderDir(kids, sct.path, 0); } else { treeState.open.add(key); kids.innerHTML = ''; }
+        saveTree();
+      };
+      host.append(head, kids);
+      if (!treeState.open.has(key)) await renderDir(kids, sct.path, 0);
+    }
   }
+  async function addRootFolder(p) {
+    try { await post('/api/roots', { action: 'add', path: p }); $('#folder-modal').classList.add('hidden'); await loadTree(); showView('explorer'); toast('Added ' + p + ' to this window.', 'ok'); }
+    catch (e) { toast(e.message, 'error'); }
+  }
+  Forge.addRootFolder = addRootFolder;
   async function renderDir(host, path, depth) {
     let data;
     try { data = await get('/api/tree', { path }); } catch (e) { host.append(el('div', { class: 'muted pad', text: e.message })); return; }
@@ -381,7 +443,8 @@
   function highlightTree(path) { for (const n of $$('#tree .node')) n.classList.toggle('selected', n.dataset.path === path); }
   function revealInTree(path) { showView('explorer'); const n = $$('#tree .node').find((x) => x.dataset.path === path); if (n) n.scrollIntoView({ block: 'center' }); highlightTree(path); }
   $('#btn-refresh-tree').onclick = loadTree;
-  $('#btn-collapse-tree').onclick = () => { treeState.open.clear(); saveTree(); loadTree(); };
+  $('#btn-collapse-tree').onclick = () => { for (const k of [...treeState.open]) if (!k.startsWith('!collapsed:')) treeState.open.delete(k); saveTree(); loadTree(); };
+  $('#btn-add-root').onclick = () => openFolderModal(null, 'add');
   $('#btn-new-file').onclick = () => newFilePrompt('');
   $('#btn-new-folder').onclick = () => newFolderPrompt('');
   $('#welcome-newfile').onclick = () => newFilePrompt('');
@@ -399,6 +462,7 @@
   function fileMenu(e, path) {
     contextMenu(e, [
       { label: 'Open', run: () => openFile(path) },
+      { label: 'Open to the side', run: () => window.ForgeSplit && window.ForgeSplit.open(path) },
       { label: 'Add to chat', run: () => window.ForgeChat && window.ForgeChat.addFileContext(path) },
       { label: 'Rename', run: () => renamePrompt(path) },
       { label: 'Copy path', run: () => navigator.clipboard.writeText(path) },
@@ -469,6 +533,29 @@
       if (count) host.prepend(el('div', { class: 'muted pad small', text: count + ' results' }));
     } catch (e) { host.innerHTML = '<div class="muted pad">' + esc(e.message) + '</div>'; }
   }
+
+  /** Replace across files, like Cursor's search and replace. Shows the count first; the change can be undone from
+   *  AI Changes because every file's earlier version is kept as a checkpoint. */
+  async function replaceAll() {
+    const q = $('#search-input').value;
+    if (!q.trim()) return toast('Type what to search for first.', 'error');
+    const body = { q, replacement: $('#replace-input').value, regex: $('#search-regex').checked, glob: $('#search-glob').value.trim() };
+    try {
+      if (window.ForgeNotebook) window.ForgeNotebook.flushAll();
+      const dirty = [...Forge.files.values()].filter((f) => f.dirty);
+      if (dirty.length && !confirm('Save your ' + dirty.length + ' unsaved file(s) first? Replace works on the saved files.')) return;
+      if (dirty.length) await saveAll();
+      const dry = await post('/api/replace', Object.assign({ dry_run: true }, body));
+      if (!dry.total) return toast('No matches to replace.', 'ok');
+      if (!confirm('Replace ' + dry.total + ' match(es) in ' + dry.files.length + ' file(s)?\n\n' + dry.files.slice(0, 12).map((f) => f.path + ' (' + f.count + ')').join('\n') + (dry.files.length > 12 ? '\n…' : '') + '\n\nYou can undo this from AI Changes.')) return;
+      const r = await post('/api/replace', body);
+      for (const f of r.files) refreshFile(f.path);
+      loadTree(); runSearch();
+      toast('Replaced ' + r.total + ' match(es) in ' + r.files.length + ' file(s). Undo it from AI Changes.', 'ok', 5000);
+    } catch (e) { toast(e.message, 'error'); }
+  }
+  $('#btn-replace-all').onclick = replaceAll;
+  $('#replace-input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) replaceAll(); });
 
   // ------------------------------------------------------------------ changes view (checkpoints, saved across restarts)
   const changePath = (c) => (c.path.startsWith('/') || !c.workspace || c.workspace === Forge.folder) ? c.path : c.workspace.replace(/\/+$/, '') + '/' + c.path;
@@ -661,6 +748,20 @@
     { label: 'Show AI changes', hint: 'Ctrl Shift G', run: () => showView('changes') },
     { label: 'Show chat history', hint: 'Ctrl Shift H', run: () => showView('history') },
     { label: 'Settings', hint: 'Ctrl ,', run: () => showView('settings') },
+    { label: 'Split editor: open this file to the side', hint: 'Ctrl \\', run: () => window.ForgeSplit && window.ForgeSplit.toggle() },
+    { label: 'Markdown: open preview to the side', hint: 'Ctrl Shift V', run: () => window.ForgePreview && window.ForgePreview.toggleMarkdown() },
+    { label: 'Add folder to this window (multi-root)', run: () => openFolderModal(null, 'add') },
+    { label: 'New Jupyter notebook', run: () => window.ForgeNotebook && window.ForgeNotebook.newNotebook() },
+    { label: 'Debug: start debugging the open Python file', hint: 'F5', run: () => window.ForgeDebug && window.ForgeDebug.start(false) },
+    { label: 'Debug: run without debugging', hint: 'Ctrl F5', run: () => window.ForgeDebug && window.ForgeDebug.start(true) },
+    { label: 'Debug: stop', hint: 'Shift F5', run: () => window.ForgeDebug && window.ForgeDebug.stop() },
+    { label: 'Debug: toggle breakpoint', hint: 'F9', run: () => window.ForgeDebug && window.ForgeDebug.toggleAtCursor() },
+    { label: 'Review: open the next file with agent changes', run: () => window.ForgeReview && window.ForgeReview.next() },
+    { label: 'Review: keep every pending agent change', run: () => window.ForgeReview && window.ForgeReview.keepAll() },
+    { label: 'Voice input', hint: 'Ctrl Shift Space', run: () => window.ForgeVoice && window.ForgeVoice.toggle($('#prompt'), $('#btn-voice')) },
+    { label: 'Export chat as Markdown', run: () => window.ForgeChat && window.ForgeChat.exportChat() },
+    { label: 'Add documentation for @docs', run: () => window.ForgeChat && window.ForgeChat.addDocsDialog() },
+    { label: 'Attach files to chat', run: () => $('#attach-input').click() },
     { label: 'Toggle verbose mode', run: () => window.ForgeChat && window.ForgeChat.toggleVerbose() },
     { label: 'Toggle thinking display', run: () => { const c = $('#thinking-toggle'); c.checked = !c.checked; c.dispatchEvent(new Event('change')); } },
     { label: 'Toggle Tab completions', run: () => $('#sb-tab').click() },
@@ -736,10 +837,12 @@
 
   // ------------------------------------------------------------------ open folder modal
   let folderModalNewWindow = false;
+  let folderModalAdd = false;
   async function openFolderModal(path, newWindow) {
-    if (newWindow !== undefined) folderModalNewWindow = !!newWindow;
+    if (newWindow !== undefined) { folderModalNewWindow = !!newWindow; folderModalAdd = newWindow === 'add'; if (folderModalAdd) folderModalNewWindow = false; }
     $('#folder-modal').classList.remove('hidden');
-    $('#folder-modal-title').textContent = folderModalNewWindow ? 'Open folder in a new window' : 'Open folder';
+    $('#folder-modal-title').textContent = folderModalAdd ? 'Add a folder to this window' : folderModalNewWindow ? 'Open folder in a new window' : 'Open folder';
+    $('#folder-open').textContent = folderModalAdd ? 'Add folder' : 'Open';
     try {
       const r = await get('/api/dirs', { path: path || Forge.folder || '~' });
       $('#folder-path').value = r.path;
@@ -764,6 +867,7 @@
   $('#folder-open-new').onclick = () => setWorkspace($('#folder-path').value.trim(), true);
   $('#folder-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') setWorkspace(e.target.value.trim(), folderModalNewWindow); });
   async function setWorkspace(p, inNewWindow) {
+    if (folderModalAdd && !inNewWindow) return addRootFolder(p);
     try {
       const r = await post('/api/workspace', { path: p, create: true });
       $('#folder-modal').classList.add('hidden');
@@ -791,12 +895,14 @@
     { key: 'max_iterations', label: 'Max tool steps per message', type: 'number' },
     { key: 'auto_approve_commands', label: 'Auto-run commands', type: 'bool', hint: 'Destructive commands and deletions still ask.' },
     { key: 'external_file_protection', label: 'External-file protection', type: 'bool', hint: 'The agent may read and change files anywhere on this computer. With this on, it asks before changing a file outside the project folder. System files and keys always ask.' },
+    { key: 'semantic_index', label: 'Codebase index (search by meaning)', type: 'bool', hint: 'Forge turns your code into embedding vectors with a small separate model (about 250 MB, started only when needed and only when memory allows), so codebase search and @codebase find code by what it does, not only by its words. Indexing pauses while a chat is running.' },
     { key: 'repo_map_chars', label: 'Repo map size (characters)', type: 'number', hint: 'Outline of your workspace given to the model. Smaller is faster.' },
     { key: 'prewarm', label: 'Pre-warm model on new chat', type: 'bool', hint: 'Processes the system prompt in the background so the first reply is fast.' },
     { group: 'Images' },
     { key: 'vision', label: 'Vision for screenshots', type: 'select', options: ['auto', 'gpu', 'cpu', 'ocr'], hint: 'auto: Qwen3-VL on the Intel GPU (4B when memory allows, otherwise 2B), then the CPU model, then text recognition only. ocr: text recognition only.' },
     { key: 'vision_cpu_model', label: 'CPU vision model (Ollama)', type: 'text', hint: 'Used when the GPU is not available, only when memory allows.' },
     { group: 'Editor' },
+    { key: 'lsp', label: 'Language servers (code intelligence)', type: 'bool', hint: 'Suggestions, hover information, go to definition, find references, rename and live errors for Python, JavaScript, TypeScript, shell, JSON, CSS, HTML and C or C++. Each language server starts only when you open a file of that language and only when memory allows.' },
     { key: 'tab_completions', label: 'Tab completions while typing', type: 'bool', hint: 'Slow on CPU; Alt+\\ triggers one manually any time.' },
     { key: 'completion_delay_ms', label: 'Completion delay (ms)', type: 'number' },
     { key: 'font_size', label: 'Editor font size', type: 'number' },
@@ -852,7 +958,7 @@
     }
     if (window.ForgeExtras && scope === 'user') await window.ForgeExtras.renderSettingsExtras(host);
     host.append(el('div', { class: 'sgroup', text: 'Shortcuts' }));
-    const sc = [['Ctrl P', 'Quick open'], ['Ctrl Shift P', 'Command palette'], ['Ctrl L', 'Add selection to chat'], ['Ctrl K', 'Edit selection with AI'], ['Ctrl I', 'Toggle AI panel'], ['Ctrl Enter', 'Send message'], ['Esc', 'Stop the agent'], ['Ctrl `', 'Terminal'], ['Ctrl B', 'Sidebar'], ['Ctrl S', 'Save'], ['Ctrl N', 'New chat'], ['Alt \\', 'Trigger completion']];
+    const sc = [['Ctrl P', 'Quick open'], ['Ctrl Shift P', 'Command palette'], ['Ctrl L', 'Add selection to chat'], ['Ctrl K', 'Edit selection with AI'], ['Ctrl I', 'Toggle AI panel'], ['Ctrl Enter', 'Send message'], ['Esc', 'Stop the agent'], ['Ctrl `', 'Terminal'], ['Ctrl B', 'Sidebar'], ['Ctrl S', 'Save'], ['Ctrl N', 'New chat'], ['Ctrl Tab', 'Next chat tab'], ['Ctrl W', 'Close chat tab (in the AI panel)'], ['Ctrl Shift Space', 'Voice input'], ['F5', 'Start debugging or continue'], ['Ctrl \\', 'Split editor'], ['F9', 'Toggle breakpoint'], ['F10 / F11', 'Step over / into'], ['Alt \\', 'Trigger completion']];
     for (const [k, v] of sc) host.append(el('div', { class: 'srow inline' }, el('span', { class: 'muted', text: v }), el('kbd', { text: k })));
   }
   /** Save a setting. Without an explicit scope it goes where it is defined: the folder when this folder overrides
@@ -961,9 +1067,15 @@
     if (mod && e.shiftKey && e.key.toLowerCase() === 'e') { e.preventDefault(); showView('explorer'); return; }
     if (mod && e.shiftKey && e.key.toLowerCase() === 'g') { e.preventDefault(); showView('changes'); return; }
     if (mod && e.shiftKey && e.key.toLowerCase() === 'h') { e.preventDefault(); showView('history'); return; }
+    if (mod && e.shiftKey && e.code === 'Space') { e.preventDefault(); if (window.ForgeVoice) window.ForgeVoice.toggle($('#prompt'), $('#btn-voice')); return; }
+    if (mod && e.key === 'Tab' && !inEditor) { e.preventDefault(); window.ForgeChat && window.ForgeChat.nextTab(e.shiftKey ? -1 : 1); return; }
+    if (mod && e.key.toLowerCase() === 'w' && e.target.closest && e.target.closest('.chat')) { e.preventDefault(); window.ForgeChat && window.ForgeChat.closeActiveTab(); return; }
     if (e.key === 'Escape' && !$('#palette').classList.contains('hidden')) closePalette();
   });
   window.addEventListener('beforeunload', (e) => { for (const f of Forge.files.values()) if (f.dirty) { e.preventDefault(); e.returnValue = ''; return; } });
+
+  // Monaco cancels pending work (hovers, completions) when a file closes; that is expected, not an error.
+  window.addEventListener('unhandledrejection', (e) => { const r = e.reason; if (r && (r.name === 'Canceled' || r.message === 'Canceled')) e.preventDefault(); });
 
   // ------------------------------------------------------------------ boot
   async function boot() {

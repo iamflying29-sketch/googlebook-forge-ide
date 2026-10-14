@@ -60,6 +60,8 @@ python3 -m pytest -q
 - If something is impossible or unclear and you cannot find out yourself, use ask_user.
 - Relative paths are inside the project folder. When the task needs it you may read and change files anywhere on this computer with absolute paths or ~ paths (the Googlebook's shared Documents folder is /mnt/shared/Documents). Changes outside the project folder may need the user's approval first.
 - Commands run non-interactively in bash; never start interactive programs (vim, nano, less, python without a script).
+- For tasks with three or more steps, start with todo_write (the full plan), keep exactly one item in_progress, and mark items completed as you finish them.
+- When the user states a lasting preference or project convention, offer to keep it with remember.
 - You cannot see images, but you work together with a vision model that can. When the user attaches a screenshot, its description and recognized text are in the message. If you need more detail, ask the vision model with look_at_image (as often as you need), then act on its answers yourself."""
 
 THINKING_RULES_ON = """## Thinking

@@ -15,6 +15,9 @@ import android.net.Uri;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.webkit.ConsoleMessage;
+import android.webkit.PermissionRequest;
+import android.content.pm.PackageManager;
+import android.Manifest;
 import android.webkit.ValueCallback;
 import android.widget.FrameLayout;
 import android.webkit.JavascriptInterface;
@@ -46,6 +49,11 @@ public class MainActivity extends Activity {
     private String startPath = "/";
     private ValueCallback<Uri[]> fileCallback;
     private static final int PICK_FILES = 42;
+    private static final int REQ_MIC = 43;
+    private Voice voice;
+    /** What to do once the microphone permission is answered: start dictation, or answer a page's request. */
+    private Runnable afterMicGranted;
+    private Runnable afterMicDenied;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -74,6 +82,14 @@ public class MainActivity extends Activity {
                 fileCallback = callback;
                 try {
                     Intent i = params.createIntent();
+                    String[] types = params.getAcceptTypes();
+                    boolean any = types == null || types.length == 0 || (types.length == 1 && (types[0] == null || types[0].isEmpty()));
+                    if (any) {
+                        // The attachment button accepts every kind of file.
+                        i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                        i.addCategory(Intent.CATEGORY_OPENABLE);
+                        i.setType("*/*");
+                    }
                     if (params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE) i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
                     startActivityForResult(i, PICK_FILES);
                     return true;
@@ -81,6 +97,18 @@ public class MainActivity extends Activity {
                     fileCallback = null;
                     return false;
                 }
+            }
+
+            /** Microphone for the IDE's own page only (the browser fallback for voice input). */
+            @Override
+            public void onPermissionRequest(PermissionRequest request) {
+                main.post(() -> {
+                    String origin = String.valueOf(request.getOrigin());
+                    boolean audioOnly = true;
+                    for (String r : request.getResources()) if (!PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) audioOnly = false;
+                    if (!origin.startsWith(SERVER) || !audioOnly) { request.deny(); return; }
+                    withMicrophone(() -> request.grant(new String[]{PermissionRequest.RESOURCE_AUDIO_CAPTURE}), request::deny);
+                });
             }
 
             @Override
@@ -173,7 +201,22 @@ public class MainActivity extends Activity {
 
 
         @JavascriptInterface
-        public String appVersion() { return "1.3"; }
+        public String appVersion() { return "1.4"; }
+
+        /** Voice input with Android's speech recognizer. Events come back through window.ForgeVoice._native(). */
+        @JavascriptInterface
+        public boolean voiceAvailable() { return Voice.available(MainActivity.this); }
+
+        @JavascriptInterface
+        public void voiceStart(String lang) {
+            main.post(() -> withMicrophone(() -> {
+                if (voice == null) voice = new Voice(MainActivity.this, MainActivity.this::voiceEvent);
+                voice.start(lang);
+            }, () -> voiceEvent(voiceError("Forge needs permission to use the microphone for voice input."))));
+        }
+
+        @JavascriptInterface
+        public void voiceStop() { main.post(() -> { if (voice != null) voice.stop(); }); }
 
         /** Opens a separate Forge window (its own task in the taskbar), like Cursor's New Window. */
         @JavascriptInterface
@@ -207,6 +250,44 @@ public class MainActivity extends Activity {
                 if (i != null) { try { startActivity(i); } catch (Exception e) { Log.w(TAG, "cannot open Terminal", e); } }
             });
         }
+    }
+
+    private static org.json.JSONObject voiceError(String text) {
+        org.json.JSONObject o = new org.json.JSONObject();
+        try { o.put("type", "error"); o.put("text", text); } catch (Exception ignored) { }
+        return o;
+    }
+
+    private void voiceEvent(org.json.JSONObject event) {
+        final String js = "window.ForgeVoice && window.ForgeVoice._native(" + org.json.JSONObject.quote(event.toString()) + ")";
+        main.post(() -> { if (web != null) web.evaluateJavascript(js, null); });
+    }
+
+    /** Runs granted() once the app may record audio, asking you first if needed. */
+    private void withMicrophone(Runnable granted, Runnable denied) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { granted.run(); return; }
+        if (afterMicDenied != null) afterMicDenied.run();
+        afterMicGranted = granted;
+        afterMicDenied = denied;
+        requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode != REQ_MIC) return;
+        Runnable ok = afterMicGranted, no = afterMicDenied;
+        afterMicGranted = null; afterMicDenied = null;
+        boolean granted = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
+        if (granted && ok != null) ok.run();
+        else if (!granted && no != null) no.run();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // Never keep the microphone open for a window you are not using.
+        if (voice != null) voice.stop();
     }
 
     @Override
@@ -260,6 +341,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (voice != null) { voice.stop(); voice.release(); }
         if (web != null) { web.stopLoading(); web.destroy(); }
         super.onDestroy();
     }

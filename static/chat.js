@@ -1,33 +1,28 @@
-/* Forge IDE: AI panel (Agent / Ask / Plan), streaming, thinking, tools, approvals, sessions. */
+/* Forge IDE: the AI panel, like Cursor's chat: tabs with several chats at once, Agent, Ask and Plan modes,
+ * streaming thinking and tools, approvals, to-do lists, queued messages, Restore checkpoint, slash commands,
+ * @ context (files, folders, code, docs, past chats, web, git, terminal, linter errors, notepads),
+ * attachments of any file, images, a model picker and export. */
 (function () {
   'use strict';
   const F = window.Forge;
   const { $, $$, el, esc, get, post, toast } = F;
-
   const C = window.ForgeChat = {};
-  let session = null;            // { id, title, ... }
-  let transcript = [];           // persisted UI transcript
-  let run = null;                // { id, es, msgEl, blocks, ... }
-  let contexts = [];             // attached context chips
-  let verbose = false;
-  let mentionItems = [], mentionSel = 0, mentionStart = -1;
-
-  const messagesEl = $('#messages');
   const promptEl = $('#prompt');
+  const host = $('#messages');
+  const tabs = [];
+  let active = null;
+  let verbose = false;
+  let menu = { items: [], sel: 0, start: -1, kind: null };
 
-  // ------------------------------------------------------------------ markdown rendering
+  // ================================================================== markdown and code blocks
   marked.setOptions({ gfm: true, breaks: false });
   const renderer = new marked.Renderer();
   renderer.code = function (code, infostring) {
     const text = typeof code === 'object' ? code.text : code;
     const lang = (typeof code === 'object' ? code.lang : infostring) || '';
-    const id = 'cb' + Math.random().toString(36).slice(2, 9);
-    return '<pre data-lang="' + esc(lang) + '" data-id="' + id + '"><div class="pre-bar"><span>' + esc(lang || 'code') + '</span><div class="pre-actions"><button data-act="copy">Copy</button><button data-act="insert">Insert at cursor</button><button data-act="apply">Apply to file</button></div></div><code class="lang-' + esc(lang) + '">' + esc(text) + '</code></pre>';
+    return '<pre data-lang="' + esc(lang) + '"><div class="pre-bar"><span>' + esc(lang || 'code') + '</span><div class="pre-actions"><button data-act="copy">Copy</button><button data-act="insert">Insert at cursor</button><button data-act="apply">Apply to file</button></div></div><code class="lang-' + esc(lang) + '">' + esc(text) + '</code></pre>';
   };
-  function md(text) {
-    const html = marked.parse(text || '', { renderer });
-    return DOMPurify.sanitize(html, { ADD_ATTR: ['data-act', 'data-lang', 'data-id'] });
-  }
+  const md = (text) => DOMPurify.sanitize(marked.parse(text || '', { renderer }), { ADD_ATTR: ['data-act', 'data-lang'] });
   function colorize(root) {
     if (!F.monaco) return;
     for (const code of root.querySelectorAll('pre code')) {
@@ -38,15 +33,13 @@
       F.monaco.editor.colorize(code.textContent, langId, { tabSize: 4 }).then((h) => { code.innerHTML = h; }).catch(() => {});
     }
   }
-  messagesEl.addEventListener('click', (e) => {
+  host.addEventListener('click', (e) => {
     const b = e.target.closest('button[data-act]');
     if (!b) return;
-    const pre = b.closest('pre');
-    const code = pre.querySelector('code').textContent;
-    const act = b.dataset.act;
-    if (act === 'copy') { navigator.clipboard.writeText(code); b.textContent = 'Copied'; setTimeout(() => (b.textContent = 'Copy'), 1200); }
-    else if (act === 'insert') { if (!F.editor.getModel()) return toast('Open a file first.'); F.editor.executeEdits('forge-chat', [{ range: F.editor.getSelection(), text: code, forceMoveMarkers: true }]); F.editor.focus(); }
-    else if (act === 'apply') applyCodeToFile(code);
+    const code = b.closest('pre').querySelector('code').textContent;
+    if (b.dataset.act === 'copy') { navigator.clipboard.writeText(code); b.textContent = 'Copied'; setTimeout(() => (b.textContent = 'Copy'), 1200); }
+    else if (b.dataset.act === 'insert') { if (!F.editor.getModel()) return toast('Open a file first.'); F.editor.executeEdits('forge-chat', [{ range: F.editor.getSelection(), text: code, forceMoveMarkers: true }]); F.editor.focus(); }
+    else if (b.dataset.act === 'apply') applyCodeToFile(code);
   });
   async function applyCodeToFile(code) {
     const f = F.activePath && F.files.get(F.activePath);
@@ -55,37 +48,7 @@
     if (accepted !== null) { f.model.setValue(accepted); toast('Applied to ' + f.path + '. Save with Ctrl+S.', 'ok'); }
   }
 
-  // ------------------------------------------------------------------ transcript rendering
-  function scrollToBottom(force) {
-    const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 120;
-    if (force || nearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
-  }
-  function showEmpty(show) { $('#chat-empty').classList.toggle('hidden', !show); }
-
-  function renderUser(turn) {
-    const m = el('div', { class: 'msg user' });
-    if (turn.attachments && turn.attachments.length) {
-      const imgs = turn.attachments.filter((a) => a.kind === 'image');
-      const others = turn.attachments.filter((a) => a.kind !== 'image');
-      if (imgs.length) {
-        const wrap = el('div', { class: 'msg-images' });
-        for (const a of imgs) wrap.append(el('img', { src: a.url, alt: a.name || 'image', title: (a.name || 'Image') + (a.width ? ' (' + a.width + ' by ' + a.height + ')' : ''), onclick: () => openLightbox(a.url) }));
-        m.append(wrap);
-      }
-      if (others.length) {
-        const ctx = el('div', { class: 'ctx' });
-        for (const a of others) ctx.append(el('span', { class: 'cchip', text: a.kind === 'selection' ? a.path + ':' + a.start + '-' + a.end : (a.kind === 'terminal' ? 'terminal output' : a.path || a.title) }));
-        m.append(ctx);
-      }
-    }
-    m.append(el('div', { class: 'bubble', text: turn.text }));
-    return m;
-  }
-
-  function newAssistantEl() {
-    const m = el('div', { class: 'msg assistant' });
-    return m;
-  }
+  // ================================================================== building blocks of the transcript
   function thinkingBlock(text, live) {
     const d = el('details', { class: 'thinking' + (live ? ' live' : ''), open: live ? '' : null });
     const sum = el('summary');
@@ -95,28 +58,27 @@
     d._body = body; d._label = sum.querySelector('.tl');
     return d;
   }
-  function textBlock(text) {
-    const d = el('div', { class: 'md' });
-    d.innerHTML = md(text);
-    colorize(d);
-    return d;
-  }
-  const TOOL_ICONS = { read_file: '📄', write_file: '✎', edit_file: '✎', list_dir: '▤', find_files: '🔍', search: '🔍', run_command: '$', web_fetch: '🌐', delete_path: '🗑', ask_user: '?', look_at_image: '👁', web_search: '🌐', codebase_search: '🔍' };
+  function textBlock(text) { const d = el('div', { class: 'md' }); d.innerHTML = md(text); colorize(d); return d; }
+  const TOOL_ICONS = { read_file: '📄', write_file: '✎', edit_file: '✎', list_dir: '▤', find_files: '🔍', search: '🔍', run_command: '$', web_fetch: '🌐', web_search: '🌐', codebase_search: '🔍', delete_path: '🗑', ask_user: '?', look_at_image: '👁', todo_write: '☑', remember: '🧠', docs_search: '📚' };
+  const TOOL_LABELS = { read_file: 'Read file', write_file: 'Write file', edit_file: 'Edit file', list_dir: 'List folder', find_files: 'Find files', search: 'Search code', run_command: 'Run command', web_fetch: 'Fetch URL', web_search: 'Web search', codebase_search: 'Search codebase', delete_path: 'Move to trash', ask_user: 'Question', look_at_image: 'Look at image', todo_write: 'Update to-do list', remember: 'Save memory', docs_search: 'Search docs' };
   function argSummary(name, a) {
     a = a || {};
     if (name === 'run_command') return a.command || '';
     if (name === 'search') return (a.pattern || '') + (a.path && a.path !== '.' ? ' in ' + a.path : '');
     if (name === 'find_files') return a.pattern || '';
     if (name === 'web_fetch') return a.url || '';
+    if (name === 'web_search' || name === 'codebase_search') return a.query || '';
+    if (name === 'docs_search') return (a.name || '') + ': ' + (a.query || '');
     if (name === 'read_file') return (a.path || '') + (a.start_line ? ':' + a.start_line + '-' + (a.end_line || '') : '');
     if (name === 'look_at_image') return (a.question || '') + (a.image ? '  [' + a.image + ']' : '');
+    if (name === 'remember') return a.memory || '';
+    if (name === 'todo_write') return Array.isArray(a.todos) ? a.todos.length + ' items' : '';
     return a.path || JSON.stringify(a);
   }
   function toolCard(t) {
     const card = el('div', { class: 'tool ' + (t.state || 'running') });
     const head = el('div', { class: 'thead', onclick: () => card.classList.toggle('open') },
-      el('span', { class: 'ticon', text: TOOL_ICONS[t.name] || '⚙' }),
-      el('span', { class: 'tname', text: labelFor(t.name) }),
+      el('span', { class: 'ticon', text: TOOL_ICONS[t.name] || '⚙' }), el('span', { class: 'tname', text: TOOL_LABELS[t.name] || t.name }),
       el('span', { class: 'targ', text: argSummary(t.name, t.arguments), title: argSummary(t.name, t.arguments) }),
       el('span', { class: 'tstate', text: t.state === 'ok' ? 'done' + (t.seconds != null ? ' · ' + t.seconds + 's' : '') : t.state === 'fail' ? 'failed' : 'running' }));
     const body = el('div', { class: 'tbody' });
@@ -128,15 +90,10 @@
     for (const k of big) if (args[k] !== undefined) body.append(el('div', { class: 'sect', text: k }), el('pre', { text: String(args[k]) }));
     const res = el('pre', { class: 'tres', text: t.result || '' });
     body.append(el('div', { class: 'sect', text: 'result' }), res);
-    if (t.name === 'read_file' || t.name === 'write_file' || t.name === 'edit_file') {
-      body.append(el('div', { class: 'tactions' }, el('button', { class: 'btn ghost sm', text: 'Open file', onclick: () => F.openFile(args.path) })));
-    }
+    if (['read_file', 'write_file', 'edit_file'].includes(t.name)) body.append(el('div', { class: 'tactions' }, el('button', { class: 'btn ghost sm', text: 'Open file', onclick: () => F.openFile(args.path) })));
     card.append(head, body);
     card._res = res; card._state = head.querySelector('.tstate');
     return card;
-  }
-  function labelFor(name) {
-    return { read_file: 'Read file', write_file: 'Write file', edit_file: 'Edit file', list_dir: 'List folder', find_files: 'Find files', search: 'Search code', run_command: 'Run command', web_fetch: 'Fetch URL', delete_path: 'Move to trash', ask_user: 'Question', look_at_image: 'Look at image', web_search: 'Web search', codebase_search: 'Search codebase' }[name] || name;
   }
   function fileChangeChip(ch) {
     return el('span', { class: 'filechange', title: 'Review diff', 'data-path': ch.path, onclick: async () => {
@@ -149,7 +106,6 @@
       } catch (e) { toast(e.message, 'error'); }
     } }, F.fileIcon(ch.path), el('span', { text: ch.path }), el('span', { class: 'badge ' + ch.kind, text: ch.kind }));
   }
-  /** The row of changed-file chips under a reply, with a Revert all button (a Cursor-style checkpoint restore). */
   function filesRow(runId) {
     const chips = el('span', { class: 'files-row' });
     const btn = el('button', { class: 'btn ghost sm', text: 'Revert all', title: 'Undo every file change of this reply', onclick: async () => {
@@ -158,7 +114,8 @@
       F.loadTree(); F.loadChanges && F.loadChanges();
       chips.querySelectorAll('.filechange').forEach((c) => { if (c.dataset.path) F.refreshFile(c.dataset.path); });
     } });
-    const row = el('div', { class: 'files-row' }, chips, btn);
+    const review = el('button', { class: 'btn ghost sm', text: 'Review in editor', title: 'Show these changes inline in the editor with Keep and Undo for each change', onclick: () => { if (window.ForgeReview) window.ForgeReview.reviewRun(runId); } });
+    const row = el('div', { class: 'files-row' }, chips, review, btn);
     row._chips = chips;
     return row;
   }
@@ -173,10 +130,88 @@
     for (const p of parts) d.append(el('span', { text: p }));
     return d;
   }
+  function visionBlock(b) {
+    const d = el('details', { class: 'vision' });
+    d.append(el('summary', { text: '👁 What the vision model sees in image ' + b.number + (b.source && b.source !== 'unavailable' && b.source !== 'off' ? ' (' + b.source + ')' : '') }));
+    const body = el('div', { class: 'vbody' });
+    if (b.description) body.append(el('div', { class: 'vsect', text: 'Description' }), el('div', { text: b.description }));
+    else body.append(el('div', { class: 'muted', text: 'The vision model was not available, so only the recognized text was used.' }));
+    if (b.ocr) body.append(el('div', { class: 'vsect', text: 'Recognized text' }), el('pre', { text: b.ocr }));
+    d.append(body);
+    return d;
+  }
+  function todosBlock(b) {
+    const d = el('div', { class: 'todos' });
+    const done = b.todos.filter((t) => t.status === 'completed').length;
+    d.append(el('div', { class: 'todos-head', text: 'To-do list · ' + done + ' of ' + b.todos.length + ' done' }));
+    for (const t of b.todos) d.append(el('div', { class: 'todo ' + t.status }, el('span', { class: 'tick', text: t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '▸' : '○' }), el('span', { text: t.content })));
+    return d;
+  }
+  function openLightbox(url) { $('#lightbox-img').src = url; $('#lightbox').classList.remove('hidden'); }
+  $('#lightbox').addEventListener('click', () => $('#lightbox').classList.add('hidden'));
+  window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#lightbox').classList.contains('hidden')) $('#lightbox').classList.add('hidden'); });
+  const askCard = (q) => el('div', { class: 'ask-card' }, el('div', { class: 'atitle', text: 'Forge asks' }), el('div', { text: q }));
 
-  /** Render a stored assistant turn (from the transcript). */
+  function approvalCard(a, resolved) {
+    const card = el('div', { class: 'approval' + (resolved ? ' resolved' : '') });
+    const isWrite = a.tool === 'write_file' || a.tool === 'edit_file';
+    const title = a.tool === 'run_command' ? 'Run this command?' : a.tool === 'delete_path' ? 'Move to trash?' : a.tool === 'remember' ? 'Save this memory?' : isWrite ? 'Change a file outside this project?' : 'Allow ' + a.tool + '?';
+    card.append(el('div', { class: 'atitle', text: title }));
+    if (a.reason) card.append(el('div', { class: 'muted small', text: a.reason }));
+    const args = a.arguments || {};
+    const editable = a.tool === 'run_command' ? 'command' : a.tool === 'remember' ? 'memory' : null;
+    const text = editable ? String(args[editable] || '') : isWrite ? (args.path + '\n\n' + (a.tool === 'write_file' ? 'New content:\n' + String(args.content || '').slice(0, 1500)
+      : 'Replace:\n' + String(args.old_text || '').slice(0, 700) + '\n\nWith:\n' + String(args.new_text || '').slice(0, 700))) : JSON.stringify(args);
+    let ta = null;
+    if (!resolved && editable) { ta = el('textarea', { spellcheck: 'false' }); ta.value = text; card.append(ta); if (a.tool === 'remember') card.append(el('div', { class: 'muted small', text: 'Scope: ' + (args.scope === 'global' ? 'every folder' : 'this project') + '. You can edit it before saving.' })); }
+    else card.append(el('pre', { text }));
+    if (resolved) card.append(el('div', { class: 'muted small', text: a.decision === 'approved' ? 'Approved' : a.decision === 'denied' ? 'Denied' : '' }));
+    else {
+      const decide = async (decision) => {
+        const changed = ta && ta.value.trim() !== text ? { [editable]: ta.value.trim() } : null;
+        try { await post('/api/approve', { run_id: a.run_id, approval_id: a.approval_id, decision, arguments: changed }); } catch (e) { toast(e.message, 'error'); }
+        card.classList.add('resolved');
+        card.querySelector('.aactions').replaceWith(el('div', { class: 'muted small', text: decision === 'deny' ? 'Denied' : 'Approved' }));
+        a.decision = decision === 'deny' ? 'denied' : 'approved';
+        if (ta) ta.replaceWith(el('pre', { text: ta.value }));
+      };
+      const actions = el('div', { class: 'aactions' }, el('button', { class: 'btn sm', text: a.tool === 'run_command' ? 'Run' : a.tool === 'remember' ? 'Save' : 'Allow', onclick: () => decide('approve') }));
+      if (a.tool !== 'remember') actions.append(el('button', { class: 'btn ghost sm', text: 'Always allow this chat', onclick: () => decide('always') }));
+      actions.append(el('button', { class: 'btn ghost sm', text: a.tool === 'remember' ? 'Do not save' : 'Skip', onclick: () => decide('deny') }));
+      card.append(actions);
+      setTimeout(() => { const b = card.querySelector('.btn'); if (b) b.focus(); }, 50);
+    }
+    return card;
+  }
+
+  function contextLabel(a) {
+    if (a.kind === 'selection') return a.path + ':' + a.start + '-' + a.end;
+    if (a.kind === 'terminal') return 'Terminal output';
+    if (a.kind === 'upload') return a.name;
+    if (a.kind === 'docs') return 'Docs: ' + a.name;
+    if (a.kind === 'chat') return 'Chat: ' + a.title;
+    if (a.kind === 'folder') return 'Folder: ' + a.path;
+    return a.path || a.title || a.kind;
+  }
+  function renderUser(tab, turn) {
+    const m = el('div', { class: 'msg user' });
+    const atts = turn.attachments || [];
+    const imgs = atts.filter((a) => a.kind === 'image');
+    const others = atts.filter((a) => a.kind !== 'image' && a.kind !== 'editor');
+    if (imgs.length) {
+      const wrap = el('div', { class: 'msg-images' });
+      for (const a of imgs) wrap.append(el('img', { src: a.url, alt: a.name || 'image', title: a.name || 'Image', onclick: () => openLightbox(a.url) }));
+      m.append(wrap);
+    }
+    if (others.length) { const ctx = el('div', { class: 'ctx' }); for (const a of others) ctx.append(el('span', { class: 'cchip', text: contextLabel(a) })); m.append(ctx); }
+    m.append(el('div', { class: 'bubble', text: turn.text }));
+    if (turn.run_id) m.append(el('button', { class: 'restore', text: '↺ Restore checkpoint', title: 'Undo the file changes of this message and everything after it, and continue the chat from here', onclick: () => restoreCheckpoint(tab, turn) }));
+    return m;
+  }
   function renderAssistant(turn) {
-    const m = newAssistantEl();
+    const m = el('div', { class: 'msg assistant' });
+    const todos = (turn.blocks || []).find((b) => b.type === 'todos');
+    if (todos) m.append(todosBlock(todos));
     for (const b of turn.blocks || []) {
       if (b.type === 'thinking') m.append(thinkingBlock(b.text, false));
       else if (b.type === 'text') m.append(textBlock(b.text));
@@ -191,362 +226,501 @@
     if (turn.stats) m.append(statLine(turn.stats));
     return m;
   }
-  /** What the vision model saw in an attached image, so you can check what Llama was told. */
-  function visionBlock(b) {
-    const d = el('details', { class: 'vision' });
-    d.append(el('summary', { text: '👁 What the vision model sees in image ' + b.number + (b.source && b.source !== 'unavailable' && b.source !== 'off' ? ' (' + b.source + ')' : '') }));
-    const body = el('div', { class: 'vbody' });
-    if (b.description) body.append(el('div', { class: 'vsect', text: 'Description' }), el('div', { text: b.description }));
-    else body.append(el('div', { class: 'muted', text: 'The vision model was not available, so only the recognized text was used.' }));
-    if (b.ocr) body.append(el('div', { class: 'vsect', text: 'Recognized text' }), el('pre', { text: b.ocr }));
-    d.append(body);
-    return d;
-  }
-  function openLightbox(url) { $('#lightbox-img').src = url; $('#lightbox').classList.remove('hidden'); }
-  $('#lightbox').addEventListener('click', () => $('#lightbox').classList.add('hidden'));
-  window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#lightbox').classList.contains('hidden')) $('#lightbox').classList.add('hidden'); });
-  function askCard(q) { return el('div', { class: 'ask-card' }, el('div', { class: 'atitle', text: 'Forge asks' }), el('div', { text: q })); }
-  function approvalCard(a, resolved) {
-    const card = el('div', { class: 'approval' + (resolved ? ' resolved' : '') });
-    const isWrite = a.tool === 'write_file' || a.tool === 'edit_file';
-    const title = a.tool === 'run_command' ? 'Run this command?' : a.tool === 'delete_path' ? 'Move to trash?' : isWrite ? 'Change a file outside this project?' : 'Allow ' + a.tool + '?';
-    card.append(el('div', { class: 'atitle', text: title }));
-    if (a.reason) card.append(el('div', { class: 'muted small', text: a.reason }));
-    const args = a.arguments || {};
-    const cmd = a.tool === 'run_command' ? (args.command || '')
-      : isWrite ? (args.path + '\n\n' + (a.tool === 'write_file' ? 'New content:\n' + String(args.content || '').slice(0, 1500)
-        : 'Replace:\n' + String(args.old_text || '').slice(0, 700) + '\n\nWith:\n' + String(args.new_text || '').slice(0, 700)))
-      : JSON.stringify(args);
-    let ta = null;
-    if (!resolved && a.tool === 'run_command') { ta = el('textarea', { spellcheck: 'false' }); ta.value = cmd; card.append(ta); }
-    else card.append(el('pre', { text: cmd }));
-    if (resolved) card.append(el('div', { class: 'muted small', text: a.decision === 'approved' ? 'Approved' : a.decision === 'denied' ? 'Denied' : '' }));
-    else {
-      const decide = async (decision) => {
-        const args = ta && ta.value.trim() !== cmd ? { command: ta.value.trim() } : null;
-        try { await post('/api/approve', { run_id: a.run_id, approval_id: a.approval_id, decision, arguments: args }); } catch (e) { toast(e.message, 'error'); }
-        card.classList.add('resolved');
-        card.querySelector('.aactions').replaceWith(el('div', { class: 'muted small', text: decision === 'deny' ? 'Denied' : 'Approved' }));
-        a.decision = decision === 'deny' ? 'denied' : 'approved';
-        if (ta) ta.replaceWith(el('pre', { text: ta.value }));
-      };
-      card.append(el('div', { class: 'aactions' },
-        el('button', { class: 'btn sm', text: a.tool === 'run_command' ? 'Run' : 'Allow', onclick: () => decide('approve') }),
-        el('button', { class: 'btn ghost sm', text: 'Always allow this chat', onclick: () => decide('always') }),
-        el('button', { class: 'btn ghost sm', text: 'Skip', onclick: () => decide('deny') })));
-      setTimeout(() => { const b = card.querySelector('.btn'); if (b) b.focus(); }, 50);
+
+  // ================================================================== tabs (several chats at once)
+  class Tab {
+    constructor(session) {
+      this.session = session; this.transcript = session.transcript || []; this.run = null;
+      this.contexts = []; this.queue = []; this.scroll = 0; this.attention = false; this.draft = '';
+      this.pane = el('div', { class: 'tab-pane hidden' });
+      host.append(this.pane);
+      this.render();
     }
-    return card;
+    render() {
+      this.pane.innerHTML = '';
+      for (const t of this.transcript) this.pane.append(t.role === 'user' ? renderUser(this, t) : renderAssistant(t));
+    }
   }
-
-  function renderTranscript() {
-    for (const n of Array.from(messagesEl.children)) if (n.id !== 'chat-empty') n.remove();
-    showEmpty(transcript.length === 0);
-    for (const t of transcript) messagesEl.append(t.role === 'user' ? renderUser(t) : renderAssistant(t));
-    scrollToBottom(true);
+  const tabsKey = () => 'forge.tabs.' + F.folder;
+  function saveTabs() { try { localStorage.setItem(tabsKey(), JSON.stringify({ ids: tabs.map((t) => t.session.id), active: active ? active.session.id : null })); } catch (e) { /* ignore */ } }
+  function renderTabBar() {
+    const bar = $('#chat-tabs');
+    bar.innerHTML = '';
+    for (const t of tabs) {
+      const b = el('div', { class: 'ctab' + (t === active ? ' active' : '') + (t.run ? ' busy' : '') + (t.attention ? ' attention' : ''), title: t.session.title, onclick: () => switchTo(t) },
+        el('span', { class: 'ct-dot' }), el('span', { class: 'ct-title', text: t.session.title || 'New chat' }),
+        el('span', { class: 'ct-x', text: '✕', title: 'Close tab', onclick: (e) => { e.stopPropagation(); closeTab(t); } }));
+      b.addEventListener('auxclick', (e) => { if (e.button === 1) closeTab(t); });
+      bar.append(b);
+    }
+    const act = bar.querySelector('.ctab.active');
+    if (act) act.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
-
-  // ------------------------------------------------------------------ sessions
-  C.sessionId = () => (session ? session.id : '');
-  const sessionKey = () => 'forge.session.' + F.folder;
-  async function loadSession(id) {
-    if (run) { toast('A run is still active in this chat.', 'error'); return; }
-    try {
-      const s = await get('/api/session', { id });
-      if (s.workspace && s.workspace !== F.folder) {
-        // A chat always works in its own folder, like in Cursor: switch this window to that folder.
-        F.goToFolder(s.workspace, s.id);
-        return;
-      }
-      session = s;
-      transcript = session.transcript || [];
-      try { localStorage.setItem(sessionKey(), session.id); } catch (e) { /* storage blocked */ }
-      $('#chat-title-text').textContent = session.title || 'New chat';
-      renderTranscript();
-    } catch (e) { await newChat(); }
+  function switchTo(tab) {
+    if (active === tab) return;
+    if (active) { active.scroll = host.scrollTop; active.draft = promptEl.value; active.pane.classList.add('hidden'); }
+    active = tab;
+    tab.attention = false;
+    tab.pane.classList.remove('hidden');
+    promptEl.value = tab.draft || '';
+    autoGrow();
+    $('#chat-empty').classList.toggle('hidden', tab.transcript.length > 0);
+    renderTabBar(); renderContexts(); renderQueue(); refreshComposer(); loadModelPicker();
+    host.scrollTop = tab.scroll || host.scrollHeight;
+    saveTabs();
+    loadHistory($('#history'));
+  }
+  function addTab(session, activate) {
+    const existing = tabs.find((t) => t.session.id === session.id);
+    if (existing) { if (activate) switchTo(existing); return existing; }
+    const t = new Tab(session);
+    tabs.push(t);
+    if (activate || !active) switchTo(t); else renderTabBar();
+    saveTabs();
+    return t;
+  }
+  async function closeTab(tab) {
+    if (tab.run && !confirm('This chat is still working. Stop it and close the tab?')) return;
+    if (tab.run) await stopRun(tab);
+    const i = tabs.indexOf(tab);
+    tabs.splice(i, 1);
+    tab.pane.remove();
+    if (active === tab) { active = null; if (tabs.length) switchTo(tabs[Math.max(0, i - 1)]); else await newChat(); }
+    renderTabBar(); saveTabs();
+  }
+  async function openChat(id) {
+    const open = tabs.find((t) => t.session.id === id);
+    if (open) return switchTo(open);
+    const s = await get('/api/session', { id });
+    if (s.workspace && s.workspace !== F.folder) { F.goToFolder(s.workspace, s.id); return; }
+    addTab(s, true);
   }
   async function newChat() {
-    if (run) stopRun();
-    session = await post('/api/session/new', {});
-    transcript = [];
-    try { localStorage.setItem(sessionKey(), session.id); } catch (e) { /* storage blocked */ }
-    $('#chat-title-text').textContent = 'New chat';
-    renderTranscript();
-    contexts = []; renderContexts();
+    const s = await post('/api/session/new', {});
+    addTab(s, true);
     promptEl.focus();
     if (F.ui.chat === false) F.toggle('chat');
     loadHistory($('#history'));
   }
   C.newChat = newChat;
-  async function saveTranscript() {
-    if (!session) return;
-    try { await post('/api/session/transcript', { id: session.id, transcript, title: session.title }); } catch (e) { /* ignore */ }
+  C.nextTab = (dir) => { if (tabs.length < 2) return; const i = tabs.indexOf(active); switchTo(tabs[(i + dir + tabs.length) % tabs.length]); };
+  C.closeActiveTab = () => { if (active) closeTab(active); };
+  C.sessionId = () => (active ? active.session.id : '');
+  async function saveTranscript(tab) {
+    try { await post('/api/session/transcript', { id: tab.session.id, transcript: tab.transcript, title: tab.session.title }); } catch (e) { /* ignore */ }
   }
-  async function loadHistory(host) {
-    if (!host) return;
+
+  // ================================================================== chat history (sidebar)
+  async function loadHistory(hostEl) {
+    if (!hostEl) return;
     const all = !!F.ui.chatsAll;
     const scopeBtn = $('#btn-chats-scope');
     if (scopeBtn) scopeBtn.textContent = all ? 'All folders' : 'This folder';
     try {
       const r = await get('/api/sessions', all ? { all: '1' } : null);
-      host.innerHTML = '';
-      if (!r.sessions.length) { host.append(el('div', { class: 'muted pad', text: all ? 'No chats yet.' : 'No chats in this folder yet. Chats from your other folders are under "This folder", switched to "All folders".' })); return; }
+      hostEl.innerHTML = '';
+      if (!r.sessions.length) { hostEl.append(el('div', { class: 'muted pad', text: all ? 'No chats yet.' : 'No chats in this folder yet.' })); return; }
       const groups = new Map();
       for (const s of r.sessions) { const k = s.workspace || ''; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(s); }
       const keys = [...groups.keys()].sort((a, b) => (a === F.folder ? -1 : b === F.folder ? 1 : 0));
       for (const folder of keys) {
-        if (all) host.append(el('div', { class: 'hist-folder', title: folder }, el('span', { text: F.folderName(folder) + (folder === F.folder ? ' (this window)' : '') }), el('span', { class: 'hf-path', text: folder })));
+        if (all) hostEl.append(el('div', { class: 'hist-folder', title: folder }, el('span', { text: F.folderName(folder) + (folder === F.folder ? ' (this window)' : '') }), el('span', { class: 'hf-path', text: folder })));
         for (const s of groups.get(folder)) {
           const other = s.workspace && s.workspace !== F.folder;
-          const row = el('div', { class: 'hist' + (session && s.id === session.id ? ' active' : ''), title: s.title + '\n' + (s.workspace || ''),
-                                  onclick: () => (other ? F.goToFolder(s.workspace, s.id) : loadSession(s.id)) },
-            el('span', { class: 'ht', text: s.title }),
-            el('span', { class: 'hd', text: timeAgo(s.updated) }),
+          const isOpen = tabs.some((t) => t.session.id === s.id);
+          hostEl.append(el('div', { class: 'hist' + (active && s.id === active.session.id ? ' active' : '') + (isOpen ? ' open' : ''), title: s.title + '\n' + (s.workspace || ''), onclick: () => (other ? F.goToFolder(s.workspace, s.id) : openChat(s.id)) },
+            el('span', { class: 'ht', text: s.title }), el('span', { class: 'hd', text: timeAgo(s.updated) }),
             el('span', { class: 'hw', text: '↗', title: 'Open in a new window', onclick: (e) => { e.stopPropagation(); F.newWindow(s.workspace || F.folder, s.id); } }),
-            el('span', { class: 'hx', text: '✕', title: 'Delete chat', onclick: async (e) => { e.stopPropagation(); if (!confirm('Delete chat "' + s.title + '"?')) return; await post('/api/session/delete', { id: s.id }); if (session && session.id === s.id) await newChat(); else loadHistory(host); } }));
-          host.append(row);
+            el('span', { class: 'hx', text: '✕', title: 'Delete chat', onclick: async (e) => {
+              e.stopPropagation(); if (!confirm('Delete chat "' + s.title + '"?')) return;
+              const t = tabs.find((x) => x.session.id === s.id); if (t) await closeTab(t);
+              await post('/api/session/delete', { id: s.id }); loadHistory(hostEl);
+            } })));
         }
       }
-    } catch (e) { host.innerHTML = '<div class="muted pad">' + esc(e.message) + '</div>'; }
+    } catch (e) { hostEl.innerHTML = '<div class="muted pad">' + esc(e.message) + '</div>'; }
   }
-  { const b = document.querySelector('#btn-chats-scope'); if (b) b.onclick = () => { F.ui.chatsAll = !F.ui.chatsAll; try { localStorage.setItem('forge.ui', JSON.stringify(F.ui)); } catch (e) { /* ignore */ } loadHistory($('#history')); }; }
   C.loadHistory = loadHistory;
-  function timeAgo(ts) {
-    const d = (Date.now() / 1000 - ts);
-    if (d < 60) return 'now'; if (d < 3600) return Math.floor(d / 60) + 'm'; if (d < 86400) return Math.floor(d / 3600) + 'h'; return Math.floor(d / 86400) + 'd';
-  }
+  { const b = $('#btn-chats-scope'); if (b) b.onclick = () => { F.ui.chatsAll = !F.ui.chatsAll; try { localStorage.setItem('forge.ui', JSON.stringify(F.ui)); } catch (e) { /* ignore */ } loadHistory($('#history')); }; }
+  function timeAgo(ts) { const d = Date.now() / 1000 - ts; if (d < 60) return 'now'; if (d < 3600) return Math.floor(d / 60) + 'm'; if (d < 86400) return Math.floor(d / 3600) + 'h'; return Math.floor(d / 86400) + 'd'; }
   $('#btn-new-chat').onclick = newChat;
   $('#btn-new-chat-side').onclick = newChat;
   $('#btn-chat-history').onclick = () => F.showView('history');
-  C.resetContext = async () => { if (!session) return; await post('/api/session/reset', { id: session.id }); toast('Model context reset for this chat; the transcript stays.', 'ok'); };
-  C.prewarm = async () => { if (!session) return; await post('/api/prewarm', { session_id: session.id }); toast('Warming up the model in the background.', 'ok'); };
+  C.resetContext = async () => { if (!active) return; await post('/api/session/reset', { id: active.session.id }); toast('Model context reset for this chat; the transcript stays.', 'ok'); };
+  C.prewarm = async () => { if (!active) return; await post('/api/prewarm', { session_id: active.session.id }); toast('Warming up the model in the background.', 'ok'); };
 
-  // ------------------------------------------------------------------ context chips
+  // ================================================================== export and Restore checkpoint
+  function transcriptMarkdown(tab) {
+    const out = ['# ' + (tab.session.title || 'Chat'), '', 'Folder: ' + F.folder, ''];
+    for (const t of tab.transcript) {
+      if (t.role === 'user') {
+        out.push('## You', '', t.text);
+        const shown = (t.attachments || []).filter((a) => a.kind !== 'editor'); if (shown.length) out.push('', 'Attached: ' + shown.map(contextLabel).join(', '));
+        out.push('');
+      } else {
+        out.push('## Forge', '');
+        for (const b of t.blocks || []) {
+          if (b.type === 'text') out.push(b.text, '');
+          else if (b.type === 'thinking') out.push('> Thought process: ' + b.text.replace(/\n/g, ' '), '');
+          else if (b.type === 'tool') out.push('Tool: ' + (TOOL_LABELS[b.name] || b.name) + ' ' + argSummary(b.name, b.arguments) + (b.result ? '\n```\n' + String(b.result).slice(0, 1500) + '\n```' : ''), '');
+          else if (b.type === 'todos') out.push('To-do list:', ...b.todos.map((x) => '- [' + (x.status === 'completed' ? 'x' : ' ') + '] ' + x.content), '');
+          else if (b.type === 'status') out.push('_' + b.text + '_', '');
+        }
+      }
+    }
+    return out.join('\n');
+  }
+  C.exportChat = async () => {
+    if (!active) return;
+    try { const r = await post('/api/session/export', { id: active.session.id, markdown: transcriptMarkdown(active) }); toast('Saved to ' + r.path, 'ok', 6000); } catch (e) { toast(e.message, 'error'); }
+  };
+  async function restoreCheckpoint(tab, turn) {
+    if (tab.run) return toast('Wait until this chat has finished, or stop it first.', 'error');
+    if (!confirm('Restore to before this message? File changes from this message onward are undone, and the chat continues from here with your message back in the input box.')) return;
+    try {
+      const r = await post('/api/session/rewind', { id: tab.session.id, run_id: turn.run_id });
+      const i = tab.transcript.indexOf(turn);
+      tab.transcript = tab.transcript.slice(0, i);
+      tab.render();
+      await saveTranscript(tab);
+      for (const m of r.messages || []) { const p = (m.match(/^(?:Restored|Removed) (\S+)/) || [])[1]; if (p) F.refreshFile(p); }
+      F.loadTree(); F.loadChanges && F.loadChanges();
+      if (tab === active) {
+        promptEl.value = turn.text; autoGrow();
+        tab.contexts = (turn.attachments || []).filter((a) => a.kind !== 'editor'); renderContexts();
+        $('#chat-empty').classList.toggle('hidden', tab.transcript.length > 0);
+      }
+      toast('Restored. ' + (r.messages || []).length + ' file change(s) undone.', 'ok');
+    } catch (e) { toast(e.message, 'error'); }
+  }
+
+  // ================================================================== context chips and attachments
   function renderContexts() {
-    const host = $('#context-chips');
-    host.innerHTML = '';
-    contexts.forEach((c, i) => {
-      const label = c.kind === 'selection' ? c.path + ':' + c.start + '-' + c.end : c.kind === 'terminal' ? 'Terminal output' : (c.path || c.title);
+    const hostEl = $('#context-chips');
+    hostEl.innerHTML = '';
+    if (!active) return;
+    active.contexts.forEach((c, i) => {
+      const remove = el('span', { class: 'x', text: '✕', onclick: () => { active.contexts.splice(i, 1); renderContexts(); } });
       if (c.kind === 'image') {
-        host.append(el('span', { class: 'cchip img' + (c.busy ? ' busy' : ''), title: (c.name || 'image') + (c.busy ? ' (uploading)' : '') },
-          c.url ? el('img', { src: c.url, alt: '', onclick: () => openLightbox(c.url) }) : el('span', { text: '…' }),
-          el('span', { class: 'n', text: c.name || 'image' }), el('span', { class: 'x', text: '✕', onclick: () => { contexts.splice(i, 1); renderContexts(); } })));
+        hostEl.append(el('span', { class: 'cchip img' + (c.busy ? ' busy' : ''), title: (c.name || 'image') + (c.busy ? ' (uploading)' : '') },
+          c.url ? el('img', { src: c.url, alt: '', onclick: () => openLightbox(c.url) }) : el('span', { text: '…' }), el('span', { class: 'n', text: c.name || 'image' }), remove));
         return;
       }
-      host.append(el('span', { class: 'cchip', title: label }, c.kind === 'file' ? F.fileIcon(c.path) : el('span', { text: c.kind === 'selection' ? '⌶' : '▣' }), el('span', { class: 'n', text: label }), el('span', { class: 'x', text: '✕', onclick: () => { contexts.splice(i, 1); renderContexts(); } })));
+      const icon = c.kind === 'file' ? F.fileIcon(c.path) : c.kind === 'upload' ? F.fileIcon(c.name) : el('span', { text: { selection: '⌶', upload: '📎', docs: '📚', chat: '💬', folder: '📁', codebase: '🔍', web: '🌐', git: '⎇', terminal: '▣' }[c.kind] || '▣' });
+      hostEl.append(el('span', { class: 'cchip' + (c.busy ? ' busy' : ''), title: contextLabel(c) + (c.bytes ? ' (' + Math.round(c.bytes / 1024) + ' KB)' : '') }, icon, el('span', { class: 'n', text: contextLabel(c) }), remove));
     });
   }
-  C.addFileContext = (path) => { if (!contexts.some((c) => c.kind === 'file' && c.path === path)) contexts.push({ kind: 'file', path }); renderContexts(); if (F.ui.chat === false) F.toggle('chat'); promptEl.focus(); };
+  const ctxs = () => (active ? active.contexts : []);
+  C.addFileContext = (path) => { if (!ctxs().some((c) => c.kind === 'file' && c.path === path)) ctxs().push({ kind: 'file', path }); renderContexts(); if (F.ui.chat === false) F.toggle('chat'); promptEl.focus(); };
   C.addSelectionAndFocus = () => {
     const ed = F.editor;
     if (ed && F.activePath) {
-      const sel = ed.getSelection();
-      const model = ed.getModel();
-      if (sel && !sel.isEmpty()) {
-        contexts.push({ kind: 'selection', path: F.activePath, start: sel.startLineNumber, end: sel.endLineNumber, text: model.getValueInRange(sel), language: model.getLanguageId() });
-      } else C.addFileContext(F.activePath);
+      const sel = ed.getSelection(), model = ed.getModel();
+      if (sel && !sel.isEmpty()) ctxs().push({ kind: 'selection', path: F.activePath, start: sel.startLineNumber, end: sel.endLineNumber, text: model.getValueInRange(sel), language: model.getLanguageId() });
+      else C.addFileContext(F.activePath);
       renderContexts();
     }
     if (F.ui.chat === false) F.toggle('chat');
     promptEl.focus();
   };
-  C.addTerminalContext = (text) => { contexts = contexts.filter((c) => c.kind !== 'terminal'); contexts.push({ kind: 'terminal', text }); renderContexts(); promptEl.focus(); };
-  C.insertText = (t) => { promptEl.value += t; promptEl.focus(); };
-  C.sendMessage = (text, mode, attach) => { if (attach) contexts.push(attach); if (mode) $('#mode-select').value = mode; promptEl.value = text; if (F.ui.chat === false) F.toggle('chat'); send(); };
+  C.addTerminalContext = (text) => { if (!active) return; active.contexts = active.contexts.filter((c) => c.kind !== 'terminal'); active.contexts.push({ kind: 'terminal', text }); renderContexts(); promptEl.focus(); };
+  C.addContext = (c) => { ctxs().push(c); renderContexts(); if (F.ui.chat === false) F.toggle('chat'); promptEl.focus(); };
+  C.insertText = (t) => { promptEl.value += t; promptEl.focus(); promptEl.dispatchEvent(new Event('input')); };
+  C.sendMessage = (text, mode, attach) => { if (attach) ctxs().push(attach); if (mode) $('#mode-select').value = mode; promptEl.value = text; if (F.ui.chat === false) F.toggle('chat'); send(); };
   C.quickAsk = (text, mode) => { C.addSelectionAndFocus(); if (mode) $('#mode-select').value = mode; promptEl.value = text; send(); };
   $('#btn-add-selection').onclick = C.addSelectionAndFocus;
 
-  // ------------------------------------------------------------------ images: paste, drop or pick, like in Cursor
+  const readDataUrl = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(file); });
   async function addImageFile(file) {
-    if (!file || !/^image\/(png|jpeg|gif|webp)$/.test(file.type)) { toast('Only PNG, JPEG, GIF and WebP images can be attached.', 'error'); return; }
+    if (!file || !/^image\/(png|jpeg|gif|webp)$/.test(file.type)) return addAnyFile(file);
     if (file.size > 15 * 1024 * 1024) { toast('That image is larger than 15 MB.', 'error'); return; }
     const chip = { kind: 'image', name: file.name && file.name !== 'image.png' ? file.name : 'Screenshot', busy: true };
-    contexts.push(chip); renderContexts();
+    ctxs().push(chip); renderContexts();
     try {
-      const dataUrl = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(file); });
-      const meta = await post('/api/image', { data: dataUrl, name: chip.name });
+      const meta = await post('/api/image', { data: await readDataUrl(file), name: chip.name });
       Object.assign(chip, { id: meta.id, url: meta.url, width: meta.width, height: meta.height, busy: false });
-    } catch (e) {
-      contexts.splice(contexts.indexOf(chip), 1);
-      toast('Could not attach the image: ' + e.message, 'error');
-    }
-    renderContexts();
-    if (F.ui.chat === false) F.toggle('chat');
-    promptEl.focus();
+    } catch (e) { ctxs().splice(ctxs().indexOf(chip), 1); toast('Could not attach the image: ' + e.message, 'error'); }
+    renderContexts(); if (F.ui.chat === false) F.toggle('chat'); promptEl.focus();
   }
-  C.addImageFile = addImageFile;
+  /** The attachment button: any file. Images go to the vision helper; text, code and PDFs are read for the model. */
+  async function addAnyFile(file) {
+    if (!file) return;
+    if (/^image\/(png|jpeg|gif|webp)$/.test(file.type)) return addImageFile(file);
+    if (file.size > 25 * 1024 * 1024) { toast(file.name + ' is larger than 25 MB.', 'error'); return; }
+    const chip = { kind: 'upload', name: file.name || 'file', busy: true, bytes: file.size };
+    ctxs().push(chip); renderContexts();
+    try {
+      const meta = await post('/api/attachment', { data: await readDataUrl(file), name: chip.name });
+      if (meta.kind === 'image') Object.assign(chip, { kind: 'image', id: meta.id, url: meta.url, busy: false });
+      else Object.assign(chip, { id: meta.id, fileKind: meta.kind, busy: false });
+      if (meta.kind === 'binary') toast(chip.name + ' cannot be read as text; the agent can still find it by path.', 'error', 6000);
+    } catch (e) { ctxs().splice(ctxs().indexOf(chip), 1); toast('Could not attach ' + chip.name + ': ' + e.message, 'error'); }
+    renderContexts(); if (F.ui.chat === false) F.toggle('chat'); promptEl.focus();
+  }
+  C.addImageFile = addImageFile; C.addAnyFile = addAnyFile;
   $('#btn-add-image').onclick = () => $('#image-input').click();
   $('#image-input').addEventListener('change', (e) => { for (const f of e.target.files) addImageFile(f); e.target.value = ''; });
-  function imagesFrom(dt) {
+  $('#btn-attach').onclick = () => $('#attach-input').click();
+  $('#attach-input').addEventListener('change', (e) => { for (const f of e.target.files) addAnyFile(f); e.target.value = ''; });
+  function filesFrom(dt) {
     const out = [];
     if (!dt) return out;
-    for (const it of dt.items || []) if (it.kind === 'file' && it.type.startsWith('image/')) { const f = it.getAsFile(); if (f) out.push(f); }
-    if (!out.length) for (const f of dt.files || []) if (f.type.startsWith('image/')) out.push(f);
+    for (const it of dt.items || []) if (it.kind === 'file') { const f = it.getAsFile(); if (f) out.push(f); }
+    if (!out.length) for (const f of dt.files || []) out.push(f);
     return out;
   }
-  promptEl.addEventListener('paste', (e) => {
-    const files = imagesFrom(e.clipboardData);
-    if (files.length) { e.preventDefault(); for (const f of files) addImageFile(f); }
-  });
+  promptEl.addEventListener('paste', (e) => { const files = filesFrom(e.clipboardData); if (files.length) { e.preventDefault(); for (const f of files) addAnyFile(f); } });
   let dragDepth = 0;
   const chatEl = $('#chat');
   chatEl.addEventListener('dragenter', (e) => { if ([...(e.dataTransfer.types || [])].includes('Files')) { dragDepth++; $('#drop-hint').classList.remove('hidden'); } });
   chatEl.addEventListener('dragleave', () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) $('#drop-hint').classList.add('hidden'); });
   chatEl.addEventListener('dragover', (e) => { if ([...(e.dataTransfer.types || [])].includes('Files')) e.preventDefault(); });
-  chatEl.addEventListener('drop', (e) => {
-    dragDepth = 0; $('#drop-hint').classList.add('hidden');
-    const files = imagesFrom(e.dataTransfer);
-    if (files.length) { e.preventDefault(); for (const f of files) addImageFile(f); }
-  });
+  chatEl.addEventListener('drop', (e) => { dragDepth = 0; $('#drop-hint').classList.add('hidden'); const files = filesFrom(e.dataTransfer); if (files.length) { e.preventDefault(); for (const f of files) addAnyFile(f); } });
   $('#btn-add-context').onclick = () => { promptEl.focus(); promptEl.value += (promptEl.value && !promptEl.value.endsWith(' ') ? ' ' : '') + '@'; promptEl.dispatchEvent(new Event('input')); };
   for (const b of $$('.tip')) b.onclick = () => { promptEl.value = b.dataset.tip; if (F.activePath && /current file/.test(b.dataset.tip)) C.addFileContext(F.activePath); promptEl.focus(); };
 
-  // @mentions
+  function lintText() {
+    const lines = [];
+    const all = window.ForgeLSP ? window.ForgeLSP.allDiagnostics() : new Map();
+    const sev = ['', 'error', 'warning', 'info', 'hint'];
+    for (const [path, diags] of all) for (const d of diags) lines.push(path + ':' + (d.range.start.line + 1) + ': ' + (sev[d.severity || 1] || 'error') + ': ' + d.message + (d.source ? ' (' + d.source + ')' : ''));
+    const syn = window.ForgeExtras && window.ForgeExtras.problemTexts ? window.ForgeExtras.problemTexts() : [];
+    return lines.concat(syn).join('\n');
+  }
+  function addLints() {
+    const t = lintText();
+    if (!t) { toast('There are no linter errors right now.', 'ok'); return false; }
+    ctxs().push({ kind: 'text', title: 'Linter errors', text: t, path: 'Linter errors' }); renderContexts();
+    return true;
+  }
+
+  // ================================================================== @ menu and / commands
+  let cache = { at: 0, docs: [], chats: [], commands: [] };
+  async function refreshCache() {
+    if (Date.now() - cache.at < 10000) return;
+    try { const [d, s, c] = await Promise.all([get('/api/docs'), get('/api/sessions'), get('/api/commands')]); cache = { at: Date.now(), docs: d.docs || [], chats: s.sessions || [], commands: c.commands || [] }; } catch (e) { /* keep */ }
+  }
   promptEl.addEventListener('input', async () => {
     const v = promptEl.value, pos = promptEl.selectionStart;
+    autoGrow();
+    if (/^\/[\w-]*$/.test(v.slice(0, pos)) && !v.slice(0, pos).includes(' ')) {
+      await refreshCache();
+      const q = v.slice(1, pos).toLowerCase();
+      menu = { kind: 'slash', start: 0, sel: 0, items: cache.commands.filter((c) => c.name.startsWith(q) || !q).map((c) => ({ label: '/' + c.name, hint: c.description, cmd: c })) };
+      return renderMenu();
+    }
     const at = v.lastIndexOf('@', pos - 1);
     if (at >= 0 && (at === 0 || /\s/.test(v[at - 1])) && !/\s/.test(v.slice(at + 1, pos))) {
-      mentionStart = at;
-      const q = v.slice(at + 1, pos);
-      try {
-        const r = await get('/api/files', { q });
-        const special = [
-          { label: 'codebase', hint: 'ranked search of the whole workspace for this message', kind: 'codebase' },
-          { label: 'web', hint: 'web search results for this message', kind: 'web' },
-          { label: 'git', hint: 'uncommitted git changes', kind: 'git' },
-          { label: 'terminal', hint: 'recent output of the active terminal', kind: 'terminal' },
-        ].filter((x) => !q || x.label.startsWith(q.toLowerCase()));
-        const pads = (window.ForgeExtras ? window.ForgeExtras.notepads() : []).filter((n) => !q || n.name.toLowerCase().includes(q.toLowerCase())).map((n) => ({ label: 'notepad: ' + n.name, hint: n.text.slice(0, 60), kind: 'notepad', pad: n }));
-        mentionItems = [...special, ...pads, ...r.files.slice(0, 10).map((f) => ({ label: f }))];
-        if (F.activePath && !q) mentionItems.splice(special.length, 0, { label: F.activePath, hint: 'current file' });
-        mentionSel = 0; renderMentions();
-      } catch (e) { hideMentions(); }
-    } else hideMentions();
-    autoGrow();
+      const q = v.slice(at + 1, pos).toLowerCase();
+      await refreshCache();
+      let files = [];
+      try { files = (await get('/api/files', { q })).files || []; } catch (e) { /* offline */ }
+      const folders = [...new Set(files.map((f) => f.includes('/') ? f.slice(0, f.lastIndexOf('/')) : '').filter(Boolean))].slice(0, 4);
+      const items = [
+        { label: 'codebase', hint: 'the most relevant code in this project', kind: 'codebase' },
+        { label: 'web', hint: 'web search results for your message', kind: 'web' },
+        { label: 'git', hint: 'your uncommitted changes', kind: 'git' },
+        { label: 'terminal', hint: 'recent output of the active terminal', kind: 'terminal' },
+        { label: 'linter errors', hint: 'errors and warnings from the language servers', kind: 'lints' },
+        ...cache.docs.filter((d) => d.status === 'ready').map((d) => ({ label: 'docs: ' + d.name, hint: d.url, kind: 'docs', name: d.name })),
+        { label: 'docs: add new documentation…', hint: 'index a documentation site for @Docs', kind: 'docs-add' },
+        ...cache.chats.filter((s) => (!active || s.id !== active.session.id) && s.title !== 'New chat').slice(0, 8).map((s) => ({ label: 'chat: ' + s.title, hint: 'an earlier chat in this folder', kind: 'chat', id: s.id, title: s.title })),
+        ...(window.ForgeExtras ? window.ForgeExtras.notepads() : []).map((n) => ({ label: 'notepad: ' + n.name, hint: n.text.slice(0, 60), kind: 'notepad', pad: n })),
+        ...folders.map((f) => ({ label: 'folder: ' + f, hint: 'files and relevant code in this folder', kind: 'folder', path: f })),
+      ].filter((x) => !q || x.label.toLowerCase().includes(q));
+      if (F.activePath && !q) items.unshift({ label: F.activePath, hint: 'current file' });
+      menu = { kind: 'at', start: at, sel: 0, items: [...items, ...files.slice(0, 10).map((f) => ({ label: f }))].slice(0, 40) };
+      return renderMenu();
+    }
+    hideMenu();
   });
-  function renderMentions() {
+  function renderMenu() {
     const m = $('#mention-menu');
     m.innerHTML = '';
-    if (!mentionItems.length) return hideMentions();
+    if (!menu.items.length) return hideMenu();
     m.classList.remove('hidden');
-    mentionItems.forEach((it, i) => m.append(el('div', { class: 'mi' + (i === mentionSel ? ' sel' : ''), onmousedown: (e) => { e.preventDefault(); pickMention(i); } }, el('span', { text: it.label.split('/').pop() }), el('span', { class: 'd', text: it.hint || it.label }))));
+    menu.items.forEach((it, i) => m.append(el('div', { class: 'mi' + (i === menu.sel ? ' sel' : ''), onmousedown: (e) => { e.preventDefault(); pickMenu(i); } },
+      el('span', { text: it.kind || it.cmd ? it.label : it.label.split('/').pop() }), el('span', { class: 'd', text: it.hint || it.label }))));
+    const sel = m.querySelector('.mi.sel'); if (sel) sel.scrollIntoView({ block: 'nearest' });
   }
-  function hideMentions() { $('#mention-menu').classList.add('hidden'); mentionItems = []; mentionStart = -1; }
-  function pickMention(i) {
-    const it = mentionItems[i];
+  function hideMenu() { $('#mention-menu').classList.add('hidden'); menu = { items: [], sel: 0, start: -1, kind: null }; }
+  async function pickMenu(i) {
+    const it = menu.items[i];
     if (!it) return;
+    if (menu.kind === 'slash') { hideMenu(); promptEl.value = ''; return runCommand(it.cmd, ''); }
     const v = promptEl.value, pos = promptEl.selectionStart;
-    promptEl.value = v.slice(0, mentionStart) + v.slice(pos);
-    promptEl.selectionStart = promptEl.selectionEnd = mentionStart;
-    if (it.kind === 'terminal') C.addTerminalContext(window.ForgeTerm ? window.ForgeTerm.activeOutput() : '');
-    else if (it.kind === 'notepad') { contexts.push({ kind: 'text', title: 'Notepad: ' + it.pad.name, text: it.pad.text, path: 'notepad: ' + it.pad.name }); renderContexts(); }
-    else if (it.kind) { if (!contexts.some((c) => c.kind === it.kind)) contexts.push({ kind: it.kind, path: '@' + it.kind }); renderContexts(); }
-    else C.addFileContext(it.label);
-    hideMentions();
+    promptEl.value = v.slice(0, menu.start) + v.slice(pos);
+    promptEl.selectionStart = promptEl.selectionEnd = menu.start;
+    hideMenu();
+    if (it.kind === 'terminal') return C.addTerminalContext(window.ForgeTerm ? window.ForgeTerm.activeOutput() : '');
+    if (it.kind === 'notepad') { ctxs().push({ kind: 'text', title: 'Notepad: ' + it.pad.name, text: it.pad.text, path: 'notepad: ' + it.pad.name }); return renderContexts(); }
+    if (it.kind === 'lints') return addLints();
+    if (it.kind === 'docs') { ctxs().push({ kind: 'docs', name: it.name }); return renderContexts(); }
+    if (it.kind === 'docs-add') return addDocsDialog();
+    if (it.kind === 'chat') { ctxs().push({ kind: 'chat', id: it.id, title: it.title }); return renderContexts(); }
+    if (it.kind === 'folder') { ctxs().push({ kind: 'folder', path: it.path }); return renderContexts(); }
+    if (it.kind) { if (!ctxs().some((c) => c.kind === it.kind)) ctxs().push({ kind: it.kind, path: '@' + it.kind }); return renderContexts(); }
+    C.addFileContext(it.label);
+  }
+  async function addDocsDialog() {
+    const url = prompt('Address of the documentation to index for @Docs (for example https://docs.python.org/3/library/):');
+    if (!url) return;
+    const name = prompt('A short name for it:', new URL(url).hostname.split('.').slice(-2, -1)[0] || 'docs');
+    if (!name) return;
+    try { await post('/api/docs', { action: 'add', name, url }); cache.at = 0; toast('Indexing ' + name + ' in the background. It appears under @docs when ready.', 'ok', 6000); } catch (e) { toast(e.message, 'error'); }
+  }
+  C.addDocsDialog = addDocsDialog;
+  /** Slash commands: built-in actions run at once; prompt commands fill the input so you can add details. */
+  async function runCommand(cmd, rest) {
+    const n = cmd.name;
+    if (n === 'new') return newChat();
+    if (n === 'reset') return C.resetContext();
+    if (n === 'export') return C.exportChat();
+    if (n === 'plan' || n === 'ask' || n === 'agent') { $('#mode-select').value = n; localStorage.setItem('forge.mode', n); toast(n[0].toUpperCase() + n.slice(1) + ' mode', 'ok', 1200); return; }
+    if (n === 'review' && !ctxs().some((c) => c.kind === 'git')) ctxs().push({ kind: 'git', path: '@git' });
+    if ((n === 'explain' || n === 'tests') && F.activePath) C.addSelectionAndFocus();
+    if (n === 'fix-lints' && !addLints()) return;
+    renderContexts();
+    promptEl.value = (cmd.prompt || '').trim() + (rest ? '\n\n' + rest : '');
+    autoGrow(); promptEl.focus();
   }
   function autoGrow() { promptEl.style.height = 'auto'; promptEl.style.height = Math.min(240, Math.max(64, promptEl.scrollHeight)) + 'px'; }
   promptEl.addEventListener('keydown', (e) => {
-    if (mentionItems.length) {
-      if (e.key === 'ArrowDown') { mentionSel = (mentionSel + 1) % mentionItems.length; renderMentions(); e.preventDefault(); return; }
-      if (e.key === 'ArrowUp') { mentionSel = (mentionSel - 1 + mentionItems.length) % mentionItems.length; renderMentions(); e.preventDefault(); return; }
-      if (e.key === 'Enter' || e.key === 'Tab') { pickMention(mentionSel); e.preventDefault(); return; }
-      if (e.key === 'Escape') { hideMentions(); e.preventDefault(); return; }
+    if (menu.items.length) {
+      if (e.key === 'ArrowDown') { menu.sel = (menu.sel + 1) % menu.items.length; renderMenu(); e.preventDefault(); return; }
+      if (e.key === 'ArrowUp') { menu.sel = (menu.sel - 1 + menu.items.length) % menu.items.length; renderMenu(); e.preventDefault(); return; }
+      if (e.key === 'Enter' || e.key === 'Tab') { pickMenu(menu.sel); e.preventDefault(); return; }
+      if (e.key === 'Escape') { hideMenu(); e.preventDefault(); return; }
     }
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
-    else if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && F.settings.enter_sends !== false && !e.isComposing) { e.preventDefault(); send(); }
-    else if (e.key === 'Escape') { if (run) stopRun(); }
+    else if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.isComposing) { e.preventDefault(); send(); }
+    else if (e.key === 'Escape' && active && active.run) stopRun(active);
   });
 
-  // ------------------------------------------------------------------ sending and streaming
-  let initDone = null;   // resolves when the first session exists; send() waits for it
+  // ================================================================== sending, queueing and streaming
+  let initDone = null;
   async function send() {
-    let text = promptEl.value.trim();
-    if (contexts.some((c) => c.busy)) { toast('Wait a moment: an image is still uploading.', 'error'); return; }
-    if (!text && contexts.some((c) => c.kind === 'image')) text = 'Look at the attached image.';
-    if (!text || run) return;
     if (initDone) await initDone;
-    if (!session) await newChat();
-    const mode = $('#mode-select').value;
-    const attachments = contexts.slice();
-    promptEl.value = ''; autoGrow();
-    contexts = []; renderContexts(); hideMentions();
-    showEmpty(false);
-    const userTurn = { role: 'user', text, attachments, ts: Date.now() };
-    transcript.push(userTurn);
-    messagesEl.append(renderUser(userTurn));
-    if (session.title === 'New chat') { session.title = text.slice(0, 60); $('#chat-title-text').textContent = session.title; }
-    const turn = { role: 'assistant', blocks: [], stats: null, mode, ts: Date.now() };
-    transcript.push(turn);
-    const msgEl = newAssistantEl();
-    messagesEl.append(msgEl);
+    if (!active) await newChat();
+    const tab = active;
+    let text = promptEl.value.trim();
+    if (tab.contexts.some((c) => c.busy)) { toast('Wait a moment: an attachment is still uploading.', 'error'); return; }
+    const slash = text.match(/^\/([\w-]+)\s*([\s\S]*)$/);
+    if (slash) {
+      await refreshCache();
+      const cmd = cache.commands.find((c) => c.name === slash[1]);
+      if (cmd && (cmd.builtin || !slash[2])) { promptEl.value = ''; return runCommand(cmd, slash[2]); }
+      if (cmd) text = (cmd.prompt || '').trim() + '\n\n' + slash[2];
+    }
+    // Mentions typed by hand (for example "@codebase" or "@web") work like ones picked from the menu.
+    for (const m of text.matchAll(/(?:^|\s)@(codebase|web|git)\b/g)) if (!tab.contexts.some((c) => c.kind === m[1])) tab.contexts.push({ kind: m[1], path: '@' + m[1] });
+    if (/(?:^|\s)@terminal\b/.test(text) && !tab.contexts.some((c) => c.kind === 'terminal') && window.ForgeTerm) tab.contexts.push({ kind: 'terminal', text: window.ForgeTerm.activeOutput() });
+    if (!text && tab.contexts.some((c) => c.kind === 'image')) text = 'Look at the attached image.';
+    if (!text && tab.contexts.length) text = 'Look at the attached context.';
+    if (!text) return;
+    const item = { text, attachments: tab.contexts.slice(), mode: $('#mode-select').value };
+    // Like Cursor, tell the model which file you are looking at (name and cursor line only, so prompts stay small).
+    const viewing = (window.ForgeSplit && window.ForgeSplit.focused()) ? window.ForgeSplit.activePath() : F.activePath;
+    if (viewing && F.editor && !item.attachments.some((c) => c.path === viewing)) {
+      const pos = (window.ForgeSplit && window.ForgeSplit.focused() ? window.ForgeSplit.editor : F.editor).getPosition();
+      item.attachments.push({ kind: 'editor', path: viewing, line: pos ? pos.lineNumber : null });
+    }
+    promptEl.value = ''; tab.draft = ''; autoGrow();
+    tab.contexts = []; renderContexts(); hideMenu();
+    if (tab.run) { tab.queue.push(item); renderQueue(); toast('Queued. It is sent when the current reply finishes.', 'ok', 1500); return; }
+    startRun(tab, item);
+  }
+  function renderQueue() {
+    const q = $('#queue');
+    q.innerHTML = '';
+    if (!active || !active.queue.length) { q.classList.add('hidden'); return; }
+    q.classList.remove('hidden');
+    active.queue.forEach((it, i) => q.append(el('div', { class: 'qitem' }, el('span', { class: 'qlabel', text: 'Queued' }), el('span', { class: 'qtext', text: it.text, title: it.text }),
+      el('button', { class: 'mini', text: '⏩', title: 'Send now (stops the current reply)', onclick: () => { const [x] = active.queue.splice(i, 1); active.queue.unshift(x); renderQueue(); stopRun(active); } }),
+      el('button', { class: 'mini', text: '✎', title: 'Edit (moves it back to the input box)', onclick: () => { const [x] = active.queue.splice(i, 1); promptEl.value = x.text; active.contexts = x.attachments; renderContexts(); renderQueue(); autoGrow(); } }),
+      el('button', { class: 'mini', text: '✕', title: 'Remove from the queue', onclick: () => { active.queue.splice(i, 1); renderQueue(); } }))));
+  }
+  async function startRun(tab, item) {
+    $('#chat-empty').classList.toggle('hidden', true);
+    const userTurn = { role: 'user', text: item.text, attachments: item.attachments, ts: Date.now() };
+    tab.transcript.push(userTurn);
+    const userEl = renderUser(tab, userTurn);
+    tab.pane.append(userEl);
+    if (tab.session.title === 'New chat') { tab.session.title = item.text.slice(0, 60); renderTabBar(); }
+    const turn = { role: 'assistant', blocks: [], stats: null, mode: item.mode, ts: Date.now() };
+    tab.transcript.push(turn);
+    const msgEl = el('div', { class: 'msg assistant' });
+    tab.pane.append(msgEl);
     const spinner = el('div', { class: 'status-line', text: 'Thinking…' });
     msgEl.append(spinner);
-    scrollToBottom(true);
+    if (tab === active) host.scrollTop = host.scrollHeight;
     let r;
-    try { r = await post('/api/chat', { session_id: session.id, message: text, mode, attachments }); }
-    catch (e) { spinner.textContent = 'Error: ' + e.message; spinner.classList.add('error'); turn.blocks.push({ type: 'status', text: 'Error: ' + e.message, error: true }); return; }
-    run = { id: r.run_id, msgEl, turn, spinner, cur: null, curEl: null, tools: new Map(), files: [], filesEl: null, verboseEls: [] };
-    setBusy(true);
+    try { r = await post('/api/chat', { session_id: tab.session.id, message: item.text, mode: item.mode, attachments: item.attachments, model: tab.session.model_choice || '' }); }
+    catch (e) { spinner.textContent = 'Error: ' + e.message; spinner.classList.add('error'); turn.blocks.push({ type: 'status', text: 'Error: ' + e.message, error: true }); saveTranscript(tab); return; }
+    userTurn.run_id = r.run_id;
+    userEl.replaceWith(renderUser(tab, userTurn));
+    const R = tab.run = { id: r.run_id, tab, msgEl, turn, spinner, cur: null, curEl: null, tools: new Map(), filesEl: null, todosEl: null, pending: false };
+    renderTabBar(); refreshComposer();
     const es = new EventSource('/api/events?run_id=' + r.run_id);
-    run.es = es;
-    es.onmessage = (m) => { try { handleEvent(JSON.parse(m.data)); } catch (e) { console.error(e); } };
-    es.onerror = () => { if (run && run.es === es) { setTimeout(() => { if (run && run.es === es) finishRun('disconnected'); }, 1500); } };
+    R.es = es;
+    es.onmessage = (m) => { try { handleEvent(R, JSON.parse(m.data)); } catch (e) { console.error(e); } };
+    es.onerror = () => { setTimeout(() => { if (tab.run === R && es.readyState === 2) finishRun(R, 'disconnected'); }, 1500); };
   }
   $('#btn-send').onclick = send;
-  $('#btn-stop').onclick = () => stopRun();
-  function setBusy(b) {
-    $('#btn-send').classList.toggle('hidden', b);
-    $('#btn-stop').classList.toggle('hidden', !b);
-    $('#sb-run').textContent = b ? 'Agent working…' : '';
-    $('#sb-run').classList.toggle('busy', b);
+  $('#btn-stop').onclick = () => { if (active) stopRun(active); };
+  function refreshComposer() {
+    const busy = !!(active && active.run);
+    $('#btn-stop').classList.toggle('hidden', !busy);
+    $('#btn-send').title = busy ? 'Queue this message (Enter)' : 'Send (Enter)';
+    $('#btn-send').classList.toggle('queueing', busy);
+    const any = tabs.filter((t) => t.run).length;
+    $('#sb-run').textContent = any ? (any === 1 ? 'Agent working…' : any + ' chats working…') : '';
+    $('#sb-run').classList.toggle('busy', !!any);
   }
-  async function stopRun() {
-    if (!run) return;
-    try { await post('/api/cancel', { run_id: run.id }); } catch (e) { /* ignore */ }
-  }
-  function finishRun(status) {
-    if (!run) return;
-    if (run.es) run.es.close();
-    if (run.spinner) run.spinner.remove();
-    if (run.curEl && run.curEl.classList) { run.curEl.classList.remove('live', 'cursor-blink'); if (run.curEl._label) run.curEl._label.textContent = 'Thought process'; if (run.curEl.tagName === 'DETAILS') run.curEl.open = false; }
-    run = null;
-    setBusy(false);
-    saveTranscript();
+  async function stopRun(tab) { if (tab.run) { try { await post('/api/cancel', { run_id: tab.run.id }); } catch (e) { /* ignore */ } } }
+  function finishRun(R, status) {
+    const tab = R.tab;
+    if (tab.run !== R) return;
+    if (R.es) R.es.close();
+    R.spinner.remove();
+    closeCurrent(R);
+    tab.run = null;
+    if (tab !== active) tab.attention = true;
+    renderTabBar(); refreshComposer();
+    saveTranscript(tab);
     loadHistory($('#history'));
     F.loadChanges && F.loadChanges();
     if (status === 'disconnected') toast('Connection to the Forge server was lost.', 'error');
+    if (tab.queue.length) { const next = tab.queue.shift(); if (tab === active) renderQueue(); setTimeout(() => startRun(tab, next), 300); }
   }
-
-  const flushText = (() => {
-    let pending = false;
-    return () => {
-      if (pending) return;
-      pending = true;
-      requestAnimationFrame(() => {
-        pending = false;
-        if (!run || !run.cur) return;
-        if (run.cur.type === 'text') { run.curEl.innerHTML = md(run.cur.text); colorize(run.curEl); run.curEl.classList.add('cursor-blink'); }
-        else if (run.cur.type === 'thinking') { run.curEl._body.textContent = run.cur.text; }
-        scrollToBottom();
-      });
-    };
-  })();
-
-  function closeCurrent() {
-    if (!run || !run.cur) return;
-    if (run.cur.type === 'text') { run.curEl.innerHTML = md(run.cur.text); colorize(run.curEl); run.curEl.classList.remove('cursor-blink'); if (!run.cur.text.trim()) run.curEl.remove(); }
-    if (run.cur.type === 'thinking') { run.curEl.classList.remove('live'); run.curEl._label.textContent = 'Thought process'; run.curEl.open = false; run.curEl._body.textContent = run.cur.text; }
-    run.cur = null; run.curEl = null;
+  const visible = (R) => R.tab === active;
+  function scrollIfActive(R, force) { if (!visible(R)) return; const near = host.scrollHeight - host.scrollTop - host.clientHeight < 120; if (force || near) host.scrollTop = host.scrollHeight; }
+  function flushText(R) {
+    if (R.pending) return;
+    R.pending = true;
+    requestAnimationFrame(() => {
+      R.pending = false;
+      if (!R.cur) return;
+      if (R.cur.type === 'text') { R.curEl.innerHTML = md(R.cur.text); colorize(R.curEl); R.curEl.classList.add('cursor-blink'); }
+      else if (R.cur.type === 'thinking') R.curEl._body.textContent = R.cur.text;
+      scrollIfActive(R);
+    });
   }
-  function startBlock(type) {
-    closeCurrent();
-    run.spinner.remove();
+  function closeCurrent(R) {
+    if (!R.cur) return;
+    if (R.cur.type === 'text') { R.curEl.innerHTML = md(R.cur.text); colorize(R.curEl); R.curEl.classList.remove('cursor-blink'); if (!R.cur.text.trim()) R.curEl.remove(); }
+    if (R.cur.type === 'thinking') { R.curEl.classList.remove('live'); R.curEl._label.textContent = 'Thought process'; R.curEl.open = false; R.curEl._body.textContent = R.cur.text; }
+    R.cur = null; R.curEl = null;
+  }
+  function startBlock(R, type) {
+    closeCurrent(R);
+    R.spinner.remove();
     const block = { type, text: '' };
-    run.turn.blocks.push(block);
-    run.cur = block;
-    run.curEl = type === 'thinking' ? thinkingBlock('', true) : el('div', { class: 'md cursor-blink' });
-    run.msgEl.append(run.curEl);
-    scrollToBottom();
+    R.turn.blocks.push(block);
+    R.cur = block;
+    R.curEl = type === 'thinking' ? thinkingBlock('', true) : el('div', { class: 'md cursor-blink' });
+    R.msgEl.append(R.curEl);
+    scrollIfActive(R);
   }
   function logVerbose(kind, text) {
     const log = $('#agent-log');
@@ -556,30 +730,24 @@
     while (log.children.length > 2000) log.firstChild.remove();
     log.scrollTop = log.scrollHeight;
   }
-
-  function handleEvent(ev) {
-    if (!run) return;
+  function handleEvent(R, ev) {
+    if (R.tab.run !== R) return;
     switch (ev.type) {
-      case 'thinking_delta':
-        if (!run.cur || run.cur.type !== 'thinking') startBlock('thinking');
-        run.cur.text += ev.text; flushText(); break;
-      case 'text_delta':
-        if (!run.cur || run.cur.type !== 'text') startBlock('text');
-        run.cur.text += ev.text; flushText(); break;
-      case 'tool_call_start':
-        closeCurrent(); break;
+      case 'thinking_delta': if (!R.cur || R.cur.type !== 'thinking') startBlock(R, 'thinking'); R.cur.text += ev.text; flushText(R); break;
+      case 'text_delta': if (!R.cur || R.cur.type !== 'text') startBlock(R, 'text'); R.cur.text += ev.text; flushText(R); break;
+      case 'tool_call_start': closeCurrent(R); break;
       case 'tool_call': {
-        closeCurrent(); run.spinner.remove();
+        closeCurrent(R); R.spinner.remove();
         const t = { type: 'tool', call_id: ev.call_id, name: ev.name, arguments: ev.arguments, state: 'running', result: '' };
-        run.turn.blocks.push(t);
+        R.turn.blocks.push(t);
         const card = toolCard(t);
-        run.tools.set(ev.call_id, { t, card });
-        run.msgEl.append(card); scrollToBottom();
+        R.tools.set(ev.call_id, { t, card });
+        R.msgEl.append(card); scrollIfActive(R);
         logVerbose('tool', ev.name + ' ' + argSummary(ev.name, ev.arguments));
         break;
       }
       case 'tool_result': {
-        const x = run.tools.get(ev.call_id);
+        const x = R.tools.get(ev.call_id);
         if (!x) break;
         x.t.state = ev.ok ? 'ok' : 'fail'; x.t.result = ev.result; x.t.seconds = ev.seconds;
         x.card.classList.remove('running'); x.card.classList.add(ev.ok ? 'ok' : 'fail');
@@ -587,49 +755,50 @@
         x.card._state.textContent = ev.ok ? 'done' + (ev.seconds != null ? ' · ' + ev.seconds + 's' : '') : 'failed';
         if (!ev.ok) x.card.classList.add('open');
         if (window.ForgeExtras && (ev.name === 'write_file' || ev.name === 'edit_file')) window.ForgeExtras.reportCheck((x.t.arguments || {}).path || '', ev.result.includes('SYNTAX CHECK FAILED') ? ev.result.slice(ev.result.indexOf('SYNTAX CHECK FAILED')) : 'Syntax check: OK');
-        if (ev.name === 'write_file' || ev.name === 'edit_file') { F.refreshFile(ev.arguments ? ev.arguments.path : (x.t.arguments || {}).path); F.loadTree(); }
+        if (ev.name === 'write_file' || ev.name === 'edit_file') { F.refreshFile((x.t.arguments || {}).path); F.loadTree(); }
         break;
       }
       case 'file_changed': {
         const ch = { path: ev.path, kind: ev.kind, run_id: ev.run_id };
-        run.files.push(ch);
-        let fb = run.turn.blocks.find((b) => b.type === 'files');
-        if (!fb) { fb = { type: 'files', files: [] }; run.turn.blocks.push(fb); run.filesEl = filesRow(ch.run_id); run.msgEl.append(run.filesEl); }
-        if (!fb.files.some((f) => f.path === ch.path)) { fb.files.push(ch); run.filesEl._chips.append(fileChangeChip(ch)); }
-        else { const i = fb.files.findIndex((f) => f.path === ch.path); fb.files[i] = ch; }
+        let fb = R.turn.blocks.find((b) => b.type === 'files');
+        if (!fb) { fb = { type: 'files', files: [] }; R.turn.blocks.push(fb); R.filesEl = filesRow(ch.run_id); R.msgEl.append(R.filesEl); }
+        if (!fb.files.some((f) => f.path === ch.path)) { fb.files.push(ch); R.filesEl._chips.append(fileChangeChip(ch)); }
+        else fb.files[fb.files.findIndex((f) => f.path === ch.path)] = ch;
         F.refreshFile(ev.path);
+        if (window.ForgeReview) window.ForgeReview.onAgentChange(ev.run_id, ev.path);
+        break;
+      }
+      case 'todos': {
+        let b = R.turn.blocks.find((x) => x.type === 'todos');
+        if (!b) { b = { type: 'todos', todos: [] }; R.turn.blocks.push(b); }
+        b.todos = ev.todos;
+        const fresh = todosBlock(b);
+        if (R.todosEl) R.todosEl.replaceWith(fresh); else R.msgEl.prepend(fresh);
+        R.todosEl = fresh;
         break;
       }
       case 'approval_required': {
-        closeCurrent();
+        closeCurrent(R);
         const a = { type: 'approval', run_id: ev.run_id, approval_id: ev.approval_id, tool: ev.tool, arguments: ev.arguments, reason: ev.reason, decision: null };
-        run.turn.blocks.push(a);
-        run.msgEl.append(approvalCard(a, false)); scrollToBottom(true);
-        if (document.hidden && 'Notification' in window && Notification.permission === 'granted') new Notification('Forge needs your approval', { body: argSummary(ev.tool, ev.arguments) });
+        R.turn.blocks.push(a);
+        R.msgEl.append(approvalCard(a, false)); scrollIfActive(R, true);
+        if (R.tab !== active) { R.tab.attention = true; renderTabBar(); }
+        if ((document.hidden || R.tab !== active) && 'Notification' in window && Notification.permission === 'granted') new Notification('Forge needs your approval', { body: argSummary(ev.tool, ev.arguments) });
         break;
       }
       case 'approval_resolved': break;
-      case 'ask_user': {
-        closeCurrent();
-        run.turn.blocks.push({ type: 'ask', question: ev.question });
-        run.msgEl.append(askCard(ev.question)); promptEl.focus(); break;
-      }
+      case 'ask_user': closeCurrent(R); R.turn.blocks.push({ type: 'ask', question: ev.question }); R.msgEl.append(askCard(ev.question)); if (visible(R)) promptEl.focus(); break;
       case 'image_analysis': {
-        closeCurrent(); run.spinner.remove();
+        closeCurrent(R); R.spinner.remove();
         const b = { type: 'vision', number: ev.number, source: ev.source, description: ev.description, ocr: ev.ocr };
-        run.turn.blocks.push(b);
-        run.msgEl.append(visionBlock(b)); scrollToBottom();
+        R.turn.blocks.push(b); R.msgEl.append(visionBlock(b)); scrollIfActive(R);
         break;
       }
-      case 'tool_error':
-        run.turn.blocks.push({ type: 'status', text: ev.message, error: true });
-        run.msgEl.append(el('div', { class: 'status-line error', text: ev.message })); break;
-      case 'status':
-        closeCurrent();
-        run.turn.blocks.push({ type: 'status', text: ev.text });
-        run.msgEl.append(el('div', { class: 'status-line', text: ev.text })); break;
+      case 'tool_error': R.turn.blocks.push({ type: 'status', text: ev.message, error: true }); R.msgEl.append(el('div', { class: 'status-line error', text: ev.message })); break;
+      case 'status': closeCurrent(R); R.turn.blocks.push({ type: 'status', text: ev.text }); R.msgEl.append(el('div', { class: 'status-line', text: ev.text })); break;
       case 'stats': {
-        run.turn.stats = ev;
+        R.turn.stats = ev;
+        if (!visible(R)) break;
         const parts = [];
         if (ev.gen_tps) parts.push(ev.gen_tps + ' tok/s');
         if (ev.context_estimate) parts.push('~' + ev.context_estimate + '/' + (F.settings.num_ctx || 8192) + ' ctx');
@@ -641,43 +810,93 @@
       }
       case 'verbose':
         logVerbose(ev.kind, ev.text);
-        run.turn.blocks.push({ type: 'verbose', kind: ev.kind, text: ev.text });
-        if (verbose) { closeCurrent(); run.msgEl.append(el('div', { class: 'verbose', text: '[' + ev.kind + '] ' + ev.text })); }
+        R.turn.blocks.push({ type: 'verbose', kind: ev.kind, text: ev.text });
+        if (verbose) { closeCurrent(R); R.msgEl.append(el('div', { class: 'verbose', text: '[' + ev.kind + '] ' + ev.text })); }
         break;
-      case 'assistant_start': case 'assistant_end': break;
       case 'error':
-        closeCurrent();
-        run.turn.blocks.push({ type: 'status', text: 'Error: ' + ev.message, error: true });
-        run.msgEl.append(el('div', { class: 'status-line error', text: 'Error: ' + ev.message + (ev.detail ? '\n' + ev.detail : '') }));
+        closeCurrent(R);
+        R.turn.blocks.push({ type: 'status', text: 'Error: ' + ev.message, error: true });
+        R.msgEl.append(el('div', { class: 'status-line error', text: 'Error: ' + ev.message + (ev.detail ? '\n' + ev.detail : '') }));
         logVerbose('error', ev.message + (ev.detail ? '\n' + ev.detail : ''));
         break;
-      case 'turn_done': break;
       case 'end':
-        closeCurrent();
-        if (run.turn.stats) run.msgEl.append(statLine(run.turn.stats));
-        finishRun(ev.status);
+        closeCurrent(R);
+        if (R.turn.stats) R.msgEl.append(statLine(R.turn.stats));
+        finishRun(R, ev.status);
         break;
+      default: break;
     }
   }
 
-  // ------------------------------------------------------------------ verbose and settings
+  // ================================================================== model picker, verbose, voice
+  /** The composer's model picker belongs to the chat, like Cursor's: each tab keeps its own model. */
+  let pickerModels = null;
+  async function loadModelPicker(refresh) {
+    const sel = $('#model-pick');
+    if (!sel) return;
+    try {
+      if (!pickerModels || refresh) pickerModels = (await get('/api/models')).models.map((m) => m.name).filter((n) => !/vl|embed/i.test(n));
+    } catch (e) { pickerModels = pickerModels || []; }
+    const def = F.settings.engine === 'gpu' ? 'GPU engine' : String(F.settings.model || 'model').replace(':latest', '');
+    sel.innerHTML = '';
+    sel.append(el('option', { value: '', text: 'Default (' + def + ')' }));
+    sel.append(el('option', { value: '__gpu', text: '⚡ GPU engine (Intel)' }));
+    for (const n of pickerModels) sel.append(el('option', { value: n, text: n.replace(':latest', '') + ' (CPU)' }));
+    const want = active ? (active.session.model_choice || '') : '';
+    sel.value = [...sel.options].some((o) => o.value === want) ? want : '';
+    sel.title = 'Model for this chat. Default follows the window setting (' + def + ').';
+  }
+  $('#model-pick').addEventListener('change', (e) => {
+    if (!active) return;
+    active.session.model_choice = e.target.value;
+    toast('This chat now uses ' + (e.target.selectedOptions[0] || {}).textContent + '.', 'ok', 1500);
+  });
   C.toggleVerbose = () => { F.saveSetting('verbose', !F.settings.verbose); };
   $('#btn-verbose').onclick = C.toggleVerbose;
-  C.onSettings = () => { verbose = !!F.settings.verbose; $('#btn-verbose').classList.toggle('on', verbose); };
-  $('#mode-select').addEventListener('change', () => localStorage.setItem('forge.mode', $('#mode-select').value));
+  $('#btn-export').onclick = () => C.exportChat();
+  $('#btn-voice').onclick = () => { if (window.ForgeVoice) window.ForgeVoice.toggle(promptEl, $('#btn-voice')); else toast('Voice input is not available.', 'error'); };
+  /** Built-in modes plus your custom modes (Settings, Custom modes). */
+  function renderModes() {
+    const sel = $('#mode-select');
+    const cur = sel.value || localStorage.getItem('forge.mode') || 'agent';
+    sel.innerHTML = '';
+    for (const [v, t] of [['agent', 'Agent'], ['ask', 'Ask'], ['plan', 'Plan']]) sel.append(el('option', { value: v, text: t }));
+    const custom = (F.settings.custom_modes || []).filter((m) => m && m.name);
+    for (const m of custom) sel.append(el('option', { value: m.name, text: m.name, title: m.instructions || '' }));
+    sel.append(el('option', { value: '__edit', text: 'Edit modes…' }));
+    sel.value = [...sel.options].some((o) => o.value === cur && o.value !== '__edit') ? cur : 'agent';
+  }
+  C.renderModes = renderModes;
+  C.onSettings = () => {
+    renderModes(); verbose = !!F.settings.verbose; $('#btn-verbose').classList.toggle('on', verbose); loadModelPicker(true); };
+  $('#mode-select').addEventListener('change', () => {
+    const sel = $('#mode-select');
+    if (sel.value === '__edit') { sel.value = localStorage.getItem('forge.mode') || 'agent'; F.showView('settings'); setTimeout(() => { const g = [...document.querySelectorAll('#settings-panel .sgroup')].find((x) => x.textContent === 'Custom modes'); if (g) g.scrollIntoView({ block: 'start' }); }, 600); return; }
+    localStorage.setItem('forge.mode', sel.value);
+  });
 
-  // ------------------------------------------------------------------ init
+  // ================================================================== start
   C.init = async () => {
     verbose = !!F.settings.verbose;
+    renderModes();
     $('#mode-select').value = localStorage.getItem('forge.mode') || 'agent';
+    if (!$('#mode-select').value) $('#mode-select').value = 'agent';
     const params = new URLSearchParams(location.search);
     const urlChat = params.get('chat');
-    let sid = urlChat;
-    if (!sid) { try { sid = localStorage.getItem(sessionKey()); } catch (e) { sid = null; } }
     if (urlChat) { params.delete('chat'); history.replaceState(null, '', '/?' + params.toString()); }
-    // If the user already sent a message before startup finished, keep that live session untouched.
-    initDone = (async () => { if (session || run) return; if (sid) await loadSession(sid); else await newChat(); })();
+    initDone = (async () => {
+      let saved = { ids: [], active: null };
+      try { saved = JSON.parse(localStorage.getItem(tabsKey()) || '{"ids":[]}'); } catch (e) { /* ignore */ }
+      if (!saved.ids || !saved.ids.length) { const old = localStorage.getItem('forge.session.' + F.folder); if (old) saved = { ids: [old], active: old }; }
+      for (const id of (saved.ids || []).slice(0, 12)) {
+        try { const s = await get('/api/session', { id }); if (!s.workspace || s.workspace === F.folder) addTab(s, false); } catch (e) { /* deleted chat */ }
+      }
+      if (urlChat) await openChat(urlChat).catch(() => {});
+      const want = tabs.find((t) => t.session.id === (urlChat || saved.active));
+      if (want) switchTo(want); else if (tabs.length) switchTo(tabs[tabs.length - 1]); else await newChat();
+    })();
     await initDone;
+    loadModelPicker();
     if ('Notification' in window && Notification.permission === 'default') { try { Notification.requestPermission(); } catch (e) { /* ignore */ } }
     loadHistory($('#history'));
   };

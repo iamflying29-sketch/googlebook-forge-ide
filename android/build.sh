@@ -12,7 +12,7 @@ B=build/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$B/classes" "$B/gen"
 "$BT/aapt2" compile --dir res -o "$B/res.zip"
 "$BT/aapt2" link -o "$B/unsigned.apk" -I "$JAR" --manifest AndroidManifest.xml -A assets \
-    --min-sdk-version 33 --target-sdk-version 35 --version-code 4 --version-name 1.3 \
+    --min-sdk-version 33 --target-sdk-version 35 --version-code 5 --version-name 1.4 \
     --java "$B/gen" "$B/res.zip"
 javac -Xlint:-options -source 11 -target 11 -cp "$JAR" -d "$B/classes" \
     "$B/gen/local/forge/R.java" src/local/forge/*.java

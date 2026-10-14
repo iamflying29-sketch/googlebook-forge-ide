@@ -49,6 +49,7 @@
       <button class="act" data-view="search" title="Search (Ctrl+Shift+F)"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></svg></button>
       <button class="act" data-view="changes" title="AI changes and checkpoints (Ctrl+Shift+G)"><svg viewBox="0 0 24 24"><path d="M6 3v12M6 15a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9c0 4-4 5-9 6"/></svg></button>
       <button class="act" data-view="git" title="Source control"><svg viewBox="0 0 24 24"><circle cx="6" cy="5" r="2.5"/><circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="9" r="2.5"/><path d="M6 7.5v9M18 11.5c0 3-4 4-9 5"/></svg></button>
+      <button class="act" data-view="debug" title="Run and Debug (F5)"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/><circle cx="18.5" cy="17.5" r="3" /></svg></button>
       <button class="act" data-view="notepads" title="Notepads"><svg viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></svg></button>
       <button class="act" data-view="history" title="Chat history (Ctrl+Shift+H)"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button>
       <div class="act-spacer"></div>
@@ -63,6 +64,7 @@
             <button class="mini" id="btn-new-file" title="New file"><svg viewBox="0 0 16 16"><path d="M4 1.5h5l3 3v10H4z"/><path d="M8 7v5M5.5 9.5h5"/></svg></button>
             <button class="mini" id="btn-new-folder" title="New folder"><svg viewBox="0 0 16 16"><path d="M1.5 3h4l1.5 1.5H14.5v8.5h-13z"/><path d="M8 6.5v4M6 8.5h4"/></svg></button>
             <button class="mini" id="btn-refresh-tree" title="Refresh"><svg viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg></button>
+            <button class="mini" id="btn-add-root" title="Add a folder to this window (several folders side by side)"><svg viewBox="0 0 16 16"><path d="M1.5 3h4l1.5 1.5H14.5v8.5h-13z"/><path d="M11 7.5v4M9 9.5h4"/></svg></button>
             <button class="mini" id="btn-collapse-tree" title="Collapse all"><svg viewBox="0 0 16 16"><path d="M3 5h10M3 8h10M3 11h10"/></svg></button>
           </div>
         </div>
@@ -73,6 +75,7 @@
         <div class="view-head"><span>Search</span></div>
         <div class="search-box">
           <input id="search-input" placeholder="Search in files (Enter)" spellcheck="false">
+          <div class="replace-row"><input id="replace-input" placeholder="Replace with" spellcheck="false"><button class="btn ghost sm" id="btn-replace-all" title="Replace every match in every file (undo from AI Changes)">Replace all</button></div>
           <div class="search-opts">
             <input id="search-glob" placeholder="files to include, e.g. *.py" spellcheck="false">
             <label class="chk"><input type="checkbox" id="search-regex"> regex</label>
@@ -100,6 +103,11 @@
           <div class="view-actions"><button class="mini" id="btn-git-refresh" title="Refresh"><svg viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg></button></div>
         </div>
         <div class="git" id="git-panel"><div class="muted pad">Loading…</div></div>
+      </section>
+
+      <section class="view" data-view="debug">
+        <div class="view-head"><span>Run and Debug</span></div>
+        <div class="debug" id="debug-panel"></div>
       </section>
 
       <section class="view" data-view="notepads">
@@ -157,7 +165,8 @@
         <div class="panel-tabs">
           <button class="ptab active" data-panel="terminal">Terminal</button>
           <button class="ptab" data-panel="output">Agent log</button>
-          <button class="ptab" data-panel="problems">Problems</button>
+          <button class="ptab" data-panel="problems">Problems <span class="pcount" id="problems-count"></span></button>
+          <button class="ptab" data-panel="debug">Debug console</button>
           <div class="panel-actions">
             <button class="mini" id="btn-term-ai" title="Ask AI for a command (Ctrl+K in the terminal)">AI</button>
             <button class="mini" id="btn-term-new" title="New terminal">＋</button>
@@ -177,6 +186,7 @@
             <div id="terminals"></div>
           </div>
           <div class="pview" data-panel="output"><pre id="agent-log" class="log"></pre></div>
+          <div class="pview" data-panel="debug"><div class="debug-console"><div id="debug-output" class="debug-output"></div><input id="debug-input" class="debug-input" placeholder="Evaluate an expression in the paused program (Enter)" spellcheck="false"></div></div>
           <div class="pview" data-panel="problems"><div id="problems" class="problems"><div class="pad muted">Syntax checks after saves and agent edits show up here, with a Fix with AI button.</div></div></div>
         </div>
       </div>
@@ -187,12 +197,11 @@
     <!-- ===== AI panel ===== -->
     <aside class="chat" id="chat">
       <div class="chat-head">
-        <div class="chat-title">
-          <span id="chat-title-text">New chat</span>
-        </div>
+        <div class="chat-tabs" id="chat-tabs"></div>
         <div class="chat-head-actions">
-          <button class="mini" id="btn-new-chat" title="New chat (Ctrl+N)">＋</button>
-          <button class="mini" id="btn-chat-history" title="Chat history">🕘</button>
+          <button class="mini" id="btn-new-chat" title="New chat in a new tab (Ctrl+N)"><svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg></button>
+          <button class="mini" id="btn-chat-history" title="Chat history"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/></svg></button>
+          <button class="mini" id="btn-export" title="Export this chat as a Markdown file"><svg viewBox="0 0 16 16"><path d="M8 2v8M4.5 6.5L8 10l3.5-3.5M2.5 11.5v2h11v-2"/></svg></button>
           <button class="mini" id="btn-verbose" title="Verbose mode: show the raw model traffic">V</button>
         </div>
       </div>
@@ -210,8 +219,19 @@
         </div>
       </div>
       <div class="composer">
+        <div class="queue hidden" id="queue"></div>
+        <div class="composer-top">
+          <div class="composer-left">
+            <button class="chip" id="btn-add-context" title="Add context: files, folders, code, docs, past chats, web, git, terminal, linter errors (@)">@ Add context</button>
+            <button class="chip" id="btn-add-selection" title="Add editor selection (Ctrl+L)">+ Selection</button>
+          </div>
+          <div class="composer-right">
+            <label class="chip toggle" title="Show the model's thinking process"><input type="checkbox" id="thinking-toggle" checked> Thinking</label>
+            <label class="chip toggle" title="Run commands without asking (destructive commands still ask)"><input type="checkbox" id="auto-toggle"> Auto-run</label>
+          </div>
+        </div>
         <div class="context-chips" id="context-chips"></div>
-        <textarea id="prompt" rows="3" placeholder="Ask, or tell the agent what to build.  @ adds a file.  Enter sends, Shift+Enter is a new line." spellcheck="false"></textarea>
+        <textarea id="prompt" rows="3" placeholder="Ask, or tell the agent what to build.  @ adds context, / runs a command.  Enter sends, Shift+Enter is a new line." spellcheck="false"></textarea>
         <div class="composer-bar">
           <div class="composer-left">
             <select id="mode-select" title="Mode">
@@ -219,16 +239,16 @@
               <option value="ask">Ask</option>
               <option value="plan">Plan</option>
             </select>
-            <button class="chip" id="btn-add-context" title="Add a file to context (@)">@ Add context</button>
-            <button class="chip" id="btn-add-selection" title="Add editor selection (Ctrl+L)">+ Selection</button>
-            <button class="chip" id="btn-add-image" title="Attach screenshots or images (you can also paste or drop them here)">+ Image</button>
-            <input type="file" id="image-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
-            <label class="chip toggle" title="Show the model's thinking process"><input type="checkbox" id="thinking-toggle" checked> Thinking</label>
-            <label class="chip toggle" title="Run commands without asking (destructive commands still ask)"><input type="checkbox" id="auto-toggle"> Auto-run</label>
+            <select id="model-pick" title="Model for this window's chats"></select>
+            <span class="stats" id="stats"></span>
           </div>
           <div class="composer-right">
-            <span class="stats" id="stats"></span>
-            <button class="send" id="btn-send" title="Send (Ctrl+Enter)">
+            <button class="cbtn" id="btn-attach" title="Attach files of any kind: code, text, PDF, images (you can also paste or drop them here)"><svg viewBox="0 0 16 16"><path d="M13.5 7.5l-5.6 5.6a3.4 3.4 0 0 1-4.8-4.8l5.8-5.8a2.2 2.2 0 0 1 3.1 3.1L6.3 11.3a1 1 0 0 1-1.5-1.5l5.2-5.2"/></svg></button>
+            <input type="file" id="attach-input" multiple hidden>
+            <button class="cbtn" id="btn-add-image" title="Attach screenshots or images (you can also paste or drop them here)"><svg viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><circle cx="5.5" cy="6.2" r="1.2"/><path d="M14.5 10.5l-3.5-3.5-7.5 6.5"/></svg></button>
+            <input type="file" id="image-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+            <button class="cbtn" id="btn-voice" title="Voice input: speak your message (Ctrl+Shift+Space)"><svg viewBox="0 0 16 16"><rect x="5.75" y="1.5" width="4.5" height="8" rx="2.25"/><path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.5"/></svg></button>
+            <button class="send" id="btn-send" title="Send (Enter)">
               <svg viewBox="0 0 16 16"><path d="M2 8l12-6-4 6 4 6z"/></svg>
             </button>
             <button class="send stop hidden" id="btn-stop" title="Stop (Esc)">■</button>
@@ -247,6 +267,9 @@
       <span id="sb-model" class="sb-item"></span>
       <span id="sb-run" class="sb-item"></span>
       <span id="sb-mem" class="sb-item" title="Free memory in the Linux VM"></span>
+      <span id="sb-index" class="sb-item clickable" title="Codebase index: click for details"></span>
+      <span id="sb-review" class="sb-item clickable review-badge"></span>
+      <span id="sb-debug" class="sb-item"></span>
     </div>
     <div class="sb-right">
       <span id="sb-tps" class="sb-item" title="Generation speed"></span>
@@ -290,7 +313,7 @@
   </div>
 
   <div id="lightbox" class="overlay lightbox hidden"><img id="lightbox-img" alt="Attached image"><div class="lb-hint">Click anywhere or press Esc to close</div></div>
-  <div id="drop-hint" class="drop-hint hidden">Drop images to attach them to your message</div>
+  <div id="drop-hint" class="drop-hint hidden">Drop files or images to attach them to your message</div>
 
   <div id="toast-host" class="toast-host"></div>
 </div>
@@ -305,6 +328,13 @@
 <script src="/app.js"></script>
 <script src="/chat.js"></script>
 <script src="/term.js"></script>
+<script src="/lsp.js"></script>
 <script src="/extras.js"></script>
+<script src="/voice.js"></script>
+<script src="/review.js"></script>
+<script src="/debug.js"></script>
+<script src="/notebook.js"></script>
+<script src="/preview.js"></script>
+<script src="/split.js"></script>
 </body>
 </html>

@@ -16,7 +16,7 @@ from .ollama_client import OllamaClient, OllamaError
 from .tools import NEEDS_APPROVAL, TOOL_NAMES, Workspace, is_dangerous_command, ollama_tool_schemas, outside_change_reason
 
 READ_ONLY_TOOLS = {"read_file", "list_dir", "find_files", "search", "web_fetch", "web_search", "codebase_search", "ask_user",
-                   "look_at_image"}
+                   "look_at_image", "todo_write", "docs_search", "remember"}
 TAGS = ("<thinking>", "</thinking>", "<tool_call>", "</tool_call>")
 
 
@@ -298,6 +298,8 @@ class Agent:
         self.settings = settings
         self.session = session          # persisted dict: messages, auto_approve, repo_map ...
         self.vision: Any = None         # VisionManager: the eyes Llama 3.1 does not have
+        self.state: Any = None          # server State: memories, hooks, docs, attachments, sessions
+        self.custom_mode: Optional[dict] = None   # a custom mode's name, instructions and tool access
 
     # ----------------------------------------------------------- helpers
     def _options(self) -> dict:
@@ -325,6 +327,48 @@ class Agent:
             self.session["repo_map_ts"] = time.time()
         return rm
 
+    def _rule_files(self) -> List[dict]:
+        """Rule files in .cursor/rules and .forge/rules (Cursor's format: Markdown with a small header that sets
+        description, globs and alwaysApply)."""
+        out: List[dict] = []
+        for d in (os.path.join(self.ws.root, ".cursor", "rules"), os.path.join(self.ws.root, ".forge", "rules")):
+            if not os.path.isdir(d):
+                continue
+            for dirpath, dirnames, files in os.walk(d):
+                if dirpath.count(os.sep) - d.count(os.sep) > 3:
+                    dirnames[:] = []
+                for name in sorted(files):
+                    if not name.endswith((".mdc", ".md")):
+                        continue
+                    p = os.path.join(dirpath, name)
+                    try:
+                        with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                            text = fh.read(20000)
+                    except OSError:
+                        continue
+                    meta, body = {}, text
+                    if text.startswith("---"):
+                        end = text.find("\n---", 3)
+                        if end > 0:
+                            key = None
+                            for line in text[3:end].splitlines():
+                                if re.match(r"^\s*-\s+", line) and key:
+                                    meta.setdefault(key, [])
+                                    if isinstance(meta[key], list):
+                                        meta[key].append(line.split("-", 1)[1].strip().strip("'\""))
+                                    continue
+                                if ":" in line:
+                                    key, val = line.split(":", 1)
+                                    key, val = key.strip(), val.strip()
+                                    meta[key] = val if val else []
+                            body = text[end + 4:].lstrip("-\n")
+                    globs = meta.get("globs") or []
+                    if isinstance(globs, str):
+                        globs = [g.strip().strip("'\"") for g in globs.strip("[]").split(",") if g.strip()]
+                    out.append({"path": os.path.relpath(p, self.ws.root), "description": str(meta.get("description") or "").strip("'\""),
+                                "globs": globs, "always": str(meta.get("alwaysApply", "")).lower() == "true", "body": body.strip()})
+        return out
+
     def _rules(self) -> str:
         """User rules: global (~/.forge-ide/rules.md) and per workspace (.forge/rules.md or .cursorrules)."""
         texts = []
@@ -339,7 +383,30 @@ class Agent:
                 continue
             if t:
                 texts.append(f"### {os.path.basename(p)}\n{t[:6000]}")
+        listed = []
+        for r in self._rule_files():
+            if r["always"]:
+                texts.append(f"### {r['path']}\n{r['body'][:6000]}")
+            elif r["description"] or r["globs"]:
+                when = r["description"] or ""
+                if r["globs"]:
+                    when += (" " if when else "") + "(applies to " + ", ".join(r["globs"][:6]) + ")"
+                listed.append(f"- {r['path']}: {when}")
+        if listed:
+            texts.append("### More rule files\nRead one with read_file when it is relevant to the task:\n" + "\n".join(listed))
         return "\n\n".join(texts)
+
+    def _rules_for_paths(self, paths: List[str]) -> str:
+        """Auto-attached rules: rule files whose globs match a file in this message's context."""
+        import fnmatch
+        hits = []
+        for r in self._rule_files():
+            if r["always"] or not r["globs"]:
+                continue
+            if any(fnmatch.fnmatch(p, g) or fnmatch.fnmatch(os.path.basename(p), g) or fnmatch.fnmatch(p, g.lstrip("*/"))
+                   for p in paths for g in r["globs"]):
+                hits.append(f"### Rule {r['path']}\n{r['body'][:4000]}")
+        return "\n\n".join(hits)
 
     def _system_prompt(self, mode: str) -> str:
         thinking = bool(self.settings.get("thinking", True))
@@ -358,6 +425,17 @@ class Agent:
         rules = self._rules()
         if rules:
             base += "\n\n## User rules (always follow these)\n" + rules
+        if self.state is not None:
+            extra = self.state.extra_roots(self.ws.root)
+            if extra:
+                base += ("\n\n## More folders in this window\nBesides the project folder, this window also contains these "
+                         "folders. Use absolute paths for files in them:\n" + "\n".join(f"- {r}" for r in extra))
+            mem = self.state.memories.prompt_text(self.ws.root)
+            if mem:
+                base += "\n\n## Memories (facts the user approved; follow them)\n" + mem
+            docs = [d["name"] for d in self.state.docs.list() if d.get("status") == "ready"]
+            if docs and mode != "ask":
+                base += "\n\n## Indexed documentation for docs_search\n" + ", ".join(docs)
         return base
 
     def _trim(self, messages: List[dict], run: Run) -> List[dict]:
@@ -408,11 +486,19 @@ class Agent:
         elif msgs[0]["content"] != system:
             msgs[0]["content"] = system
         content = self._compose_user_message(user_text, attachments, run)
+        if self.custom_mode:
+            # Mode instructions travel with the message, so the system prompt (and its cache) stays the same.
+            cm = self.custom_mode
+            ro = str(cm.get("tools", "all")) == "read-only"
+            content = (f"## Mode: {cm.get('name')}\n{str(cm.get('instructions') or '').strip()}"
+                       + ("\n(In this mode you may only use read-only tools.)" if ro else "") + "\n\n" + content)
         user_msg: Dict[str, Any] = {"role": "user", "content": content}
         if self.settings.get("native_images"):
             imgs = self._native_images(attachments)
             if imgs:
                 user_msg["images"] = imgs
+        self.session.setdefault("runs", []).append({"run_id": run.id, "msg_index": len(msgs), "ts": time.time()})
+        self.session["runs"] = self.session["runs"][-300:]
         msgs.append(user_msg)
         max_iters = int(self.settings.get("max_iterations", 30))
         native = self.settings.get("tool_mode", "prompt") == "native" and mode != "ask"
@@ -502,6 +588,12 @@ class Agent:
         return "\n".join(lines)
 
     def _compose_user_message(self, text: str, attachments: List[dict], run: Optional["Run"] = None) -> str:
+        editor = [a for a in attachments if a.get("kind") == "editor"]
+        attachments = [a for a in attachments if a.get("kind") != "editor"]
+        if editor and editor[0].get("path"):
+            e = editor[0]
+            text += (f"\n\n(The user has {e['path']} open in the editor" + (f", cursor at line {e['line']}" if e.get("line") else "")
+                     + ". \"This file\" means that file.)")
         if not attachments:
             return text
         parts = [text, "\n\n## Attached context"]
@@ -515,6 +607,35 @@ class Agent:
         for a in attachments:
             kind = a.get("kind", "file")
             if kind == "image":
+                continue
+            if kind == "upload" and self.state is not None:
+                meta = self.state.attachments.get(str(a.get("id", "")))
+                if not meta:
+                    parts.append(f"\n### Attached file {a.get('name')}\n[the attachment could not be found]")
+                elif meta.get("text") is None:
+                    parts.append(f"\n### Attached file {meta['name']} ({meta['bytes']:,} bytes)\nForge cannot read this file type as "
+                                 f"text. It is saved at {meta['path']} if a command can process it.")
+                else:
+                    body = meta["text"]
+                    cut = len(body) > 40000
+                    parts.append(f"\n### Attached file {meta['name']} ({meta['kind']}, saved at {meta['path']})\n```\n"
+                                 f"{body[:40000]}\n```" + ("\n[truncated; use read_file on the saved path for the rest]" if cut else ""))
+                continue
+            if kind == "docs" and self.state is not None:
+                parts.append("\n### Documentation (@Docs " + str(a.get("name")) + ")\n" + self.state.docs.search(str(a.get("name")), text))
+                continue
+            if kind == "chat" and self.state is not None:
+                other = self.state.sessions.get(str(a.get("id", "")))
+                if other:
+                    from .features import chat_context
+                    parts.append("\n### Earlier chat (@past chats)\n" + chat_context(other))
+                continue
+            if kind == "folder":
+                from .features import folder_context
+                try:
+                    parts.append("\n### Folder (@folders)\n" + folder_context(self.ws, str(a.get("path", ".")), text))
+                except Exception as e:  # noqa: BLE001
+                    parts.append(f"\n### Folder {a.get('path')}\n[could not read: {e}]")
                 continue
             if kind == "selection":
                 parts.append(f"\n### Selection from {a.get('path')} (lines {a.get('start')}-{a.get('end')})\n```{a.get('language','')}\n{a.get('text','')}\n```")
@@ -531,10 +652,7 @@ class Agent:
             elif kind == "terminal":
                 parts.append(f"\n### Terminal output\n```\n{a.get('text','')[-6000:]}\n```")
             elif kind == "codebase":
-                from .codesearch import CodeIndex
-                idx = getattr(self.ws, "code_index", None) or CodeIndex(self.ws.root)
-                self.ws.code_index = idx
-                parts.append("\n### Relevant code from the workspace (@codebase)\n" + idx.search_text(text, limit=6, max_chars=7000))
+                parts.append("\n### Relevant code from the workspace (@codebase)\n" + self._code_search(text, limit=6, max_chars=7000))
             elif kind == "web":
                 try:
                     parts.append("\n### Web search results (@web)\n" + self.ws.web_search(text, limit=6))
@@ -548,6 +666,9 @@ class Agent:
                 except (subprocess.TimeoutExpired, OSError) as e:
                     diff = f"[git diff failed: {e}]"
                 parts.append("\n### Uncommitted git changes (@git)\n```diff\n" + (diff[:12000] or "(no changes)") + "\n```")
+        rules = self._rules_for_paths([str(a.get("path")) for a in attachments if a.get("kind") in ("file", "selection") and a.get("path")])
+        if rules:
+            parts.append("\n### Project rules for these files (follow them)\n" + rules)
         return "\n".join(parts)
 
     # ----------------------------------------------------------- streaming one assistant message
@@ -665,6 +786,33 @@ class Agent:
         return call
 
     # ----------------------------------------------------------- executing tools
+    def _code_search(self, query: str, limit: int = 8, max_chars: int = 9000) -> str:
+        """Codebase search: keyword ranking blended with the meaning-based index when it is available."""
+        from .codesearch import CodeIndex
+        from .semantic import hybrid_search_text
+        idx = getattr(self.ws, "code_index", None) or CodeIndex(self.ws.root)
+        self.ws.code_index = idx
+        sem = None
+        if self.state is not None:
+            try:
+                sem = self.state.semantic_for(self.ws.root)
+                if sem is not None and sem.status.get("state") in ("idle",):
+                    sem.start()
+            except Exception:  # noqa: BLE001
+                sem = None
+        out = hybrid_search_text(idx, sem, query, limit=limit, max_chars=max_chars)
+        extra = self.state.extra_roots(self.ws.root) if self.state is not None else []
+        for root in extra[:4]:
+            # The other folders of the window are searched too; their paths are given in full.
+            ws2 = self.state.workspace_for(root)
+            idx2 = getattr(ws2, "code_index", None) or CodeIndex(root)
+            ws2.code_index = idx2
+            more = hybrid_search_text(idx2, self.state.semantic_for(root), query, limit=max(2, limit // 2),
+                                      max_chars=max_chars // 2)
+            if not more.startswith("No code"):
+                out += "\n\n" + more.replace("\n--- ", "\n--- " + root + "/")
+        return out
+
     def _execute_tool(self, run: Run, call: dict, mode: str) -> Optional[str]:
         name = call["name"]
         args = dict(call.get("arguments") or {})
@@ -674,6 +822,10 @@ class Agent:
                     "<content>, <old_text> or <new_text> blocks.")
         call_id = uuid.uuid4().hex[:8]
         run.emit("tool_call", call_id=call_id, name=name, arguments=self._display_args(args))
+        if self.custom_mode and str(self.custom_mode.get("tools", "all")) == "read-only" and name not in READ_ONLY_TOOLS:
+            res = f"ERROR: '{name}' is not allowed in the {self.custom_mode.get('name')} mode. Only read-only tools may be used."
+            run.emit("tool_result", call_id=call_id, name=name, result=res, ok=False)
+            return res
         if mode == "plan" and name not in READ_ONLY_TOOLS:
             res = f"ERROR: '{name}' is not allowed in Plan mode. Only read-only tools may be used; finish by writing the plan."
             run.emit("tool_result", call_id=call_id, name=name, result=res, ok=False)
@@ -700,13 +852,42 @@ class Agent:
                     run.emit("tool_result", call_id=call_id, name=name, result=res, ok=False)
                     return res
                 run.emit("approval_resolved", call_id=call_id, decision="approved")
+        # Hooks (beforeShellExecution) may allow, ask or deny a command.
+        force_ask = False
+        if name == "run_command" and self.state is not None:
+            h = self.state.hooks.run(self.ws.root, "beforeShellExecution", {"command": str(args.get("command", "")), "cwd": self.ws.root})
+            if h["permission"] == "deny":
+                res = "A hook blocked this command: " + ("; ".join(h["messages"]) or "no reason given")
+                run.emit("tool_result", call_id=call_id, name=name, result=res, ok=False)
+                return res
+            force_ask = h["permission"] == "ask"
+        if name == "remember":
+            text = str(args.get("memory") or args.get("value") or "").strip()
+            scope = "global" if str(args.get("scope", "project")).lower() == "global" else "project"
+            decision = run.request_approval("remember", {"memory": text, "scope": scope}, "Save this memory for future chats?")
+            if decision.get("decision") in ("approve", "always") and text and self.state is not None:
+                saved = str((decision.get("arguments") or {}).get("memory") or text).strip()
+                self.state.memories.add(self.ws.root, saved, scope)
+                run.emit("approval_resolved", call_id=call_id, decision="approved")
+                res = f"Memory saved ({scope}): {saved}"
+                run.emit("tool_result", call_id=call_id, name=name, result=res, ok=True)
+                return res
+            run.emit("approval_resolved", call_id=call_id, decision="denied")
+            res = "The user did not save this memory."
+            run.emit("tool_result", call_id=call_id, name=name, result=res, ok=False)
+            return res
         # Approval
         needs = name in NEEDS_APPROVAL or name.startswith("mcp_")
         if needs:
-            auto = bool(self.settings.get("auto_approve_commands")) or bool(self.session.get("auto_approve"))
-            dangerous = name == "delete_path" or (name == "run_command" and is_dangerous_command(str(args.get("command", ""))))
+            cmd_text = str(args.get("command", ""))
+            allow = [p.strip() for p in (self.settings.get("command_allowlist") or []) if str(p).strip()]
+            deny = [p.strip() for p in (self.settings.get("command_denylist") or []) if str(p).strip()]
+            denied = name == "run_command" and any(cmd_text.strip().startswith(p) for p in deny)
+            allowed = name == "run_command" and any(cmd_text.strip().startswith(p) for p in allow)
+            auto = bool(self.settings.get("auto_approve_commands")) or bool(self.session.get("auto_approve")) or allowed
+            dangerous = name == "delete_path" or (name == "run_command" and (is_dangerous_command(cmd_text) or denied)) or force_ask
             if not auto or dangerous:
-                reason = "This command looks destructive." if dangerous and name == "run_command" else (
+                reason = "A hook asked for your approval." if force_ask else "This command is on your denylist." if denied else "This command looks destructive." if dangerous and name == "run_command" else (
                     "Moving a file to the trash." if name == "delete_path" else
                     "Tool from an MCP server." if name.startswith("mcp_") else "Commands run on your computer.")
                 decision = run.request_approval(name, self._display_args(args), reason)
@@ -731,6 +912,13 @@ class Agent:
             res = f"ERROR in {name}: {e}"
         dur = round(time.monotonic() - t0, 2)
         run.emit("tool_result", call_id=call_id, name=name, result=res, ok=ok, seconds=dur)
+        if name in ("write_file", "edit_file") and ok and self.state is not None:
+            st, root = self.state, self.ws.root
+            try:
+                p = self.ws.resolve(str(args.get("path", "")))
+            except Exception:  # noqa: BLE001
+                p = str(args.get("path", ""))
+            threading.Thread(target=lambda: st.hooks.run(root, "afterFileEdit", {"path": p}), daemon=True).start()
         if name in ("write_file", "edit_file", "delete_path") and ok:
             ch = self.ws.checkpoints.get(run.id, self.ws.relpath(self.ws.resolve(str(args.get("path", "")))))
             if ch:
@@ -790,11 +978,31 @@ class Agent:
         if name == "web_search":
             return ws.web_search(str(need("query")))
         if name == "codebase_search":
-            from .codesearch import CodeIndex
-            idx = getattr(ws, "code_index", None)
-            if idx is None:
-                idx = ws.code_index = CodeIndex(ws.root)
-            return idx.search_text(str(need("query")))
+            return self._code_search(str(need("query")))
+        if name == "todo_write":
+            todos = a.get("todos")
+            if isinstance(todos, str):
+                try:
+                    todos = json.loads(todos)
+                except json.JSONDecodeError:
+                    todos = [{"content": l.strip("-* []x").strip(), "status": "completed" if "[x]" in l.lower() else "pending"}
+                             for l in todos.splitlines() if l.strip()]
+            if not isinstance(todos, list):
+                raise ValueError("todos must be a list of {content, status}")
+            clean = []
+            for t in todos[:30]:
+                if isinstance(t, dict) and str(t.get("content", "")).strip():
+                    stt = str(t.get("status", "pending")).lower()
+                    clean.append({"content": str(t["content"]).strip()[:200],
+                                  "status": stt if stt in ("pending", "in_progress", "completed") else "pending"})
+            self.session["todos"] = clean
+            run.emit("todos", todos=clean)
+            done = sum(1 for t in clean if t["status"] == "completed")
+            return f"To-do list updated: {done} of {len(clean)} done."
+        if name == "docs_search":
+            if self.state is None:
+                raise ValueError("documentation search is not available")
+            return self.state.docs.search(str(need("name")), str(need("query")))
         if name == "look_at_image":
             if self.vision is None:
                 raise ValueError("no vision helper is available")

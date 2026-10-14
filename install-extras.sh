@@ -1,0 +1,110 @@
+#!/bin/bash
+# Installs the optional parts of Forge IDE 1.4. Each part is independent; Forge works without any of them and
+# turns the matching feature off when a part is missing.
+#
+#   ./install-extras.sh lsp        language servers (suggestions, hover, go to definition, live errors)
+#   ./install-extras.sh debug      the Python debugger (debugpy)
+#   ./install-extras.sh voice      voice input in a browser (whisper.cpp and its base.en speech model)
+#   ./install-extras.sh index      the meaning-based codebase index (a small llama.cpp server and nomic-embed-text)
+#   ./install-extras.sh docs       PDF reading for attachments (pdftotext) and text recognition (tesseract)
+#   ./install-extras.sh all        everything above
+#
+# Safety: builds run at low priority inside a systemd scope with a memory cap, and every step first checks that
+# the VM has enough free memory. Downloads are checked against published SHA-256 hashes. Nothing is ever deleted.
+set -euo pipefail
+WANT="${1:-all}"
+
+need_mem() {   # need_mem MB: stop if the VM has less free memory than that
+  local free
+  free=$(free -m | awk 'NR==2 {print $7}')
+  if [ "$free" -lt "$1" ]; then
+    echo "Only $free MB of memory is free in the VM and this step needs $1 MB. Close other programs (or unload the"
+    echo "model with 'forge-ide' Unload in the command palette) and run this again."
+    exit 1
+  fi
+}
+
+capped() {     # capped MB command...: run a heavy command with a memory cap at low priority
+  local cap=$1; shift
+  if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --user --scope --quiet -p "MemoryMax=${cap}M" -p MemorySwapMax=0 nice -n 10 "$@"
+  else
+    nice -n 10 "$@"
+  fi
+}
+
+fetch_checked() {   # fetch_checked URL SHA256 TARGET
+  local url=$1 sum=$2 target=$3
+  if [ -f "$target" ] && echo "$sum  $target" | sha256sum -c --status; then
+    echo "Already present: $target"
+    return
+  fi
+  mkdir -p "$(dirname "$target")"
+  curl -fL --max-filesize 600000000 -o "$target.part" "$url"
+  if ! echo "$sum  $target.part" | sha256sum -c --status; then
+    echo "The download of $url does not match its published hash. It was kept as $target.part for inspection."
+    exit 1
+  fi
+  mv "$target.part" "$target"
+}
+
+do_lsp() {
+  echo "== Language servers"
+  sudo apt-get install -y python3-pylsp clangd nodejs npm
+  mkdir -p ~/.local/lib/forge-lsp
+  cd ~/.local/lib/forge-lsp
+  [ -f package.json ] || echo '{}' > package.json
+  need_mem 800
+  capped 1500 npm install --no-audit --no-fund \
+    bash-language-server@5.4.2 typescript@5.6.3 typescript-language-server@4.3.3 vscode-langservers-extracted@4.10.0
+}
+
+do_debug() {
+  echo "== Python debugger"
+  sudo apt-get install -y python3-debugpy
+}
+
+do_docs() {
+  echo "== PDF reading and text recognition"
+  sudo apt-get install -y poppler-utils tesseract-ocr tesseract-ocr-eng
+}
+
+do_voice() {
+  echo "== Voice input (whisper.cpp v1.9.5)"
+  sudo apt-get install -y git cmake g++ curl
+  mkdir -p ~/.local/lib/forge-voice
+  if [ ! -d ~/.local/lib/forge-voice/src ]; then
+    git clone --depth 1 --branch v1.9.5 https://github.com/ggml-org/whisper.cpp.git ~/.local/lib/forge-voice/src
+  fi
+  cd ~/.local/lib/forge-voice/src
+  need_mem 1500
+  capped 1200 bash -c 'cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DGGML_NATIVE=ON >/dev/null && cmake --build build -j3 --target whisper-cli'
+  fetch_checked https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin \
+    a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002 ~/.forge-ide/models/ggml-base.en.bin
+}
+
+do_index() {
+  echo "== Codebase index (llama.cpp CPU server and nomic-embed-text v1.5)"
+  sudo apt-get install -y git cmake g++ curl
+  local src=~/.local/lib/forge-embed/llama.cpp
+  if [ ! -d "$src" ]; then
+    git clone https://github.com/ggml-org/llama.cpp.git "$src"
+    git -C "$src" checkout -q 091b6a7fc561b78da90a0ed2d524ec995458c657
+  fi
+  need_mem 2000
+  capped 1500 bash -c "cmake -S '$src' -B '$src/build-cpu' -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=ON -DGGML_VULKAN=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF >/dev/null && cmake --build '$src/build-cpu' -j2 --target llama-server"
+  cp "$src/build-cpu/bin/llama-server" ~/.local/lib/forge-embed/llama-server
+  fetch_checked https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf \
+    3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7 ~/.forge-ide/models/embed/nomic-embed-text-v1.5.Q8_0.gguf
+}
+
+case "$WANT" in
+  lsp) do_lsp ;;
+  debug) do_debug ;;
+  docs) do_docs ;;
+  voice) do_voice ;;
+  index) do_index ;;
+  all) do_docs; do_debug; do_lsp; do_voice; do_index ;;
+  *) echo "Usage: $0 [lsp|debug|docs|voice|index|all]"; exit 2 ;;
+esac
+echo "Done. Restart Forge with: forge-ide restart"
