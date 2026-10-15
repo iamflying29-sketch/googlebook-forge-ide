@@ -79,8 +79,8 @@
     if (session && session.dap) await sendBreakpoints(rel).catch(() => {});
   }
   D.toggleAtCursor = () => { const ed = (window.ForgeSplit && window.ForgeSplit.focused()) ? window.ForgeSplit.editor : F.editor, m = ed && ed.getModel(); if (m) toggleBreakpoint(m, ed.getPosition().lineNumber); };
-  const FAMILY = { python: /\.py$/i, c: /\.(c|h|cc|cpp|cxx|hpp)$/i, cpp: /\.(c|h|cc|cpp|cxx|hpp)$/i, rust: /\.rs$/i, kotlin: /\.(kt|kts|java)$/i, java: /\.(kt|kts|java)$/i };
-  const LANG_OF = (p) => (/\.py$/i.test(p) ? 'python' : /\.(c|h)$/i.test(p) ? 'c' : /\.(cc|cpp|cxx|hpp)$/i.test(p) ? 'cpp' : /\.rs$/i.test(p) ? 'rust' : /\.(kt|kts)$/i.test(p) ? 'kotlin' : /\.java$/i.test(p) ? 'java' : null);
+  const FAMILY = { python: /\.py$/i, c: /\.(c|h|cc|cpp|cxx|hpp)$/i, cpp: /\.(c|h|cc|cpp|cxx|hpp)$/i, rust: /\.rs$/i, kotlin: /\.(kt|kts|java)$/i, java: /\.(kt|kts|java)$/i, javascript: /\.(m|c)?(js|ts)$/i, typescript: /\.(m|c)?(js|ts)$/i };
+  const LANG_OF = (p) => (/\.py$/i.test(p) ? 'python' : /\.(c|h)$/i.test(p) ? 'c' : /\.(cc|cpp|cxx|hpp)$/i.test(p) ? 'cpp' : /\.rs$/i.test(p) ? 'rust' : /\.(kt|kts)$/i.test(p) ? 'kotlin' : /\.java$/i.test(p) ? 'java' : /\.(m|c)?js$/i.test(p) ? 'javascript' : /\.(m|c)?ts$/i.test(p) ? 'typescript' : null);
   const srcPath = (p) => (p && p.startsWith('file://') ? decodeURIComponent(p.slice(7)) : p);   // the Kotlin debugger sends URIs
   async function sendBreakpoints(rel) {
     if (session && session.lang && !FAMILY[session.lang].test(rel)) return;
@@ -137,7 +137,7 @@
     let program = (progInput && progInput.value.trim()) || F.activePath || '';
     if (!program) return toast('Open the file you want to run, or type its path in Run and Debug.', 'error');
     const lang = LANG_OF(program);
-    if (!lang) return toast('Forge can debug Python, C, C++, Rust, Kotlin and Java files.', 'error');
+    if (!lang) return toast('Forge can debug Python, C, C++, Rust, Kotlin, Java, JavaScript and TypeScript files.', 'error');
     if (F.saveAll) await F.saveAll();
     const args = ($('#dbg-args') && $('#dbg-args').value.trim()) ? $('#dbg-args').value.trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g).map((a) => a.replace(/^["']|["']$/g, '')) : [];
     F.showPanel('debug');
@@ -147,7 +147,7 @@
     renderSidebar();
     try {
       let prep = { program: F.absPath(program) };
-      if (lang !== 'python') {
+      if (lang !== 'python' && lang !== 'javascript') {
         out('Building with debug information…', 'info');
         prep = await F.post('/api/debug/prepare', { path: program });
         if (prep.build) out('$ ' + prep.build, 'info');
@@ -156,13 +156,17 @@
       }
       s.dap = new Dap((ev) => onEvent(s, ev), lang);
       await s.dap.connect();
-      const adapterID = lang === 'python' ? 'debugpy' : (lang === 'kotlin' || lang === 'java') ? 'intellij_jvm' : 'gdb';
+      const js = lang === 'javascript' || lang === 'typescript';
+      const adapterID = lang === 'python' ? 'debugpy' : (lang === 'kotlin' || lang === 'java') ? 'intellij_jvm' : js ? 'pwa-node' : 'gdb';
       await s.dap.request('initialize', { clientID: 'forge', clientName: 'Forge IDE', adapterID, pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true, supportsVariableType: true, supportsRunInTerminalRequest: false, locale: 'en' });
       s.initialized = new Promise((res) => { s.onInitialized = res; });
       let launchArgs;
       if (lang === 'python') launchArgs = { type: 'python', request: 'launch', name: 'Forge', program: F.absPath(program), args, cwd: F.folder, console: 'internalConsole', redirectOutput: true, justMyCode: true, showReturnValue: true, noDebug: !!noDebug, stopOnEntry: false };
       else if (lang === 'kotlin' || lang === 'java') launchArgs = { type: 'intellij_jvm', request: 'launch', name: 'Forge', tool: 'java', mainClass: prep.main_class, file: prep.file, args, cwd: F.folder, console: 'internalConsole', noDebug: !!noDebug,
         classPaths: prep.class_paths, javaExec: prep.java_exec, vmArgs: ['-Xmx256m', '-XX:TieredStopAtLevel=1', '-XX:+UseSerialGC'] };
+      else if (js) launchArgs = { type: 'pwa-node', request: 'launch', name: 'Forge', program: prep.program, args, cwd: F.folder, __workspaceFolder: F.folder, console: 'internalConsole', outputCapture: 'std',
+        skipFiles: ['<node_internals>/**'], sourceMaps: true, outFiles: prep.out_dir ? [prep.out_dir + '/**/*.js'] : undefined,
+        resolveSourceMapLocations: prep.out_dir ? [prep.out_dir + '/**', F.folder + '/**', '!**/node_modules/**'] : undefined, noDebug: !!noDebug };   // TypeScript is compiled into Forge's build folder
       else launchArgs = { name: 'Forge', program: prep.program, args, cwd: prep.cwd || F.folder, stopAtBeginningOfMainSubprogram: false };
       const launched = s.dap.request('launch', launchArgs, lang === 'kotlin' || lang === 'java' ? 600000 : 60000);
       await Promise.race([s.initialized, launched]);

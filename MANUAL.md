@@ -1,4 +1,4 @@
-# Forge IDE Manual (version 1.8.0)
+# Forge IDE Manual (version 1.9.0)
 
 Forge is a Cursor-style AI coding IDE that runs entirely on your Lenovo Googlebook 15. The editor, the agent, the terminal and the models all live on the laptop, and nothing you type leaves it. This manual explains every part of it.
 
@@ -142,7 +142,7 @@ Click the microphone button in the AI panel (or press Ctrl Shift Space) and spea
 
 ## 13. Debugging
 
-Forge debugs **Python, C, C++, Rust, Kotlin and Java** programs, and **Android apps** on a device. Open the **Run and Debug** view (the play icon in the activity bar).
+Forge debugs **Python, C, C++, Rust, Kotlin, Java, JavaScript and TypeScript** programs, and **Android apps** on a device. Open the **Run and Debug** view (the play icon in the activity bar).
 
 1. Click left of a line number to set a **breakpoint** (a red dot), or press F9 on the line. Breakpoints are remembered per folder and move with the code when you edit.
 2. Press **F5** (or Start debugging). Forge saves your files and runs the file you have open; you can type another file and arguments in the view. Forge picks the debugger from the file:
@@ -150,6 +150,7 @@ Forge debugs **Python, C, C++, Rust, Kotlin and Java** programs, and **Android a
    - **C and C++** are compiled first with debug information (`gcc` or `g++` with `-g -O0`, next to the source file) and run under GDB.
    - **Rust** is built with `forge-cargo build` and runs under rust-gdb, GDB with Rust's own display of strings, vectors and other types.
    - **Kotlin and Java** are compiled with the Kotlin compiler (and javac for Java files) into Forge's build folder, together with the libraries of the project, and run under the debugger built into JetBrains' Kotlin language server. Forge uses the Kotlin server the editor already runs for the folder; if none is open (in a Java project, for example), it starts one of its own for the session, which needs about 4.1 GB free on the Googlebook. The file needs a `main` function.
+   - **JavaScript** runs with Node under Microsoft's js-debug (the debugger VS Code uses). **TypeScript** is compiled first with `tsc` into Forge's build folder (with your `tsconfig.json` when the folder has one), and breakpoints and the current line stay in your `.ts` files through source maps.
    The build output appears in the Debug console.
 3. When the program stops, the line is highlighted. The view shows the **variables** (click ▸ to look inside lists, dictionaries, structures and objects), your **watch** expressions and the **call stack** (click a frame to jump there).
 4. Step with **F10** (over), **F11** (into) and **Shift F11** (out). **F5** continues, **F6** pauses a running program, **Ctrl Shift F5** restarts and **Shift F5** stops.
@@ -157,7 +158,7 @@ Forge debugs **Python, C, C++, Rust, Kotlin and Java** programs, and **Android a
 
 **Android apps.** In the Android view, Debug on device starts the installed debug build on the target device (a virtual device, the Googlebook or a paired phone) so that it waits for the debugger, connects through adb, and attaches the Kotlin debugger. Set breakpoints in your Kotlin or Java code first; the app stops there, with its variables and the call stack down into Android's own classes. Build and install the app before (Build, install and run does both). While attached to Android, expressions in the Debug console may not work yet; this is a known limit of JetBrains' debugger.
 
-"Run without debugging" (Ctrl F5) runs the file with its output in the Debug console. The debugged program and its debugger run inside a memory cap (1 GB, or the Kotlin server's cap with a 256 MB Java heap for the program). Python debugging needs `python3-debugpy` (`install-extras.sh debug`); C, C++ and Rust need GDB 14 or newer (Debian 13 has 16.3). Stopping a session also stops the program and everything it started.
+"Run without debugging" (Ctrl F5) runs the file with its output in the Debug console. The debugged program and its debugger run inside a memory cap (1 GB, or the Kotlin server's cap with a 256 MB Java heap for the program). `install-extras.sh debug` installs debugpy, GDB (C, C++ and Rust need GDB 14 or newer; Debian 13 has 16.3) and js-debug; TypeScript also needs `tsc` from `install-extras.sh lsp`. Stopping a session also stops the program and everything it started.
 
 ## 14. Notebooks
 

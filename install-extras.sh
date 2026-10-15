@@ -64,8 +64,13 @@ do_lsp() {
 }
 
 do_debug() {
-  echo "== Python debugger"
-  sudo apt-get install -y python3-debugpy
+  echo "== Debuggers: debugpy (Python), GDB (C, C++ and Rust) and js-debug 1.140.0 (JavaScript and TypeScript)"
+  sudo apt-get install -y python3-debugpy gdb
+  local D=$HOME/.local/lib/forge-jsdebug
+  fetch_checked https://github.com/microsoft/vscode-js-debug/releases/download/v1.140.0/js-debug-dap-v1.140.0.tar.gz \
+    27dab92937ec1ab35821ae955aac867544fe06a1b6307229049f2d789af10968 "$D/dl-1.140.0/js-debug-dap-v1.140.0.tar.gz"
+  mkdir -p "$D/v1.140.0"
+  tar -xzf "$D/dl-1.140.0/js-debug-dap-v1.140.0.tar.gz" -C "$D/v1.140.0"
 }
 
 do_docs() {

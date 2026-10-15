@@ -17,7 +17,8 @@ import subprocess
 from typing import Optional
 
 LANGS = {".py": "python", ".c": "c", ".h": "c", ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp",
-         ".rs": "rust", ".kt": "kotlin", ".kts": "kotlin", ".java": "java"}
+         ".rs": "rust", ".kt": "kotlin", ".kts": "kotlin", ".java": "java", ".js": "javascript", ".mjs": "javascript",
+         ".cjs": "javascript", ".ts": "typescript", ".mts": "typescript", ".cts": "typescript"}
 
 
 def lang_of(path: str) -> Optional[str]:
@@ -60,9 +61,11 @@ def prepare(path: str, root: str) -> dict:
     """Build what a debug session needs and say how to launch it."""
     lang = lang_of(path)
     if lang is None:
-        return {"ok": False, "message": "Forge can debug Python, C, C++, Rust, Kotlin and Java files."}
-    if lang == "python":
+        return {"ok": False, "message": "Forge can debug Python, C, C++, Rust, Kotlin, Java, JavaScript and TypeScript files."}
+    if lang in ("python", "javascript"):
         return {"ok": True, "lang": lang, "program": path}
+    if lang == "typescript":
+        return _build_ts(path, root)
     if lang in ("c", "cpp"):
         if path.endswith((".h", ".hpp")):
             return {"ok": False, "message": "Open the .c or .cpp file that has main, not a header."}
@@ -224,3 +227,24 @@ def android_prepare(app_id: str, serial: str, port: int) -> dict:
 def android_release(local_port: int, serial: str, port: int) -> None:
     from .devices import adb
     adb(["forward", "--remove", f"tcp:{int(local_port)}"], serial=serial, port=port, timeout=10)
+
+
+def _build_ts(path: str, root: str) -> dict:
+    """Compile a TypeScript program (the file and what it imports) with tsc into Forge's build folder, with source
+    maps, so breakpoints in the .ts files work. Node 20 cannot run TypeScript by itself."""
+    import hashlib
+    from .lsp import NODE_BIN
+    tsc = os.path.join(NODE_BIN, "tsc")
+    if not os.path.isfile(tsc):
+        return {"ok": False, "message": "TypeScript is not installed (install-extras.sh lsp installs it)."}
+    base = root if os.path.commonpath([root, path]) == root else os.path.dirname(path)
+    out = os.path.join(os.path.expanduser("~"), ".forge-ide", "debug-build", "ts-" + hashlib.sha1(base.encode()).hexdigest()[:12])
+    os.makedirs(out, exist_ok=True)
+    cfg = os.path.join(base, "tsconfig.json")
+    cmd = [tsc, "--inlineSourceMap", "--inlineSources", "--outDir", out, "--rootDir", base, "--skipLibCheck"]   # maps inside the .js files
+    cmd += ["-p", cfg] if os.path.isfile(cfg) else ["--target", "es2022", "--module", "commonjs", "--esModuleInterop", path]
+    code, text = _run(cmd, base, 300)
+    program = os.path.join(out, os.path.splitext(os.path.relpath(path, base))[0] + ".js")
+    ok = os.path.isfile(program)
+    return {"ok": ok, "lang": "typescript", "program": program, "out_dir": out, "build": "tsc", "output": text,
+            "message": "" if ok else "The TypeScript code did not compile. The output is in the Debug console."}

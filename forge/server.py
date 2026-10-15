@@ -1718,6 +1718,10 @@ class Handler(BaseHTTPRequestHandler):
                 if stop_own:
                     stop_own()
             return
+        if lang in ("javascript", "typescript"):
+            from . import jsdebug
+            jsdebug.serve(sock, folder, gate, os.path.join(DATA_DIR, "logs"))
+            return
         if lang == "python":
             import importlib.util
             cmd = [sys.executable, "-m", "debugpy.adapter"] if importlib.util.find_spec("debugpy") else None
