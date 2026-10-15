@@ -27,6 +27,9 @@ case "$VARIANT" in
     SYS=lineage-23.0-20260403-GAPPS-waydroid_tv_x86_64-system.zip; SYS_SHA=ddf5995f9104fe7164ad326def8bbed5cbf6340b55da5012e240b5855c44953b
     VEN=lineage-23.0-20260403-MAINLINE-waydroid_tv_x86_64-vendor.zip; VEN_SHA=8b8b176c7d3b34719889f3c891d86b98af8dbbb2f737a970e89302fa3d0cf077
     ARCH=waydroid_tv_x86_64; SDK=36; BASE=$HOME/.forge-ide/vd/atv16; DL=$BASE/dl-20261015; IMG=$BASE/img-google
+    # This build has no Docker support in its start step: it needs /etc as the system image's own link to
+    # /system/etc, and a fresh /dev, which forge-init (compiled below) mounts before Android's init starts.
+    KEEP_ETC=1
     DESC="LineageOS 23.0 (Android TV 16) GAPPS 20260403 and MAINLINE TV vendor 20260403 from WayDroid-ATV, SHA-256 verified" ;;
   *)
     echo "Usage: forge-vd-image 17 | 17-google | tv16-google   (Android 11 to 16 are downloaded with podman pull)"; exit 2 ;;
@@ -60,7 +63,14 @@ mountpoint -q "$MNT/vendor" || sudo -n mount -o ro,loop "$IMG/vendor.img" "$MNT/
 trap 'sudo -n umount "$MNT/system" "$MNT/vendor" 2>/dev/null || true' EXIT
 grep -q "^ro.system.build.version.sdk=$SDK" <(sudo -n cat "$MNT/system/system/build.prop") || { echo "This is not an API $SDK system image."; exit 1; }
 echo "Building the container image"
-sudo -n tar --xattrs --xattrs-include='*' -C "$MNT" -c vendor -C "$MNT/system" --exclude=./vendor --exclude=./etc . -C "$STAGE" etc \
-  | sudo -n env CONTAINERS_CONF_OVERRIDE="$CONF" nice -n 10 podman import -c 'ENTRYPOINT ["/init"]' -m "$DESC" - "$TAG"
+if [ "${KEEP_ETC:-0}" = 1 ]; then
+  mkdir -p "$STAGE/tv"
+  gcc -static -O2 -Wall -Wno-format-truncation -o "$STAGE/tv/forge-init" "$(dirname "$(readlink -f "$0")")/../vd/forge-init.c"
+  sudo -n tar --xattrs --xattrs-include='*' -C "$MNT" -c vendor -C "$MNT/system" --exclude=./vendor . -C "$STAGE/tv" forge-init \
+    | sudo -n env CONTAINERS_CONF_OVERRIDE="$CONF" nice -n 10 podman import -c 'ENTRYPOINT ["/forge-init"]' -m "$DESC" - "$TAG"
+else
+  sudo -n tar --xattrs --xattrs-include='*' -C "$MNT" -c vendor -C "$MNT/system" --exclude=./vendor --exclude=./etc . -C "$STAGE" etc \
+    | sudo -n env CONTAINERS_CONF_OVERRIDE="$CONF" nice -n 10 podman import -c 'ENTRYPOINT ["/init"]' -m "$DESC" - "$TAG"
+fi
 sync; sudo -n sysctl -q -w vm.drop_caches=1 || true
 echo "$TAG is ready."

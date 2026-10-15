@@ -1,0 +1,62 @@
+#!/bin/bash
+# forge-preview: renders the @Preview composables of an Android module on device screen shapes, without a device
+# (part of Forge IDE). Robolectric runs Android's framework on the JVM and Roborazzi saves each preview as a PNG, so
+# a round Wear OS watch, a TV, a tablet and a foldable can be checked in seconds. Run it in the project folder:
+#
+#   forge-preview [:module] [--shapes phone,foldable,tablet,watch-round,watch-square,tv]
+#
+# The libraries and Forge's test are added through a Gradle init script for this run only; the project's files are
+# not changed. The pictures go to ~/.forge-ide/previews/<project>/<time>/<shape>/. The run gets the Googlebook's
+# free memory above its 2.3 GB reserve as a hard cap (at most 3.5 GB, at least 2.8 GB), with small Java heaps inside it.
+set -euo pipefail
+module=:app; shapes=phone,foldable,tablet,watch-round,watch-square,tv
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --shapes) shapes=$2; shift 2 ;;
+    :*) module=$1; shift ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "Unknown argument: $1"; exit 2 ;;
+  esac
+done
+here=$(dirname "$(readlink -f "$0")")
+reserve=2300; max_cap=3584; min_cap=2800
+info=$(curl -s -m 8 "http://127.0.0.1:${FORGE_PORT:-8765}/api/memcheck?vm=0&host=0&what=Compose%20previews" 2>/dev/null || true)
+host=$(printf '%s' "$info" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin); print(int(d.get("host_mb") if d.get("host_mb") is not None else -1))
+except Exception: print(-1)')
+vm=$(free -m | awk 'NR==2 {print $7}')
+if [ "$host" -lt 0 ]; then
+  echo "Forge: the Googlebook's free memory is unknown, so previews do not run (they need up to 3.5 GB)."; exit 1
+fi
+budget=$((host - reserve)); [ $((vm - 300)) -lt "$budget" ] && budget=$((vm - 300))
+cap=$budget; [ "$cap" -gt $max_cap ] && cap=$max_cap
+if [ "$cap" -lt $min_cap ]; then
+  echo "Forge: not enough free memory for previews right now (the Googlebook has ${host} MB free; about $((min_cap + reserve)) MB are needed so that it keeps its 2.3 GB reserve)."
+  echo "Close other apps, stop virtual devices or unload the model, then try again."
+  exit 1
+fi
+out="$HOME/.forge-ide/previews/$(basename "$PWD")/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$out"
+if [ -z "${ANDROID_HOME:-}" ]; then   # outside Forge's terminal: the SDK Forge uses
+  for sdk in "$HOME/tools/android-sdk" "$HOME/Android/Sdk"; do
+    [ -d "$sdk/platforms" ] && { export ANDROID_HOME=$sdk; break; }
+  done
+fi
+if [ -x ./gradlew ]; then G=./gradlew
+elif command -v gradle >/dev/null; then G=gradle
+else G=$(ls -d "$HOME"/.local/lib/forge-android/gradle-*/bin/gradle 2>/dev/null | sort -V | tail -n 1); G=${G:-gradle}
+fi
+echo "Forge: rendering the previews of $module on: $shapes (memory cap ${cap} MB)."
+set +e
+systemd-run --user --scope --quiet -p "MemoryMax=${cap}M" -p MemorySwapMax=0 nice -n 5 \
+  "$G" --no-daemon --init-script "$here/../preview/forge-preview.init.gradle" \
+  "-Dorg.gradle.jvmargs=-Xmx1g -XX:MaxMetaspaceSize=448m -XX:+UseSerialGC -XX:ReservedCodeCacheSize=128m -Dfile.encoding=UTF-8" \
+  -Pkotlin.compiler.execution.strategy=in-process -Dorg.gradle.workers.max=2 \
+  "-Pforge.preview.module=$module" "-Pforge.preview.src=$here/../preview/src" "-Pforge.preview.out=$out" \
+  "-Pforge.preview.shapes=$shapes" "${module%:}:testDebugUnitTest" --tests forge.preview.ForgePreviewTest
+status=$?
+set -e
+count=$(find "$out" -name '*.png' | wc -l)
+echo "Forge: $count preview pictures in $out"
+find "$out" -name '*.png' | sort | head -40
+exit $status

@@ -267,7 +267,9 @@
         el('button', { class: 'btn ghost sm', text: 'Install', disabled: !m.apk || !t, onclick: () => installApk(m) }),
         el('button', { class: 'btn ghost sm', text: 'Run', disabled: !m.application_id || !t, onclick: () => launchApp(m) }),
         el('button', { class: 'btn ghost sm', text: 'Debug on device', disabled: !m.application_id || !t, title: 'Starts the installed debug build on ' + targetName() + ' and attaches the debugger (breakpoints in the gutter, F9)', onclick: () => window.ForgeDebug && window.ForgeDebug.attachAndroid({ app_id: m.application_id }) }),
-        el('button', { class: 'btn ghost sm', text: 'App logcat', disabled: !m.application_id, onclick: () => openLogcat(m.application_id) })));
+        el('button', { class: 'btn ghost sm', text: 'App logcat', disabled: !m.application_id, onclick: () => openLogcat(m.application_id) }),
+        el('button', { class: 'btn ghost sm', text: 'Compose previews', title: 'Renders every @Preview of this module as pictures on phone, foldable, tablet, round and square watch and TV screens, without a device (forge-preview)',
+          onclick: () => runInTerminal('forge-preview ' + (m.module === '.' ? ':' : ':' + m.module.split('/').join(':')), 'Compose previews') })));
     }
     box.append(actions(
       el('button', { class: 'btn ghost sm', text: 'Lint', onclick: () => runInTerminal('forge-gradle lint', 'Android lint') }),

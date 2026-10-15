@@ -239,6 +239,10 @@ def prompt_section(root: str) -> str:
         lines.append("- To see the running app, save a screenshot with `adb exec-out screencap -p > ~/.forge-ide/screen.png`, then "
                      "call look_at_image with that path and a question; the vision model looks at it for you. For errors, read "
                      "`adb logcat -d -t 300 '*:E'`.")
+        lines.append("- To see Jetpack Compose screens without a device, run `forge-preview [:module] [--shapes phone,foldable,"
+                     "tablet,watch-round,watch-square,tv]`. It renders every @Preview (Wear OS ones too) as PNG pictures with "
+                     "Robolectric and prints their paths under ~/.forge-ide/previews/; look at them with look_at_image. It does "
+                     "not change the project's files, and it is the way to check real Wear OS Compose screens.")
         lines.append("- Builds run inside a 2 GB memory limit and need free memory; keep Gradle builds to one at a time.")
     try:
         from .android import kmp_info

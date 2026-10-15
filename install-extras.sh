@@ -117,7 +117,7 @@ do_android() {
   fi
   need_mem 1500
   # Input is closed: if Google ever asks for a new license, sdkmanager stops instead of accepting it for you.
-  capped 1200 "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" "platforms;android-36" "platforms;android-36.1" \
+  capped 1200 "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" "platforms;android-36" "platforms;android-36.1" "platforms;android-37.2" \
     "build-tools;36.1.0" "build-tools;37.0.0" "sources;android-35" "sources;android-36" "ndk;29.0.14206865" "cmake;4.1.2" < /dev/null
   local K=https://download.jetbrains.com/language-server/kotlin-server/263.6379.0/kotlin-server-263.6379.0.tar.gz
   fetch_checked "$K" "$(curl -fsSL "$K.sha256" | awk '{print $1}')" "$A/dl/kotlin-server-263.6379.0.tar.gz"

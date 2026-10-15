@@ -16,6 +16,8 @@ Safety, all measured on this Googlebook (2026-10-15):
 - Forge's adb server (port 5041) holds the devices, never the shared one other Googlebook tools use."""
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -53,7 +55,10 @@ VERSIONS: Dict[str, dict] = {
                   "types": ["phone", "small-phone", "foldable", "tablet", "watch-round", "watch-square", "desktop"]},
     "tv16-google": {"label": "Android TV 16 with Google apps", "detail": "LineageOS 23.0 Android TV with Google Play and a Google TV mode, API 36",
                     "image": "localhost/forge-android:tv16-google", "backend": "waydroid", "cap_mb": 3072, "build": "forge-vd-image tv16-google",
-                    "size": "1.2 GB download, 2.9 GB on disk", "types": ["tv"], "args": ["atv.setup.bt_remote_pairing=false"]},
+                    "size": "1.2 GB download, 2.9 GB on disk", "types": ["tv"], "args": ["atv.setup.bt_remote_pairing=false"],
+                    # Its start step predates WayDroid's Docker support: forge-init prepares /dev, and Forge writes the
+                    # waydroid.prop and answers its network request (DHCP) as WayDroid's own container manager would.
+                    "prop_file": True, "dhcp": True},
     "16": {"label": "Android 16", "detail": "AOSP, API 36", "image": "docker.io/redroid/redroid:16.0.0_64only-latest", "backend": "redroid", "cap_mb": 2560, "size": "0.8 GB download"},
     "15": {"label": "Android 15", "detail": "AOSP, API 35", "image": "docker.io/redroid/redroid:15.0.0_64only-latest", "backend": "redroid", "cap_mb": 2560, "size": "0.7 GB download"},
     "14": {"label": "Android 14", "detail": "AOSP, API 34", "image": "docker.io/redroid/redroid:14.0.0_64only-latest", "backend": "redroid", "cap_mb": 2560, "size": "0.7 GB download"},
@@ -508,6 +513,75 @@ def _start_display(d: dict) -> Optional[str]:
     return "The invisible display for Android 17 did not appear."
 
 
+# ------------------------------------------------------------------ network for WayDroid's older builds
+# Android's Ethernet service takes over eth0: it clears the address Podman gave the container and asks for one by
+# DHCP, as a TV does on a home network. WayDroid's own container manager answers that with dnsmasq on its bridge, and
+# Forge does the same on Podman's bridge for the images that need it: each such device gets a fixed hardware address
+# and network address, and one small dnsmasq (DHCP only for those addresses, plus DNS passed on to the VM's resolver)
+# runs while any of them runs. It listens only on Podman's bridge.
+DHCP_UNIT = "forge-vd-dhcp"
+_net_cache: Dict[str, tuple] = {}
+
+
+def _podman_net() -> Tuple[str, ipaddress.IPv4Interface]:
+    """Podman's default network as Podman reports it: the bridge's name, and its gateway with the network's prefix."""
+    if "net" not in _net_cache:
+        r = pod(["network", "inspect", "podman"], timeout=20)
+        net = json.loads(r.stdout)[0]
+        sub = next(x for x in net["subnets"] if ":" not in x["subnet"])   # the IPv4 network
+        _net_cache["net"] = (net["network_interface"], ipaddress.ip_interface(f"{sub['gateway']}/{sub['subnet'].split('/')[1]}"))
+    return _net_cache["net"]
+
+
+def _net_identity(d: dict) -> Tuple[str, str]:
+    """A fixed hardware address and network address for a device. The addresses come from the top of Podman's
+    network, and Podman hands out its own from the bottom, so the two do not meet."""
+    i = d["port"] - FIRST_PORT
+    mac = "02:f0:" + ":".join(f"{b:02x}" for b in hashlib.sha1(d["id"].encode()).digest()[:4])
+    return mac, str(_podman_net()[1].network.broadcast_address - 2 - i)
+
+
+def _dhcp_devices() -> List[dict]:
+    return [d for d in definitions() if VERSIONS.get(d["version"], {}).get("dhcp")]
+
+
+def _sudo(args: List[str], timeout: float = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(["sudo", "-n"] + args, capture_output=True, text=True, timeout=timeout)
+
+
+def ensure_dhcp() -> Optional[str]:
+    """(Re)starts the DHCP service for the devices that need it, right after such a device's container started: Podman
+    creates its bridge only while a container runs, and a fresh start never sits on a bridge that was replaced. Their
+    addresses are fixed, so a running device simply renews with the new instance. Returns an error text or None."""
+    try:
+        bridge, gw = _podman_net()
+        hosts = [f"--dhcp-host={mac},{ip}" for mac, ip in (_net_identity(d) for d in _dhcp_devices())]
+    except (OSError, ValueError, KeyError, IndexError, StopIteration, subprocess.SubprocessError) as e:
+        return f"Podman's network could not be read: {e}"
+    cmd = ["/usr/sbin/dnsmasq", "--keep-in-foreground", "--conf-file=/dev/null", "--pid-file=", f"--interface={bridge}",
+           "--except-interface=lo", "--bind-interfaces", f"--listen-address={gw.ip}", "--no-hosts", "--leasefile-ro",
+           f"--dhcp-range={gw.network.network_address},static,{gw.network.netmask},12h", "--dhcp-ignore=tag:!known",
+           f"--dhcp-option=option:router,{gw.ip}", f"--dhcp-option=option:dns-server,{gw.ip}", "--log-facility=-"] + hosts
+    _sudo(["systemctl", "stop", DHCP_UNIT])
+    _sudo(["systemctl", "reset-failed", DHCP_UNIT])
+    r = _sudo(["systemd-run", "--quiet", f"--unit={DHCP_UNIT}", "-p", "MemoryMax=32M", "-p", "TasksMax=8",
+               "--description=Forge: DHCP and DNS for virtual Android TVs on the Podman bridge"] + cmd)
+    if r.returncode != 0:
+        return "The network service for the device did not start: " + (r.stderr or r.stdout).strip()[-200:]
+    time.sleep(1)
+    if _sudo(["systemctl", "is-active", "--quiet", DHCP_UNIT]).returncode != 0:
+        log = _sudo(["journalctl", "-u", DHCP_UNIT, "-n", "3", "--no-pager", "-o", "cat"]).stdout.strip()
+        return "The network service for the device stopped: " + log[-200:]
+    return None
+
+
+def stop_dhcp_if_idle(stopping: str = "") -> None:
+    """Stops the DHCP service when no device that needs it runs (the one being stopped does not count, because its
+    container can take a moment to disappear)."""
+    if not any(running(d) for d in _dhcp_devices() if d["id"] != stopping):
+        _sudo(["systemctl", "stop", DHCP_UNIT])
+
+
 def _run_args(d: dict, image: str) -> List[str]:
     info = VERSIONS[d["version"]]
     prof = PROFILES[(d.get("look") or {}).get("profile") or TYPES[d["type"]]]
@@ -519,6 +593,23 @@ def _run_args(d: dict, image: str) -> List[str]:
         args += ["-v", f"{os.path.join(VD_DIR, 'features', 'tv.xml')}:/vendor/etc/permissions/forge-device-type.xml:ro"]
     if personas.features_xml(d.get("persona")):
         args += ["-v", f"{os.path.join(VD_DIR, 'features', 'persona-' + d['persona'] + '.xml')}:/vendor/etc/permissions/forge-persona.xml:ro"]
+    if info.get("dhcp"):
+        mac, ip = _net_identity(d)
+        args += ["--mac-address", mac, "--ip", ip]
+    if info.get("prop_file"):
+        props = ["gralloc.gbm.device=/dev/dri/renderD128", "persist.waydroid.multi_windows=false", "ro.adb.secure=0",
+                 "sys.use_memfd=true", "waydroid.background_start=true", f"waydroid.host.gid={os.getgid()}",
+                 f"waydroid.host.uid={os.getuid()}", "waydroid.pulse_runtime_path=/run/xdg/pulse", "waydroid.stub_sensors_hal=1",
+                 "waydroid.wayland_display=wayland-0", "waydroid.xdg_runtime_dir=/run/xdg",
+                 # The graphics settings WayDroid's container manager writes for a machine with a render node.
+                 "ro.hardware.gralloc=minigbm_gbm_mesa", "ro.hardware.egl=mesa", "ro.opengles.version=196610",
+                 "ro.vndk.lite=true", "waydroid.updater.disabled=true"] + info.get("args", [])
+        # This build does not turn the start arguments into properties, so the type and persona ones go here too.
+        props += (["ro.build.characteristics=tv"] if d["type"] == "tv" else []) + personas.init_args(d.get("persona"))
+        prop = os.path.join(VD_DIR, "props", f"{d['id']}.prop")
+        os.makedirs(os.path.dirname(prop), exist_ok=True)
+        _write_if_changed(prop, "# Written by Forge, as WayDroid's container manager would\n" + "\n".join(props) + "\n")
+        args += ["-v", f"{prop}:/vendor/waydroid.prop:ro"]
     if info["backend"] == "waydroid":
         args += ["-v", f"{os.path.join(VD_DIR, 'empty')}:/.dockerenv:ro",
                  "-v", f"/run/user/{os.getuid()}/forge-vd-{d['id']}:/run/xdg/wayland-0",
@@ -613,6 +704,13 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
             _set(d["id"], "failed", "The container did not start: " + (r.stderr or r.stdout).strip()[-300:])
             _stop_display(d)
             return
+        if info.get("dhcp"):
+            err = ensure_dhcp()
+            if err:
+                pod(["kill", container(d)], timeout=40)
+                _set(d["id"], "failed", err)
+                _stop_display(d)
+                return
         touch_active(d)
         subprocess.run(["systemd-run", "--user", "--quiet", f"--unit=forge-vd-{d['id']}-watchdog", "-p", "MemoryMax=64M",
                         "/usr/bin/python3", "-I", os.path.join(BIN, "forge-vd-watchdog"), container(d), d["id"], _display_unit(d)],
@@ -625,6 +723,7 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
             if not running(d, fresh=True):
                 _set(d["id"], "failed", "Android stopped while starting. The Android view's notices or the Forge log say why.")
                 _stop_display(d)
+                stop_dhcp_if_idle(d["id"])
                 return
             if info["backend"] == "waydroid" and not provisioned:
                 b = _in_android(d, "getprop sys.boot_completed", timeout=15).stdout.strip()
@@ -642,7 +741,13 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
                 break
             time.sleep(2)
         else:
-            _set(d["id"], "failed", "Android did not finish starting within 4 minutes.")
+            # A device that never finished starting is stopped, so it does not keep its memory while nobody uses it.
+            pod(["kill", container(d)], timeout=40)
+            subprocess.run(["systemctl", "--user", "stop", f"forge-vd-{d['id']}-watchdog"], capture_output=True, timeout=20)
+            _stop_display(d)
+            stop_dhcp_if_idle(d["id"])
+            _set(d["id"], "failed", "Android did not finish starting within 4 minutes, so Forge stopped it. "
+                                    "The Android view's notices or the Forge log say why.")
             return
         restore_vm_permissions(full=True)
         look = dict(d.get("look") or {})
@@ -698,6 +803,8 @@ def stop(dev_id: str) -> dict:
     adb(["disconnect", serial], port=FORGE_PORT, timeout=8)
     subprocess.run(["systemctl", "--user", "stop", f"forge-vd-{d['id']}-watchdog"], capture_output=True, timeout=20)
     _stop_display(d)
+    if VERSIONS.get(d["version"], {}).get("dhcp"):
+        stop_dhcp_if_idle(d["id"])
     _set(dev_id, "stopped", "")
     ok = r.returncode == 0 or "not running" in (r.stderr or "")
     return {"ok": ok, "message": f"Stopped {d['name']}." if ok else (r.stderr or r.stdout).strip()[-300:]}

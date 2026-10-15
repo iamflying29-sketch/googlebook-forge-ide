@@ -457,6 +457,19 @@ def hazards(fixes: list) -> None:
             pass
     if os.path.isdir("/sys/fs/selinux/class") and os.listdir("/sys/fs/selinux/class"):
         fixes.append("WARNING: an SELinux policy is loaded in the VM's kernel; restart the Terminal app to clear it")
+    # Device-mapper entries live in the VM's shared kernel. Android's package manager names them after its packages;
+    # Forge's images never let it make them, so any that exist were left by an Android that got past that, and they
+    # make the next Android's packages fail to mount. They hold no data; they are reported, not removed.
+    left = []
+    try:
+        for dm in os.listdir("/sys/block"):
+            if dm.startswith("dm-") and (read_text(f"/sys/block/{dm}/dm/name") or "").strip().startswith("com.android."):
+                left.append(dm)
+    except OSError:
+        pass
+    if left:
+        fixes.append(f"WARNING: {len(left)} device-mapper entries named after Android's packages are in the VM's kernel; "
+                     "they hold no data and are gone after the Terminal app restarts")
 
 
 def android_running() -> bool:
@@ -507,8 +520,8 @@ def shield() -> None:
                 log(f"and {len(unlogged) - 15} more like these")
             for fix in unlogged:
                 logged[fix] = now
-            if fixes:
-                recent.extend({"time": time.time(), "fix": f} for f in fixes)
+            if unlogged:   # the status file follows the log, so a standing warning does not crowd out the fixes
+                recent.extend({"time": time.time(), "fix": f} for f in unlogged)
                 del recent[:-50]
             write_status("shield.json", {"time": time.time(), "android_running": bool(running), "active": active,
                                          "reference_time": ref["time"], "recent": recent[-20:],

@@ -1,0 +1,52 @@
+// Forge preview (part of Forge IDE): renders a module's @Preview composables on device screen shapes with Robolectric
+// (Android's framework running on the JVM) and Roborazzi, so no device is needed. forge-preview passes this file to
+// Gradle with --init-script, so the test libraries and Forge's test are added for that run only; the project's own
+// build files are not changed.
+def props = gradle.startParameter.projectProperties
+def module = props["forge.preview.module"] ?: ":app"
+def testDir = props["forge.preview.src"]
+def outDir = props["forge.preview.out"]
+def shapes = props["forge.preview.shapes"] ?: "phone,foldable,tablet,watch-round,watch-square,tv"
+
+allprojects { p ->
+    if (p.path != module) {
+        return
+    }
+    def configure = {
+        def android = p.extensions.getByName("android")
+        android.testOptions.unitTests.includeAndroidResources = true
+        def tests = android.sourceSets.getByName("test")
+        if (tests.hasProperty("kotlin")) {
+            tests.kotlin.srcDir(testDir)   // Android Gradle Plugin 9 compiles Kotlin from the kotlin folders
+        } else {
+            tests.java.srcDir(testDir)
+        }
+        p.dependencies {
+            // The lowest versions Forge's test needs. Compose keeps all its UI libraries at one version, so these are
+            // raised to the version the project already uses; the preview never changes the project's Compose version.
+            testImplementation "androidx.compose.ui:ui-test-junit4:1.7.0"
+            debugImplementation "androidx.compose.ui:ui-test-manifest:1.7.0"
+            testImplementation "junit:junit:4.13.2"
+            testImplementation "org.robolectric:robolectric:4.17"
+            testImplementation "io.github.takahirom.roborazzi:roborazzi:1.76.0"
+            testImplementation "io.github.takahirom.roborazzi:roborazzi-compose:1.76.0"
+            testImplementation "io.github.sergio-sastre.ComposablePreviewScanner:android:0.9.3"
+        }
+        p.tasks.withType(Test).configureEach {
+            systemProperty "roborazzi.test.record", "true"
+            systemProperty "forge.preview.out", outDir
+            systemProperty "forge.preview.shapes", shapes
+            systemProperty "forge.preview.packages", android.namespace
+            maxHeapSize = "1g"
+            jvmArgs "-XX:+UseSerialGC", "-XX:MaxMetaspaceSize=320m", "-XX:ReservedCodeCacheSize=96m",
+                    // Robolectric reaches into these parts of Java's own library, which Java 17 and newer keep closed
+                    "--add-opens=java.base/java.io=ALL-UNNAMED", "--add-opens=java.base/java.lang=ALL-UNNAMED",
+                    "--add-opens=java.base/java.util=ALL-UNNAMED", "--add-opens=java.base/java.nio=ALL-UNNAMED",
+                    "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED", "--add-exports=java.base/jdk.internal.access=ALL-UNNAMED",
+                    "--add-opens=java.base/jdk.internal.access=ALL-UNNAMED"
+            maxParallelForks = 1
+        }
+    }
+    p.pluginManager.withPlugin("com.android.application") { configure() }
+    p.pluginManager.withPlugin("com.android.library") { configure() }
+}
