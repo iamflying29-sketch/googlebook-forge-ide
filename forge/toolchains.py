@@ -222,7 +222,9 @@ def prompt_section(root: str) -> str:
                      f"{s['java'] or ''}.".replace("  ", " "))
         lines.append("- Devices: the target device is chosen in the Android view (`forge-device` lists them). Plain `adb` in your "
                      "commands already talks to the target. There are virtual devices (Android 11 to 17 in containers, as phone, "
-                     "small phone, foldable, tablet, watch-sized, TV or desktop screens), phones, tablets and watches paired over "
+                     "small phone, foldable, tablet, watch-sized, TV or desktop screens, plus Google's own builds of Wear OS 6 for "
+                     "round and square watches, Google TV 16, and Android 16 with Google Play, which has the Pixel Launcher and "
+                     "Google's apps), phones, tablets and watches paired over "
                      "Wi-Fi, and the Googlebook itself (Android 17). To test on another device or screen shape: `forge-device use "
                      "<name or serial>`, `forge-device start <virtual device id>`, `forge-device profile <phone|tablet|foldable|"
                      "watch-round|tv|...>`, `forge-device dark on`, `forge-device font 1.3`.")

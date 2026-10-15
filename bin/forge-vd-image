@@ -4,6 +4,16 @@
 #   17           Android 17 (LineageOS 24.0), VANILLA system and MAINLINE vendor     -> localhost/forge-android:17
 #   17-google    Android 17 (LineageOS 24.0) with Google apps (GAPPS system)         -> localhost/forge-android:17-google
 #   tv16-google  Android TV 16 (LineageOS 23.0) with Google apps and Google TV mode  -> localhost/forge-android:tv16-google
+#   wear6        Wear OS 6.0 (Android 16), Google's official x86_64 build             -> localhost/forge-android:wear6
+#   googletv16   Google TV (Android TV 16), Google's official x86_64 build             -> localhost/forge-android:googletv16
+#   pixel16      Android 16 with Google Play, Google's official x86_64 phone build     -> localhost/forge-android:pixel16
+# The Google variants use Google's official SDK system image (downloaded with sdkmanager, which checks Google's
+# checksums): its system, system_ext and product partitions, with Redroid's Android 16 vendor partition in place of
+# the emulator's (which needs the emulator's virtual hardware), and Redroid's init and SELinux library in place of
+# Google's. Those are made for containers: they never load Android's SELinux policy into the VM's kernel, and the
+# device starts the same way as every Redroid device in Forge. Two small Forge pieces are added: forge-init (locks
+# device-mapper, see vd/forge-init.c) and libforge_compat.so (see vd/compat.c). Everything else is Google's,
+# with its compressed system packages unpacked once here as Android would unpack them on the first boot.
 # The images are only read (mounted read-only); the container image is the system tree with the vendor tree at
 # /vendor and /etc as an empty folder, because the image's Docker-mode start step moves the files a container
 # engine puts into /etc and then restores /etc as a link to /system/etc.
@@ -31,16 +41,87 @@ case "$VARIANT" in
     # /system/etc, and a fresh /dev, which forge-init (compiled below) mounts before Android's init starts.
     KEEP_ETC=1
     DESC="LineageOS 23.0 (Android TV 16) GAPPS 20260403 and MAINLINE TV vendor 20260403 from WayDroid-ATV, SHA-256 verified" ;;
+  wear6)
+    GOOGLE_PKG="system-images;android-36;android-wear-signed;x86_64"; VENDOR_IMAGE=docker.io/redroid/redroid:16.0.0_64only-latest
+    SDK=36; BASE=$HOME/.forge-ide/vd/wear6; IMG=$BASE/img-20261015
+    DESC="Wear OS 6.0 (Android 16) x86_64 system image from Google's SDK repository with Redroid 16's vendor partition" ;;
+  googletv16)
+    GOOGLE_PKG="system-images;android-36;google-tv;x86_64"; VENDOR_IMAGE=docker.io/redroid/redroid:16.0.0_64only-latest
+    SDK=36; BASE=$HOME/.forge-ide/vd/googletv16; IMG=$BASE/img-20261015
+    DESC="Google TV (Android TV 16) x86_64 system image from Google's SDK repository with Redroid 16's vendor partition" ;;
+  pixel16)
+    GOOGLE_PKG="system-images;android-36;google_apis_playstore;x86_64"; VENDOR_IMAGE=docker.io/redroid/redroid:16.0.0_64only-latest
+    SDK=36; BASE=$HOME/.forge-ide/vd/pixel16; IMG=$BASE/img-20261015
+    DESC="Android 16 with Google Play x86_64 system image from Google's SDK repository with Redroid 16's vendor partition" ;;
   *)
-    echo "Usage: forge-vd-image 17 | 17-google | tv16-google   (Android 11 to 16 are downloaded with podman pull)"; exit 2 ;;
+    echo "Usage: forge-vd-image 17 | 17-google | tv16-google | wear6 | googletv16 | pixel16   (Android 11 to 16 are downloaded with podman pull)"; exit 2 ;;
 esac
 TAG=localhost/forge-android:$VARIANT
 STAGE=$BASE/stage; MNT=/mnt/forge-$VARIANT
 CONF=$HOME/.forge-ide/vd/containers.conf
-mkdir -p "$DL" "$IMG" "$STAGE/etc"
-if [ "${FORCE:-0}" != 1 ] && sudo -n env CONTAINERS_CONF_OVERRIDE="$CONF" podman image exists "$TAG"; then
+POD="sudo -n env CONTAINERS_CONF_OVERRIDE=$CONF podman"
+if [ "${FORCE:-0}" != 1 ] && $POD image exists "$TAG"; then
   echo "$TAG is already built (FORCE=1 rebuilds it)."; exit 0
 fi
+
+if [ -n "${GOOGLE_PKG:-}" ]; then
+  SDKROOT=${ANDROID_HOME:-$HOME/tools/android-sdk}
+  DIR="$SDKROOT/$(echo "$GOOGLE_PKG" | tr ';' '/')"
+  if [ ! -f "$DIR/system.img" ]; then
+    echo "Downloading $GOOGLE_PKG from Google's SDK repository"
+    JAVA_OPTS="-Xmx512m" timeout 3600 "$SDKROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDKROOT" --install "$GOOGLE_PKG" < /dev/null | tail -n 1
+  fi
+  grep -q "^ro.build.version.sdk=$SDK$" "$DIR/build.prop" || { echo "This is not an API $SDK system image."; exit 1; }
+  mkdir -p "$IMG" "$STAGE"
+  # The super partition is GPT partition 2 of system.img; its logical partitions are copied out (read only).
+  start=$(/usr/sbin/sfdisk -d "$DIR/system.img" | awk -F'[=,]' '/name="super"/ {gsub(/ /, "", $2); print $2}')
+  [ -n "$start" ] || { echo "No super partition in $DIR/system.img"; exit 1; }
+  [ -f "$IMG/system.img" ] || timeout 900 nice -n 10 python3 -I "$(dirname "$(readlink -f "$0")")/../vd/lpunpack.py" \
+    "$DIR/system.img" "$IMG" --offset $((start * 512)) --only system,system_ext,product
+  sudo -n mkdir -p "$MNT"
+  $POD image exists "$VENDOR_IMAGE" || timeout 3600 $POD pull "$VENDOR_IMAGE"
+  VMNT=$($POD image mount "$VENDOR_IMAGE")
+  cleanup() {
+    for m in "$MNT/system/lib64/libselinux.so" "$MNT/system/bin/init" "$MNT/vendor" "$MNT/product" "$MNT/system_ext" "$MNT"; do mountpoint -q "$m" && sudo -n umount "$m"; done
+    $POD image unmount "$VENDOR_IMAGE" >/dev/null 2>&1 || true
+  }
+  trap cleanup EXIT
+  mountpoint -q "$MNT" || sudo -n mount -o ro,loop "$IMG/system.img" "$MNT"
+  sudo -n mount -o ro,loop "$IMG/product.img" "$MNT/product"
+  sudo -n mount -o ro,loop "$IMG/system_ext.img" "$MNT/system_ext"
+  sudo -n mount -o bind,ro "$VMNT/vendor" "$MNT/vendor"
+  sudo -n mount -o bind,ro "$VMNT/system/bin/init" "$MNT/system/bin/init"
+  sudo -n mount -o bind,ro "$VMNT/system/lib64/libselinux.so" "$MNT/system/lib64/libselinux.so"
+  mkdir -p "$STAGE/build"
+  gcc -static -O2 -Wall -Wno-format-truncation -o "$STAGE/build/forge-init" "$(dirname "$(readlink -f "$0")")/../vd/forge-init.c"
+  # Google ships most system packages compressed, and Android unpacks them on the first boot after checking the
+  # unpacked file's SELinux label, which Redroid's SELinux library does not report. So they are unpacked here, the
+  # same way (vd/unpack-apex.py), and the image takes exactly the copies this run reports.
+  mkdir -p "$STAGE/apex/forge-unpacked"
+  UNPACK=$(sudo -n python3 -I "$(dirname "$(readlink -f "$0")")/../vd/unpack-apex.py" "$MNT/system/apex" "$STAGE/apex/forge-unpacked")
+  LEAVE=$(echo "$UNPACK" | sed -n 's#^leave #--exclude=./system/apex/#p')
+  USE=$(echo "$UNPACK" | sed -n 's#^use #forge-unpacked/#p')
+  echo "Unpacked $(echo "$USE" | grep -c .) compressed system packages"
+  # The unpacked packages are added as single files (not their folder, which the image already has) and renamed
+  # into /system/apex on the way.
+  # libforge_compat.so (vd/compat.c), loaded into Android's process starter, answers two questions a container cannot:
+  # the SELinux labels Google's connectivity module reads from its BPF files, and the owner change Android's system
+  # process makes on a sandboxed process's cgroup folder. With it, every Google module runs as Google ships it.
+  NDKCC=$(ls -d "$SDKROOT"/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android3[0-9]-clang 2>/dev/null | sort -V | tail -n 1)
+  [ -n "$NDKCC" ] || { echo "The Android NDK is needed (install-extras.sh android)."; exit 1; }
+  "$NDKCC" -shared -fPIC -O2 -Wall -o "$STAGE/build/libforge_compat.so" "$(dirname "$(readlink -f "$0")")/../vd/compat.c"
+  # Root-owned copies for the image (in Android, the owner of files made by this user would be Android's system user).
+  sudo -n install -D -o 0 -g 0 -m 0755 "$STAGE/build/forge-init" "$STAGE/root/forge-init"
+  sudo -n install -D -o 0 -g 0 -m 0644 "$STAGE/build/libforge_compat.so" "$STAGE/root/forge-lib/libforge_compat.so"
+  echo "Building the container image"
+  sudo -n tar --xattrs --xattrs-include='*' --transform='s,^forge-unpacked/,./system/apex/,;s,^forge-lib/,./system/lib64/,' \
+    $LEAVE -C "$MNT" -c . -C "$STAGE/root" forge-init forge-lib/libforge_compat.so -C "$STAGE/apex" $USE \
+    | $POD import -c 'ENTRYPOINT ["/forge-init", "--lock-only", "qemu=1", "androidboot.hardware=redroid"]' -m "$DESC" - "$TAG"
+  sync; sudo -n sysctl -q -w vm.drop_caches=1 || true
+  echo "$TAG is ready."
+  exit 0
+fi
+mkdir -p "$DL" "$IMG" "$STAGE/etc"
 
 fetch() {   # file folder sha256
   local f=$1 dir=$2 sum=$3
@@ -66,7 +147,8 @@ echo "Building the container image"
 if [ "${KEEP_ETC:-0}" = 1 ]; then
   mkdir -p "$STAGE/tv"
   gcc -static -O2 -Wall -Wno-format-truncation -o "$STAGE/tv/forge-init" "$(dirname "$(readlink -f "$0")")/../vd/forge-init.c"
-  sudo -n tar --xattrs --xattrs-include='*' -C "$MNT" -c vendor -C "$MNT/system" --exclude=./vendor . -C "$STAGE/tv" forge-init \
+  sudo -n install -D -o 0 -g 0 -m 0755 "$STAGE/tv/forge-init" "$STAGE/tv-root/forge-init"
+  sudo -n tar --xattrs --xattrs-include='*' -C "$MNT" -c vendor -C "$MNT/system" --exclude=./vendor . -C "$STAGE/tv-root" forge-init \
     | sudo -n env CONTAINERS_CONF_OVERRIDE="$CONF" nice -n 10 podman import -c 'ENTRYPOINT ["/forge-init"]' -m "$DESC" - "$TAG"
 else
   sudo -n tar --xattrs --xattrs-include='*' -C "$MNT" -c vendor -C "$MNT/system" --exclude=./vendor --exclude=./etc . -C "$STAGE" etc \

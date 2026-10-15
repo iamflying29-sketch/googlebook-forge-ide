@@ -21,6 +21,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -59,6 +60,16 @@ VERSIONS: Dict[str, dict] = {
                     # Its start step predates WayDroid's Docker support: forge-init prepares /dev, and Forge writes the
                     # waydroid.prop and answers its network request (DHCP) as WayDroid's own container manager would.
                     "prop_file": True, "dhcp": True},
+    "wear6": {"label": "Wear OS 6", "detail": "Google's official Wear OS 6.0 build, Android 16, API 36",
+              "image": "localhost/forge-android:wear6", "backend": "google", "cap_mb": 2048, "build": "forge-vd-image wear6",
+              "size": "1.1 GB download, about 6.5 GB on disk", "types": ["watch-round", "watch-square"]},
+    "googletv16": {"label": "Google TV 16", "detail": "Google's official Google TV build, Android TV 16, API 36",
+                   "image": "localhost/forge-android:googletv16", "backend": "google", "cap_mb": 2560,
+                   "build": "forge-vd-image googletv16", "size": "1 GB download, about 12 GB on disk", "types": ["tv"]},
+    "pixel16": {"label": "Android 16 with Google Play", "detail": "Google's official Android 16 build with Google Play, API 36",
+                "image": "localhost/forge-android:pixel16", "backend": "google", "cap_mb": 3072,
+                "build": "forge-vd-image pixel16", "size": "1.9 GB download, about 9 GB on disk",
+                "types": ["phone", "small-phone", "foldable", "tablet", "desktop"]},
     "16": {"label": "Android 16", "detail": "AOSP, API 36", "image": "docker.io/redroid/redroid:16.0.0_64only-latest", "backend": "redroid", "cap_mb": 2560, "size": "0.8 GB download"},
     "15": {"label": "Android 15", "detail": "AOSP, API 35", "image": "docker.io/redroid/redroid:15.0.0_64only-latest", "backend": "redroid", "cap_mb": 2560, "size": "0.7 GB download"},
     "14": {"label": "Android 14", "detail": "AOSP, API 34", "image": "docker.io/redroid/redroid:14.0.0_64only-latest", "backend": "redroid", "cap_mb": 2560, "size": "0.7 GB download"},
@@ -176,23 +187,54 @@ def clean_rc(text: str, ueventd: bool = False) -> Tuple[str, List[str]]:
     return "\n".join(out) + ("\n" if text.endswith("\n") else ""), removed
 
 
+# Google's official images (see forge-vd-image) need one more change. The network BPF loader of Google's Tethering
+# module writes /proc/sys/net/core/bpf_jit_enable and bpf_jit_kallsyms, which exist only in the VM's own network
+# namespace, and stops Android when it cannot. Right before it runs, the container's /proc/sys/net/core is covered
+# with private copies of its files plus those two, so its writes stay in the container (this kernel always compiles
+# BPF programs anyway). The VM's own settings are never reachable from a container's network namespace.
+_NET_CORE = ("optmem_max", "rmem_default", "rmem_max", "rps_default_mask", "somaxconn", "txrehash", "wmem_default",
+             "wmem_max", "xfrm_acq_expires", "xfrm_aevent_etime", "xfrm_aevent_rseqth")
+# And Android's process starter loads libforge_compat.so (vd/compat.c, built into the image by forge-vd-image), which
+# answers two questions a container cannot: the SELinux labels of the BPF files Google's connectivity module checks,
+# and the owner change Android's system process makes on a sandboxed process's cgroup folder.
+ZYGOTE_PRELOAD = "    setenv LD_PRELOAD /system/lib64/libforge_compat.so"
+
+
+def with_preload(text: str) -> str:
+    out = []
+    for line in text.splitlines():
+        out.append(line)
+        if re.match(r"^service\s+zygote\S*\s", line):
+            out.append(ZYGOTE_PRELOAD)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+GOOGLE_INIT_RC = "\n".join(
+    ["# Added by Forge for Google's images (see forge/vdevice.py): private stand-ins for the BPF loader.",
+     "on load-bpf-programs", "    mkdir /dev/forge-netcore 0755 root root"] +
+    [f"    copy /proc/sys/net/core/{f} /dev/forge-netcore/{f}" for f in _NET_CORE] +
+    ["    write /dev/forge-netcore/bpf_jit_enable 1", "    write /dev/forge-netcore/bpf_jit_kallsyms 1",
+     "    mount none /dev/forge-netcore /proc/sys/net/core bind", "", ""])
+
+
 def _image_id(image: str) -> str:
     r = pod(["image", "inspect", "--format", "{{.Id}}", image], timeout=30)
     iid = r.stdout.strip()
     return iid if re.match(r"^[0-9a-f]{64}$", iid) else ""
 
 
-def shield_image(image: str, progress: Optional[Callable[[str], None]] = None) -> str:
-    """The protected copy of an Android image (built on first use, in a few seconds). Raises RuntimeError."""
+def shield_image(image: str, progress: Optional[Callable[[str], None]] = None, google: bool = False) -> str:
+    """The protected copy of an Android image (built on first use, in a few seconds). For Google's images it also
+    gets GOOGLE_INIT_RC. Raises RuntimeError."""
     iid = _image_id(image)
     if not iid:
         raise RuntimeError(f"{image} is not downloaded.")
-    tag = f"localhost/forge-shield:{iid[:12]}-v{SHIELD}"
+    tag = f"localhost/forge-shield:{iid[:12]}-v{SHIELD}" + ("-google2" if google else "")
     if tag in images():
         return tag
     if progress:
         progress("Preparing the protected copy of the Android image")
-    work = os.path.join(RC_DIR, f"{iid[:12]}-v{SHIELD}-{int(time.time())}")   # a new folder each time, nothing is deleted
+    work = os.path.join(RC_DIR, f"{iid[:12]}-v{SHIELD}{'-google2' if google else ''}-{int(time.time())}")   # a new folder each time, nothing is deleted
     files = os.path.join(work, "files")
     os.makedirs(files)
     r = pod(["image", "mount", image], timeout=120)
@@ -211,6 +253,12 @@ def shield_image(image: str, progress: Optional[Callable[[str], None]] = None) -
                 continue
             text = got.stdout.decode("utf-8", errors="surrogateescape")
             cleaned, removed = clean_rc(text, ueventd=rel in UEVENTD_FILES)
+            if google and rel == "system/etc/init/hw/init.rc":
+                cleaned = GOOGLE_INIT_RC + cleaned
+                removed.append("added private stand-ins for the BPF loader")
+            if google and re.match(r"^system/etc/init/hw/init\.zygote", rel):
+                cleaned = with_preload(cleaned)
+                removed.append("process starter loads libforge_compat.so")
             if removed:
                 dest = os.path.join(files, rel)
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -520,6 +568,14 @@ def _start_display(d: dict) -> Optional[str]:
 # and network address, and one small dnsmasq (DHCP only for those addresses, plus DNS passed on to the VM's resolver)
 # runs while any of them runs. It listens only on Podman's bridge.
 DHCP_UNIT = "forge-vd-dhcp"
+# The images built by forge-vd-image (WayDroid-ATV and Google's) start from a fresh container every time (see _boot).
+EPHEMERAL = ("waydroid", "google")
+
+
+def _adb_public_key() -> str:
+    """The public key of the adb servers on this VM (Forge's included), for Google's signed builds."""
+    with open(os.path.join(HOME, ".android", "adbkey.pub")) as f:
+        return f.read().strip()
 _net_cache: Dict[str, tuple] = {}
 
 
@@ -586,7 +642,7 @@ def _run_args(d: dict, image: str) -> List[str]:
     info = VERSIONS[d["version"]]
     prof = PROFILES[(d.get("look") or {}).get("profile") or TYPES[d["type"]]]
     cap = info["cap_mb"]
-    args = ["run", "-d"] + (["--rm"] if info["backend"] == "waydroid" else []) + ["--privileged", f"--cap-drop={CAP_DROP}", "--name", container(d), "--label", "forge.vd=" + d["id"],
+    args = ["run", "-d"] + (["--rm"] if info["backend"] in EPHEMERAL else []) + ["--privileged", f"--cap-drop={CAP_DROP}", "--name", container(d), "--label", "forge.vd=" + d["id"],
             f"--memory={cap}m", f"--memory-swap={cap}m", "--cpus=4", f"--pids-limit={PIDS_LIMIT}", "-p", f"127.0.0.1:{d['port']}:5555",
             "-v", f"forge-vd-{d['id']}-data:/data"]
     if d["type"] == "tv":
@@ -621,7 +677,12 @@ def _run_args(d: dict, image: str) -> List[str]:
                  f"androidboot.redroid_dpi={prof[3]}", "androidboot.redroid_gpu_mode=guest", "androidboot.use_memfd=true"]
     if d["type"] == "tv":
         args.append("ro.build.characteristics=tv")
-    args += info.get("args", []) + personas.init_args(d.get("persona"))
+    persona = personas.init_args(d.get("persona"))
+    if info["backend"] in ("redroid", "google"):
+        # Redroid's init reads its arguments as a kernel command line, which splits at spaces unless a value is quoted
+        # (a model such as "Galaxy Watch8" would otherwise become "Galaxy").
+        persona = [f'{a.split("=", 1)[0]}="{a.split("=", 1)[1]}"' if " " in a else a for a in persona]
+    args += info.get("args", []) + persona
     return args
 
 
@@ -680,7 +741,7 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
                 _set(d["id"], "failed", err)
                 return
         try:
-            image = shield_image(info["image"], lambda m: _set(d["id"], "starting", m))
+            image = shield_image(info["image"], lambda m: _set(d["id"], "starting", m), google=info["backend"] == "google")
         except RuntimeError as e:
             _set(d["id"], "failed", str(e))
             _stop_display(d)
@@ -689,7 +750,7 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
         # task_profiles.json, without which Android's storage service aborts) when it finds that already done. So the
         # WayDroid-based images start from a fresh container every time; Podman discards it when the device stops,
         # and the Android data stays in the device's volume. Redroid's containers are reused.
-        ephemeral = info["backend"] == "waydroid"
+        ephemeral = info["backend"] in EPHEMERAL
         name = f"forge-vd-{d['id']}-{image.split(':')[-1]}" + ("-e" if ephemeral else "")
         n = 2
         while ephemeral and pod(["container", "exists", name], timeout=20).returncode == 0:
@@ -725,14 +786,23 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
                 _stop_display(d)
                 stop_dhcp_if_idle(d["id"])
                 return
-            if info["backend"] == "waydroid" and not provisioned:
+            if info["backend"] in EPHEMERAL and not provisioned:
                 b = _in_android(d, "getprop sys.boot_completed", timeout=15).stdout.strip()
+                if b == "1" and info["backend"] == "google":
+                    # Google's signed builds accept only authorized adb keys: Forge's key is installed, as accepting
+                    # "Allow USB debugging" on a real device does, and adb listens on the container's port.
+                    _in_android(d, f"mkdir -p /data/misc/adb; echo {shlex.quote(_adb_public_key())} > /data/misc/adb/adb_keys; "
+                                   "chown 1000:2000 /data/misc/adb/adb_keys; chmod 0640 /data/misc/adb/adb_keys; "
+                                   "settings put global adb_enabled 1; setprop service.adb.tcp.port 5555; "
+                                   "setprop ctl.restart adbd", timeout=40)
                 if b == "1":
                     # A fresh LineageOS waits in its setup wizard and refuses adb until the device counts as set up.
+                    # A container has no battery, and Wear OS will not start before 20 percent: it is full and plugged in.
                     _in_android(d, "settings put global device_provisioned 1; settings put secure user_setup_complete 1; "
                                    "settings put global development_settings_enabled 1; settings put global adb_enabled 1; "
-                                   "for w in org.lineageos.setupwizard com.google.android.setupwizard com.google.android.tungsten.setupwraith; do "
-                                   "pm disable-user --user 0 $w >/dev/null 2>&1; done; "
+                                   "for w in org.lineageos.setupwizard com.google.android.setupwizard com.google.android.tungsten.setupwraith "
+                                   "com.google.android.wearable.setupwizard; do pm disable-user --user 0 $w >/dev/null 2>&1; done; "
+                                   + ("cmd battery set ac 1; cmd battery set level 100; " if info["backend"] == "google" else "") +
                                    "setprop ctl.start adbd; input keyevent 3", timeout=40)
                     provisioned = True
             adb(["connect", serial], port=FORGE_PORT, timeout=8)
@@ -773,6 +843,11 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
             if want_density in (out or ""):
                 break
             time.sleep(3)
+        if not d.get("persona") and (look.get("profile") or TYPES[d["type"]]) == "watch-round":
+            # Apps learn that a watch is round from this flag (Configuration.isScreenRound); Google's emulator sets
+            # it from its own vendor partition, which is not used here.
+            _in_android(d, "cmd overlay fabricate --target android --name forge_round "
+                           "android:bool/config_mainBuiltInDisplayIsRound 0x12 1; cmd overlay enable com.android.shell:forge_round", timeout=40)
         if d.get("persona"):
             _set(d["id"], "booting", "Giving the screen the persona's cutout and navigation")
             for _ in range(6):
@@ -833,7 +908,7 @@ def download(version: str, gate: Callable[[], Optional[str]]) -> dict:
     except OSError:
         pass
     info = VERSIONS[version]
-    if info["backend"] == "waydroid":
+    if info["backend"] in EPHEMERAL:
         cmd = ["systemd-run", "--user", "--wait", "--quiet", "--pipe", "-p", "MemoryMax=1300M", "-p", "MemorySwapMax=0",
                os.path.join(BIN, "forge-vd-image"), version]
     else:

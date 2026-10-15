@@ -1,5 +1,9 @@
 /*
- * forge-init: the first program of the Android TV 16 virtual device (part of Forge IDE).
+ * forge-init: the first program of the Android TV 16 and Google image virtual devices (part of Forge IDE).
+ *
+ * With --lock-only (Google's official system images, which start with Redroid's container-ready init), it gives
+ * Android its own cgroup root (see android_cgroup_root) and puts the device-mapper lock described below into
+ * Podman's /dev, and then starts /init with the remaining arguments. Everything else below is for Android TV 16.
  *
  * WayDroid-ATV's Android TV 16 build predates WayDroid's Docker support and expects the container that WayDroid's
  * own LXC setup gives it. This program prepares what differs in a Podman container, inside the container only,
@@ -53,12 +57,67 @@ static void move_to_child_cgroup(void) {
     close(fd);
 }
 
+/* Google's images: on a phone, Android's init mounts cgroups itself and gives the root to Android's system user, which
+   Android's system process needs to move a sandboxed process (for example WebView's) between the "system" and "apps"
+   branches. In a container the root already exists and stays root's. So a child cgroup "android" is made, Android's
+   init is moved into android/init, the android folder's own control files go to the system user (uid 1000), and that
+   folder is shown to Android as its /sys/fs/cgroup. The container's own limits stay one level up, out of reach. */
+static void android_cgroup_root(void) {
+    static const char root[] = "/sys/fs/cgroup/android";
+    DIR *d;
+    struct dirent *e;
+    char path[300];
+    int fd;
+    if (mkdir(root, 0755) != 0 && errno == EROFS) {
+        if (mount(NULL, "/sys/fs/cgroup", NULL, MS_REMOUNT, NULL) != 0) {
+            perror("forge-init: making /sys/fs/cgroup writable failed");
+        }
+        mkdir(root, 0755);
+    }
+    mkdir("/sys/fs/cgroup/android/init", 0755);
+    fd = open("/sys/fs/cgroup/android/init/cgroup.procs", O_WRONLY | O_CLOEXEC);
+    if (fd < 0 || write(fd, "0", 1) != 1) {
+        perror("forge-init: moving into android/init failed");
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    fd = open("/sys/fs/cgroup/cgroup.subtree_control", O_WRONLY | O_CLOEXEC);   /* the memory controller for Android */
+    if (fd >= 0) {
+        if (write(fd, "+memory", 7) != 7) {
+            perror("forge-init: enabling the memory controller failed");
+        }
+        close(fd);
+    }
+    if (lchown(root, 1000, 1000) != 0) {
+        perror("forge-init: giving the android cgroup to Android failed");
+    }
+    chmod(root, 0775);
+    d = opendir(root);
+    while (d && (e = readdir(d)) != NULL) {
+        struct stat st;
+        snprintf(path, sizeof path, "%s/%s", root, e->d_name);
+        if (e->d_name[0] == '.' || lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;   /* its own control files only, not android/init */
+        }
+        if (lchown(path, 1000, 1000) != 0) {
+            perror("forge-init: giving a cgroup file to Android failed");
+        }
+    }
+    if (d) {
+        closedir(d);
+    }
+    if (mount(root, "/sys/fs/cgroup", NULL, MS_BIND, NULL) != 0) {
+        perror("forge-init: showing Android its cgroup root failed");
+    }
+}
+
 struct node { char path[128]; mode_t mode; dev_t rdev; };
 static struct node nodes[1024];
 static int node_count;
 
 static int skipped(const char *rel, mode_t mode) {
-    static const char *own[] = {"kmsg", "random", "urandom", "null", "ptmx"};   /* Android's or set up below */
+    static const char *own[] = {"ptmx", "kmsg", "random", "urandom", "null"};   /* Android's or set up below */
     for (unsigned i = 0; i < sizeof own / sizeof own[0]; i++) {
         if (strcmp(rel, own[i]) == 0) {
             return 1;
@@ -130,12 +189,27 @@ static void restore_nodes(void) {
     }
 }
 
-static void lock_device_mapper(void) {
+static void lock_node(const char *path) {
     /* A null device that Android's device manager cannot replace: its mknod finds the name taken, and the bind
        mount keeps the name from being removed. Opening it gives a file that answers no device-mapper requests. */
-    if (mknod("/dev/device-mapper", S_IFCHR | 0600, makedev(1, 3)) != 0 ||
-        mount("/dev/device-mapper", "/dev/device-mapper", NULL, MS_BIND, NULL) != 0) {
-        perror("forge-init: locking /dev/device-mapper failed");
+    if (access(path, F_OK) == 0) {   /* Podman's copy of the real one: covered by a null device */
+        if (mknod("/dev/.forge-null", S_IFCHR | 0600, makedev(1, 3)) != 0 && errno != EEXIST) {
+            perror("forge-init: making a null device failed");
+        }
+        if (mount("/dev/.forge-null", path, NULL, MS_BIND, NULL) != 0) {
+            perror("forge-init: locking a device-mapper node failed");
+        }
+        return;
+    }
+    if (mknod(path, S_IFCHR | 0600, makedev(1, 3)) != 0 || mount(path, path, NULL, MS_BIND, NULL) != 0) {
+        perror("forge-init: locking a device-mapper node failed");
+    }
+}
+
+static void lock_device_mapper(void) {
+    lock_node("/dev/device-mapper");
+    if (access("/dev/mapper", F_OK) == 0) {
+        lock_node("/dev/mapper/control");
     }
 }
 
@@ -180,7 +254,14 @@ static void make_binder_devices(void) {
 }
 
 int main(int argc, char **argv) {
-    (void)argc;
+    if (argc > 1 && strcmp(argv[1], "--lock-only") == 0) {
+        android_cgroup_root();
+        lock_device_mapper();
+        argv[1] = "/init";
+        execv("/init", argv + 1);
+        perror("forge-init: starting /init failed");
+        return 1;
+    }
     move_to_child_cgroup();
     remember_nodes("/dev", "", 0);
     if (mount("tmpfs", "/dev", "tmpfs", MS_NOSUID, "mode=0755") != 0) {

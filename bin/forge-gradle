@@ -22,6 +22,11 @@ heap=$((cap - 900))   # room for class metadata, the JIT, the small Gradle clien
 jvmargs="-Xmx${heap}m -XX:MaxMetaspaceSize=320m -XX:+UseSerialGC -XX:ReservedCodeCacheSize=160m -Dfile.encoding=UTF-8"
 mode=--no-daemon; [ "${FORGE_GRADLE_DAEMON:-0}" = 1 ] && mode=--daemon
 echo "Forge: Gradle gets ${cap} MB (Java heap ${heap} MB) of the Googlebook's free memory."
+if [ -z "${ANDROID_HOME:-}" ]; then   # outside Forge's terminal: the SDK Forge uses
+  for sdk in "$HOME/tools/android-sdk" "$HOME/Android/Sdk"; do
+    [ -d "$sdk/platforms" ] && { export ANDROID_HOME=$sdk; break; }
+  done
+fi
 if [ -x ./gradlew ]; then G=./gradlew
 elif command -v gradle >/dev/null; then G=gradle
 else G=$(ls -d "$HOME"/.local/lib/forge-android/gradle-*/bin/gradle 2>/dev/null | sort -V | tail -n 1); G=${G:-gradle}
