@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 
 HOME = os.path.expanduser("~")
 ANDROID_LIB = os.path.join(HOME, ".local", "lib", "forge-android")
+FORGE_BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")   # forge-gradle, forge-device, ...
 SDK_CANDIDATES = (os.environ.get("ANDROID_HOME", ""), os.path.join(HOME, "tools", "android-sdk"), os.path.join(HOME, "Android", "Sdk"))
 JAVA_HOMES = ("/usr/lib/jvm/java-21-openjdk-amd64", "/usr/lib/jvm/default-java")
 
@@ -77,7 +78,7 @@ def tool_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """The environment for the terminal and the agent's commands, with every installed toolchain on the PATH."""
     env = dict(base if base is not None else os.environ)
     p = paths()
-    add: List[str] = []
+    add: List[str] = [FORGE_BIN]
     if p["sdk"]:
         env.setdefault("ANDROID_HOME", p["sdk"])
         env.setdefault("ANDROID_SDK_ROOT", p["sdk"])
@@ -113,6 +114,19 @@ elif [ -f "$HOME/.bash_login" ]; then . "$HOME/.bash_login"
 elif [ -f "$HOME/.profile" ]; then . "$HOME/.profile"
 fi
 [ -n "$FORGE_PATH_PREPEND" ] && export PATH="$FORGE_PATH_PREPEND:$PATH"
+# adb talks to the device chosen in Forge's Android view (virtual devices and paired devices are on Forge's own adb
+# server, port 5041), unless you name a device or server yourself or set ANDROID_SERIAL.
+adb() {
+    local port serial
+    if [ -z "$ANDROID_SERIAL" ] && [ -r "$HOME/.forge-ide/adb-target" ] && read -r port serial < "$HOME/.forge-ide/adb-target"; then
+        case " $* " in
+            *" -s "*|*" -P "*|*" -H "*|*" -L "*|*" -t "*) command adb "$@" ;;
+            *) ANDROID_ADB_SERVER_PORT="$port" ANDROID_SERIAL="$serial" command adb "$@" ;;
+        esac
+    else
+        command adb "$@"
+    fi
+}
 """
 
 
@@ -205,10 +219,16 @@ def prompt_section(root: str) -> str:
                      f"build-tools {', '.join(s['build_tools']) or 'none'}; NDK {s['ndk'] or 'not installed'}. On the PATH: "
                      "sdkmanager, avdmanager, lint, apkanalyzer, aapt2, d8, apksigner, zipalign, bundletool, kotlinc, gradle, java "
                      f"{s['java'] or ''}.".replace("  ", " "))
-        lines.append("- The device is the Googlebook itself, connected over adb (Wireless debugging). There is no emulator. "
-                     "Build with `forge-gradle assembleDebug` (it runs ./gradlew or Gradle inside the memory limit), install with "
+        lines.append("- Devices: the target device is chosen in the Android view (`forge-device` lists them). Plain `adb` in your "
+                     "commands already talks to the target. There are virtual devices (Android 11 to 17 in containers, as phone, "
+                     "small phone, foldable, tablet, watch-sized, TV or desktop screens), phones, tablets and watches paired over "
+                     "Wi-Fi, and the Googlebook itself (Android 17). To test on another device or screen shape: `forge-device use "
+                     "<name or serial>`, `forge-device start <virtual device id>`, `forge-device profile <phone|tablet|foldable|"
+                     "watch-round|tv|...>`, `forge-device dark on`, `forge-device font 1.3`.")
+        lines.append("- Build with `forge-gradle assembleDebug` (it runs ./gradlew or Gradle inside the memory limit), install with "
                      "`adb install -r <apk>` (never gradlew installDebug), and start the app with "
-                     "`adb shell monkey -p <applicationId> -c android.intent.category.LAUNCHER 1`.")
+                     "`adb shell monkey -p <applicationId> -c android.intent.category.LAUNCHER 1`. Never run `adb reboot` or "
+                     "power a virtual device off from inside Android; stop it with `forge-device stop <id>`.")
         lines.append("- To see the running app, save a screenshot with `adb exec-out screencap -p > ~/.forge-ide/screen.png`, then "
                      "call look_at_image with that path and a question; the vision model looks at it for you. For errors, read "
                      "`adb logcat -d -t 300 '*:E'`.")

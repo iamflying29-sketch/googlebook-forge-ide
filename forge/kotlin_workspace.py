@@ -70,7 +70,7 @@ def _android_generated(mod: str) -> Tuple[List[str], List[dict]]:
     for pattern in GENERATED_SOURCES:
         dirs = sorted(glob.glob(os.path.join(mod, pattern)), key=lambda p: "/debug" not in p)
         if dirs and os.path.isdir(dirs[0]):
-            roots.append({"path": dirs[0], "type": "java-source", "generated": True})
+            roots.append({"path": dirs[0], "type": "java-source"})   # only path and type: the server rejects unknown keys
     return jars, roots
 
 

@@ -166,6 +166,14 @@ do_rust() {
     -c rust-analyzer -c rust-src -c clippy -c rustfmt
 }
 
+do_devices() {
+  echo "== Virtual devices (Podman) and the Forge Android guard"
+  need_mem 800
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends podman crun passt fuse-overlayfs
+  "$HERE/guard/install.sh"
+  echo "Download Android versions in Forge's Android view, under Virtual devices (Android 17: forge-vd-image 17)."
+}
+
 case "$WANT" in
   lsp) do_lsp ;;
   debug) do_debug ;;
@@ -174,7 +182,8 @@ case "$WANT" in
   index) do_index ;;
   android) do_android ;;
   rust) do_rust ;;
-  all) do_docs; do_debug; do_lsp; do_voice; do_index; do_android; do_rust ;;
-  *) echo "Usage: $0 [lsp|debug|docs|voice|index|android|rust|all]"; exit 2 ;;
+  devices) do_devices ;;
+  all) do_docs; do_debug; do_lsp; do_voice; do_index; do_android; do_rust; do_devices ;;
+  *) echo "Usage: $0 [lsp|debug|docs|voice|index|android|rust|devices|all]"; exit 2 ;;
 esac
 echo "Done. Restart Forge with: forge-ide restart"

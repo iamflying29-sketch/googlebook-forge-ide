@@ -1,0 +1,89 @@
+#!/usr/bin/python3 -I
+"""Forge virtual device watchdog: protects the Googlebook's memory while one virtual Android device runs.
+
+Forge starts one of these per device in its own systemd user unit, so it keeps working when Forge restarts. Every 2
+seconds it reads the Googlebook's free memory (a few hundred bytes over adb, with a time limit):
+- below 3800 MB it returns the Linux VM's file cache to the Googlebook (at most every 10 seconds);
+- below 2900 MB it stops the device at once;
+- when the free memory cannot be read for 2 minutes, it stops the device too, because it can no longer protect it.
+It also stops a device nobody has used in Forge for 3 hours, gives VM kernel files that Android takes over back to
+root every 10 seconds, and exits as soon as the device has stopped.
+Devices are always stopped from outside (podman kill), never with Android's own power off.
+Usage: forge-vd-watchdog <container> <device id> <display unit>"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from forge.devices import googlebook_free_mb  # noqa: E402
+from forge.vdevice import conmon_running, restore_vm_permissions  # noqa: E402
+
+STOP_BELOW_MB, TRIM_BELOW_MB, UNKNOWN_LIMIT_S, IDLE_LIMIT_S = 2900, 3800, 120, 3 * 3600
+VD_DIR = os.path.expanduser("~/.forge-ide/vd")
+CONF = os.path.join(VD_DIR, "containers.conf")
+
+
+def pod(*args, timeout=40):
+    try:
+        return subprocess.run(["sudo", "-n", "env", f"CONTAINERS_CONF_OVERRIDE={CONF}", "podman", *args],
+                              capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", "timeout")
+
+
+def notice(dev_id, message):
+    try:
+        with open(os.path.join(VD_DIR, "notices.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"time": time.time(), "device": dev_id, "message": message}) + "\n")
+    except OSError:
+        pass
+    print(message, flush=True)
+
+
+def stop(name, display):
+    pod("kill", name)
+    subprocess.run(["systemctl", "--user", "stop", display], capture_output=True, timeout=20)
+
+
+def main():
+    name, dev_id, display = sys.argv[1:4]
+    unknown_since, last_trim, last_check = None, 0.0, 0.0
+    while True:
+        now = time.time()
+        if now - last_check > 10:
+            last_check = now
+            restore_vm_permissions()   # Android hands some VM kernel files to its system user; give them back
+            if not conmon_running(name):
+                subprocess.run(["systemctl", "--user", "stop", display], capture_output=True, timeout=20)
+                return
+            try:
+                if now - os.path.getmtime(os.path.join(VD_DIR, dev_id + ".active")) > IDLE_LIMIT_S:
+                    notice(dev_id, "Forge stopped the virtual device because nobody had used it for 3 hours.")
+                    stop(name, display)
+                    return
+            except OSError:
+                pass
+        host = googlebook_free_mb()
+        if host is None:
+            unknown_since = unknown_since or now
+            if now - unknown_since > UNKNOWN_LIMIT_S:
+                notice(dev_id, "Forge stopped the virtual device because it could not read the Googlebook's free memory for 2 minutes.")
+                stop(name, display)
+                return
+        else:
+            unknown_since = None
+            if host < STOP_BELOW_MB:
+                notice(dev_id, f"Forge stopped the virtual device because the Googlebook had only {int(host)} MB of memory free.")
+                stop(name, display)
+                return
+            if host < TRIM_BELOW_MB and now - last_trim > 10:
+                last_trim = now
+                subprocess.run(["sync"], timeout=30)
+                subprocess.run(["sudo", "-n", "sysctl", "-q", "-w", "vm.drop_caches=1"], capture_output=True, timeout=30)
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    main()

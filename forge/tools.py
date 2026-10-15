@@ -29,7 +29,8 @@ BINARY_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", 
 DANGEROUS_COMMAND = re.compile(
     r"(^|[;&|]\s*)(sudo\s+)?(rm\s+-[a-zA-Z]*r|rm\s+-[a-zA-Z]*f|rmdir|mkfs|dd\s+if=|shred|chmod\s+-R\s+777|"
     r":\(\)\s*\{|git\s+(push\s+.*--force|reset\s+--hard|clean\s+-[a-zA-Z]*f)|"
-    r"pm\s+(uninstall|clear)|adb\s+.*\b(rm|uninstall|clear)\b|truncate\s|>\s*/dev/sd|killall|pkill\s+-9|"
+    r"pm\s+(uninstall|clear)|adb\s+.*\b(rm|uninstall|clear|reboot|powerctl|shutdown)\b|svc\s+power|truncate\s|>\s*/dev/sd|killall|pkill\s+-9|"
+    r"podman\s+(rm|rmi|volume\s+rm|system\s+(prune|reset)|image\s+(rm|prune)|container\s+(rm|prune))\b|"
     r"shutdown|reboot|poweroff|halt|systemctl\s+(stop|disable|mask)|fastboot\s+.*\b(flash|erase|format|oem|flashing|unlock)\b|"
     r"sdkmanager\s+.*--uninstall|cargo\s+uninstall)", re.IGNORECASE)
 
@@ -590,7 +591,9 @@ class Workspace:
         timeout = max(1.0, min(float(timeout or 90.0), 900.0 if (memory_cap_mb or "forge-gradle" in command) else 600.0))
         wd = self.resolve(cwd, must_exist=True) if cwd else self.root
         from .toolchains import tool_env
+        from .devices import env_for_commands
         env = tool_env()
+        env.update(env_for_commands())   # plain adb reaches the device chosen in the Android view
         env.setdefault("TERM", "dumb")
         env["FORGE_IDE"] = "1"
         env["NO_AUTO_TMUX"] = "1"

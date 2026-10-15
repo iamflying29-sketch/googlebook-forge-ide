@@ -1,4 +1,4 @@
-# Forge IDE Manual (version 1.5.1)
+# Forge IDE Manual (version 1.6.0)
 
 Forge is a Cursor-style AI coding IDE that runs entirely on your Lenovo Googlebook 15. The editor, the agent, the terminal and the models all live on the laptop, and nothing you type leaves it. This manual explains every part of it.
 
@@ -82,7 +82,7 @@ Type **@** in the input box (or click "@ Add context") for the context menu:
 
 - **Files** and **folders** of the project (a folder adds its file list and its most relevant code).
 - **codebase**: the most relevant code of the whole project, found by meaning and by keywords.
-- **docs**: a documentation site you indexed (see section 17). "add new documentation…" indexes a new one.
+- **docs**: a documentation site you indexed (see section 18). "add new documentation…" indexes a new one.
 - **chat**: the questions and answers of an earlier chat of this folder, without its tool output.
 - **web**: web search results for your message.
 - **git**: your uncommitted changes.
@@ -167,15 +167,37 @@ Jupyter notebooks (`.ipynb` files) open as cells, like in Cursor.
 
 - **Toolchains**: the Android SDK (platforms 35, 36 and 36.1; build-tools 35, 36.1 and 37; NDK 29; CMake 4.1.2; sdkmanager, avdmanager, lint, apkanalyzer, aapt2, d8, apksigner and zipalign), bundletool, the Kotlin compiler 2.4.21, Gradle 9.8.1, Java 21 and Rust 1.99 (cargo, clippy and rustfmt) are on the PATH in Forge's terminal and for the agent.
 - **Code intelligence**: Kotlin (JetBrains' Kotlin language server, with its data sharing set to none, so it sends nothing), Java (Eclipse JDT), XML for AndroidManifest and layout files (LemMinX) and Rust (rust-analyzer) get suggestions, hover, go to definition, references, rename, formatting and live errors, like the other languages. `build.gradle.kts` files are Kotlin, and `build.gradle` files get Groovy highlighting.
-- **The Android view** (the Android icon in the activity bar) shows the device and the toolchains, with Connect, Screenshot to chat and Logcat. In an Android project it adds Build, install and run; Build debug APK; Install; Run; App logcat; Lint; Unit tests; and Release bundle (AAB). In a Rust project it adds cargo check, build, run, test and clippy. Builds run in a terminal tab, so you can watch them and stop them with Ctrl C.
-- **The device is your Googlebook**, over Wireless debugging. The Linux VM has no virtualization support, so there is no emulator. Forge uses Debian's adb, the same one your other Googlebook tools use, and installs apps with `adb install` instead of Gradle's installDebug, because a second adb version could stop the adb server those tools rely on.
-- **Screenshot to chat** attaches what the Googlebook shows, so the vision model can look at your running app for Llama. The agent does the same by itself in Android projects: it builds, installs and starts the app, takes a screenshot, asks the vision model what the app shows, and reads the error log.
+- **The Android view** (the Android icon in the activity bar) shows the devices (section 16), the toolchains, Screenshot to chat and Logcat. In an Android project it adds Build, install and run; Build debug APK; Install; Run; App logcat; Lint; Unit tests; and Release bundle (AAB). In a Rust project it adds cargo check, build, run, test and clippy. Builds run in a terminal tab, so you can watch them and stop them with Ctrl C.
+- **Devices**: your Googlebook, virtual devices with Android 11 to 17 in every screen shape, and devices paired over Wi-Fi (section 16). Forge uses Debian's adb, the same one your other Googlebook tools use, and installs apps with `adb install` instead of Gradle's installDebug, because a second adb version could stop the adb server those tools rely on.
+- **Screenshot to chat** attaches what the target device shows, so the vision model can look at your running app for Llama. The agent does the same by itself in Android projects: it builds, installs and starts the app, takes a screenshot, asks the vision model what the app shows, and reads the error log.
 - **Logcat** in the bottom panel shows the log live, colored by level, for the whole device or one app, with a text filter and Add to chat. It stops by itself after 15 minutes or 20 MB.
 - **Builds and memory**: `forge-gradle` and `forge-cargo` (used by the Android view, and applied automatically to the agent's Gradle, Cargo and kotlinc commands) size every build to the free memory. A Gradle build gets the Googlebook's free memory above its 2.3 GB reserve as a hard cap (at most 2 GB, at least 1.5 GB, so it needs about 3.8 GB free), and Gradle's Java heap is scaled to fit well inside that cap, so a build that needs more memory stops with Gradle's own message instead of being killed. Builds run without a lingering Gradle daemon, so their memory is returned as soon as they finish; `FORGE_GRADLE_DAEMON=1 forge-gradle ...` keeps the daemon for faster repeated builds. `~/.gradle/gradle.properties` also limits Gradle when you run it yourself: a 1 GB heap, Kotlin compiled inside the Gradle process, two workers, and a daemon that stops after 15 idle minutes. Cargo uses three parallel jobs.
 - **Language servers for Kotlin, Java and Rust** are large programs. Each starts only with enough free memory and runs inside a memory cap: on the Googlebook, 3.8 GB free for Java and Rust, and 4.1 GB for Kotlin (4.7 GB in an Android project, because indexing android.jar takes more memory).
 - **The Kotlin project model** (Settings, Editor). JetBrains' Kotlin server normally runs a Gradle import every time it starts in a Gradle project, which adds a second large Java process. In **light** mode Forge writes the project description itself, in its own cache folder (your project is not touched): the source folders of each module, the JDK, the Kotlin library, android.jar and the app's R class (after one build) for Android modules, generated sources, jars in libs folders, and the libraries your build files name when Gradle has already downloaded them. Android's own sources are left out to save memory, so hover documentation for Android's own methods is shorter. The server then needs about half the memory and starts in seconds, with full error checking, also for loose Kotlin files. **gradle** mode uses the full Gradle import, with every library exactly as Gradle resolves it, and needs 4.7 GB free (5.5 GB in an Android project). **auto** (the default) uses the Gradle import when there is room for it and light mode otherwise. If light mode reports a library as missing, build the project once (so Gradle downloads it) or switch to gradle mode. When memory is short, Forge says so once, and the server starts when you reopen the file later with more memory free.
 
-## 16. The codebase index
+## 16. Devices and virtual devices
+
+Forge works with three kinds of devices, and one of them is always the **target**. Build, install and run, Logcat, Screenshot to chat, and `adb` in Forge's terminal and in the agent's commands all go to the target device. You choose it with Use in the Android view, or with `forge-device use <name>`.
+
+- **This Googlebook** (Android 17), over Wireless debugging. Forge only shows its screen. It never taps or types on it, because it is the screen you are working on.
+- **Virtual devices**: real Android 11, 12, 13, 14, 15, 16 and 17 running in containers inside the Linux VM. The VM has no hardware virtualization, so Google's emulator cannot run here. A container runs Android directly on the VM's Linux kernel instead, the way Android's cloud test farms do. Android 11 to 16 come from the open-source Redroid project. Android 17 is LineageOS 24.0 from the WayDroid-ATV project: Forge downloads it, checks it against its published checksums and packages it with `forge-vd-image 17`.
+- **Phones, tablets, watches and TVs paired over Wi-Fi**, for example your Galaxy phone with One UI, a Galaxy Watch, a tablet or an Android TV.
+
+**Virtual devices.** In the Android view, under Virtual devices, download an Android version once (Android 17 is a 1.4 GB download, the others about 0.7 GB). Then choose the version and a type (phone, small phone, foldable, tablet, round watch, square watch, TV or desktop) and click Create. Start runs the device and makes it the target when it is ready: Android 16 takes about 15 seconds and Android 17 about 25. Each device keeps its own data, so installed apps and settings stay between runs. Stop ends it. Forge always stops a device from outside and never uses Android's own power off (see Memory safety).
+
+**The device window.** Screen opens a floating window with the device's live screen, about two pictures a second. Click to tap, hold to long press, drag to swipe and scroll the wheel to scroll. Click the screen and type to send keys: Escape is Back, and Enter, Backspace, Tab and the arrow keys work. You can also type into the text box and press Enter. Back, Home and Recents are below the screen, To chat attaches the screen for the vision model, and you can drag the window by its title. For virtual devices, the window also switches these live: the screen profile (phone 1080×2400, small phone, foldable open and closed, tablet 1600×2560, round watch 454×454 with a round mask, square watch, TV 1920×1080 and desktop window), dark theme, text size from 100 to 200 percent, and rotation. Android lays the app out again right away, so you can check one app on every screen shape in a minute. On the tablet profile, Android 17 even switches to its tablet taskbar.
+
+**What the types mean.** A TV device runs Android's television mode: the TV features are declared, apps get the television UI mode, and Forge starts TV apps through their Leanback launcher entry. Watches are watch-sized round or square screens of phone Android. Wear OS itself cannot run in a container, because Android crashes when it is told it is a watch (the Wear OS services are not part of phone Android). For Wear OS features, use a paired watch or Samsung's Remote Test Lab. One UI cannot run in a container either. Pair your Galaxy phone for that, or use Samsung's Remote Test Lab, which gives free web access to real Galaxy phones, foldables, tablets and watches, including Android 17 with One UI 9.
+
+**Pairing over Wi-Fi.** On the device, open Settings, Developer options, Wireless debugging, Pair device with pairing code. In the Android view, under Pair a phone, tablet, watch or TV, enter the pairing address and the six-digit code and click Pair. Then enter the address shown under Wireless debugging (not the pairing one) and click Connect. On a Galaxy Watch, tap Software version five times first to unlock Developer options, then turn on ADB debugging and Wireless debugging. The device must be on the same Wi-Fi as the Googlebook. Look for devices lists devices that announce themselves on the network, but the Linux VM often cannot see those announcements, so typing the address is the reliable way.
+
+**From the terminal and for the agent**, `forge-device` does all of this. `forge-device` alone lists the devices. Other examples: `forge-device new 17 tablet`, `forge-device start android17-tablet --wait`, `forge-device use <name>`, `forge-device profile watch-round`, `forge-device dark on`, `forge-device font 1.3`, `forge-device screenshot` and `forge-device stop <id>`. The agent knows these commands, so you can ask it to test your app on a phone, a tablet and a watch-sized screen and to look at each one with the vision model.
+
+**Two adb servers.** The Googlebook stays alone on the shared adb server (port 5037), because your other Googlebook tools use a plain `adb shell` there, and a second device would make them fail. Virtual and paired devices are on Forge's own adb server (port 5041). In Forge's terminal, `adb` goes to the target automatically. With `-s` or `-P` you choose the device or server yourself.
+
+**Removing a virtual device.** Forge never deletes devices or downloads by itself. To remove one, stop it, then run `sudo podman rm forge-vd-<id>` and `sudo podman volume rm forge-vd-<id>-data` in a terminal, and remove its entry from `~/.forge-ide/vd/devices.json`.
+
+## 17. The codebase index
 
 Forge turns your code into embedding vectors with nomic-embed-text, a small embedding model, so codebase search and @codebase find code by what it does, not only by the words in it. Results are blended with keyword ranking.
 
@@ -184,7 +206,7 @@ Forge turns your code into embedding vectors with nomic-embed-text, a small embe
 - The embedding model runs in its own small llama.cpp server (about 250 MB), never in Ollama, so it never pushes Llama out of memory. It stops after two idle minutes.
 - Settings, Codebase index shows the state and has Index now and Pause. Settings, Agent, Codebase index turns it off, also per folder.
 
-## 17. Memories, rules, docs, hooks and more
+## 18. Memories, rules, docs, hooks and more
 
 - **Memories**: when you tell the agent something lasting ("always use tabs", "my server runs on Debian"), it offers to remember it. You see the memory, can edit it, and choose Save or Do not save. Memories are added to every chat, globally or for this project. Settings, Memories lists, edits and removes them.
 - **Rules for the AI**: global rules and project rules in Settings (`~/.forge-ide/rules.md` and `.forge/rules.md`); `.cursorrules`, `AGENTS.md` and `CLAUDE.md` are read too. Cursor's rule folder works as well: Markdown files in `.cursor/rules` or `.forge/rules` with a small header. `alwaysApply: true` rules are always followed, rules with `globs` are added when a matching file is attached, and rules with only a `description` are listed so the agent reads them when they are relevant.
@@ -196,15 +218,15 @@ Forge turns your code into embedding vectors with nomic-embed-text, a small embe
 - **MCP servers** in Settings: their tools run only after your approval.
 - **Terminal Ctrl K**: plain English in, a command pasted into the terminal for you to run.
 
-## 18. Working outside the project folder
+## 19. Working outside the project folder
 
 The agent may read and change files anywhere on the computer with absolute or ~ paths, for example `/mnt/shared/Documents` (your Documents folder). With **External-file protection** on (Settings, Agent), it asks before changing a file outside the project; the approval card shows the path and the change. System files (for example in /etc or /usr) and keys (for example ~/.ssh) always ask, even with protection off. You can open any file yourself by typing its path in quick open (Ctrl P), for example `/etc/hostname`.
 
-## 19. Settings: User and Folder
+## 20. Settings: User and Folder
 
 The Settings view has two tabs. **User** settings apply to every folder. **Folder** settings override them for the current folder only and are saved in `.forge/settings.json` inside it. A setting without an override says "(from User)", and an override has a Reset link. Engine, connection and memory settings are machine-wide and only appear under User. Below the settings are the cards for the GPU engine, the codebase index, custom modes, the command lists, memories, docs, hooks, rules and MCP servers.
 
-## 20. The GPU engine
+## 21. The GPU engine
 
 **Start it**: Forge app, Settings, the GPU engine card, Start engine. The first start downloads the model weights once (4.9 GB). The app asks the VM to hand memory back, waits until the free-memory check passes, loads the model and reports "running". A notification with a Stop engine button stays visible.
 
@@ -214,7 +236,7 @@ The Settings view has two tabs. **User** settings apply to every folder. **Folde
 
 If the GPU engine is not running, a chat tells you so instead of loading the 5 GB CPU model by itself. Start the engine, or pick an Ollama model.
 
-## 21. Memory safety
+## 22. Memory safety
 
 The Googlebook has 16 GB for Android, the VM and the models together. If it runs out, Android closes apps, and if it closes the Terminal app, the VM goes with it. Forge's rules:
 
@@ -225,9 +247,12 @@ The Googlebook has 16 GB for Android, the VM and the models together. If it runs
 - The helpers check memory before they start, and helpers that run inside a memory cap start only when the Googlebook has the cap plus its 2.3 GB reserve free, so even a helper that grows to its cap cannot push the Googlebook below the reserve. The caps: the debugged program 1 GB, a notebook kernel 1.5 GB, the Kotlin language server 1.8 GB (2.4 GB in an Android project or with a full Gradle import, 3.2 GB for both), the Java and Rust language servers 1.5 GB, and builds whatever is free above the reserve, up to 2 GB. Helpers stop when they are not used, and the embedding server stops by itself if the Forge server ever stops.
 - The command palette has Unload the model from memory.
 
+- **Virtual devices** each run inside a hard memory cap (2.5 GB for Android 11 to 16, 3 GB for Android 17) and start only when the Googlebook has the cap plus 2.3 GB free. In practice that means one device at a time next to Forge, and not at the same time as the Llama model. A watchdog for each device returns the VM's file cache to the Googlebook when it falls under 3.8 GB free, and stops the device under 2.9 GB free, when it cannot read the free memory for two minutes, or after three hours without use. Downloads and image builds run inside a memory cap too.
+- **Android shares the VM's kernel** in a container, and Android's start and shutdown steps touch some kernel settings, so Forge guards against all of it. When Android powers off or restarts, it can signal every process in the VM or crash the VM's kernel, so Forge never uses Android's own power off, and the Forge Android guard (a small root service, `forge-android-guard`) ends any Android that starts to shut down by itself within milliseconds. Containers cannot load SELinux policies or kernel modules, access hardware directly or change the clock. Android also hands some kernel files (for example `/proc/cmdline` and `/sys/power/state`) to its own system user; Forge gives them back to root after each start and every 10 seconds while a device runs, and virtual devices keep their screen on, so Android never tries to suspend.
+
 Do not run Waydroid, a second model or a large build at the same time as a model.
 
-## 22. Keyboard shortcuts
+## 23. Keyboard shortcuts
 
 | Keys | Action |
 | --- | --- |
@@ -263,11 +288,11 @@ Do not run Waydroid, a second model or a large build at the same time as a model
 | Alt \ | Ask for a completion |
 | Ctrl R (in the app) | Reload the IDE |
 
-## 23. Where things are
+## 24. Where things are
 
-Code in `~/projects/forge-ide`; data in `~/.forge-ide/` (settings, chats, checkpoints, images, attachments, memories, docs, hooks, commands, the codebase index, notepads, rules and models); folder settings, rules, memories and hooks in `.forge/` inside each folder; the app and this manual in Documents/Forge; exported chats in Documents/Forge/Chats; language servers in `~/.local/lib/forge-lsp`; whisper.cpp in `~/.local/lib/forge-voice`; the embedding server in `~/.local/lib/forge-embed`; the Kotlin, Java and XML language servers, the Kotlin compiler, Gradle, bundletool, forge-gradle and forge-cargo in `~/.local/lib/forge-android`; Rust in `~/.cargo` and `~/.rustup`; the Android SDK in `~/tools/android-sdk`; Gradle's memory settings in `~/.gradle/gradle.properties`; language server caches in `~/.forge-ide/lsp-cache`; the engine build in `~/tools/gpu-build`; Ollama tuning in `/etc/systemd/system/ollama.service.d/forge-tuning.conf`; helper logs in `~/.forge-ide/logs`.
+Code in `~/projects/forge-ide`; data in `~/.forge-ide/` (settings, chats, checkpoints, images, attachments, memories, docs, hooks, commands, the codebase index, notepads, rules and models); folder settings, rules, memories and hooks in `.forge/` inside each folder; the app and this manual in Documents/Forge; exported chats in Documents/Forge/Chats; language servers in `~/.local/lib/forge-lsp`; whisper.cpp in `~/.local/lib/forge-voice`; the embedding server in `~/.local/lib/forge-embed`; the Kotlin, Java and XML language servers, the Kotlin compiler, Gradle, bundletool, forge-gradle and forge-cargo in `~/.local/lib/forge-android`; Rust in `~/.cargo` and `~/.rustup`; the Android SDK in `~/tools/android-sdk`; Gradle's memory settings in `~/.gradle/gradle.properties`; language server caches in `~/.forge-ide/lsp-cache`; the engine build in `~/tools/gpu-build`; Ollama tuning in `/etc/systemd/system/ollama.service.d/forge-tuning.conf`; helper logs in `~/.forge-ide/logs`; virtual devices in `~/.forge-ide/vd` (the device list, notices, and the Android 17 downloads in `a17`), with their images and data in Podman's storage (`/var/lib/containers`); the target device in `~/.forge-ide/adb-target`; `forge-device`, `forge-vd-image` and `forge-vd-watchdog` in `bin/` of the Forge folder; the Forge Android guard in `/usr/local/lib/forge-guard` and `/etc/systemd/system/forge-android-guard.service`.
 
-## 24. Troubleshooting
+## 25. Troubleshooting
 
 - **Waiting screen**: the VM or server is not up. Open the Terminal app, wait, Retry, or `forge-ide status`.
 - **Ollama offline**: `sudo systemctl restart ollama`.
@@ -278,7 +303,9 @@ Code in `~/projects/forge-ide`; data in `~/.forge-ide/` (settings, chats, checkp
 - **No suggestions or hover in the editor**: the language server for that language is not installed (`install-extras.sh lsp`), memory was short when the file opened, or Language servers is off in Settings. Reopen the file after fixing it.
 - **The Terminal app says the Linux VM is low on memory and suggests more RAM**: the Terminal counts every out-of-memory stop inside the VM, including the deliberate ones, when a helper reaches its memory cap and is stopped. Helpers are sized to stay well below their caps, so this should be rare. If it happens, the helper's feature stops (a build fails, or code intelligence for one language ends), and nothing else is affected. Reopening the file or running the build again with more memory free continues.
 - **"Not enough free memory" for a build**: a build needs at least 1.5 GB above the Googlebook's 2.3 GB reserve (about 3.8 GB free). Close other apps, use the GPU engine (which takes the model out of the VM), or unload the model.
-- **No device in the Android view**: click Connect. If that fails, check that Wireless debugging is on.
+- **The Googlebook is missing in the Android view**: click Connect this Googlebook. If that fails, check that Wireless debugging is on. Its address changes after sleep, and Sleep Guard publishes the new one.
+- **A virtual device does not start**: the message says why. Usually memory is short (stop another device or unload the model), the Android version is not downloaded yet, or the Forge Android guard is not installed (run `guard/install.sh` in the Forge folder once). Notices at the top of Virtual devices say when the watchdog or the guard stopped a device.
+- **A paired device does not connect**: pairing and connecting use two different addresses on the device's Wireless debugging screen. The pairing code expires after a minute, and the device must be on the same Wi-Fi.
 - **Kotlin code intelligence does not start**: it needs 4.1 GB free on the Googlebook (4.7 GB in an Android project; with the full Gradle import 4.7 GB, or 5.5 GB in an Android project). Forge says so once; reopen the file when more memory is free. The first start in a project takes longer while it reads the project and the libraries.
 - **The microphone does nothing in the app**: allow the microphone for Forge in Android's settings (Apps, Forge, Permissions).
 - **The index stays at "Index waiting"**: memory was short; it continues by itself when memory is free again. Settings, Codebase index shows the reason.
@@ -286,6 +313,6 @@ Code in `~/projects/forge-ide`; data in `~/.forge-ide/` (settings, chats, checkp
 - **The agent seems confused by earlier parts of a long chat**: start a new chat (Ctrl N), use /reset, or Restore checkpoint on an earlier message.
 - **A bad agent change**: Undo in the editor, Revert all under the reply, Restore checkpoint, or AI Changes.
 
-## 25. Updating Forge
+## 26. Updating Forge
 
 Edit the code, then `forge-ide restart`. For the app, `android/build.sh` and `adb install -r android/Forge.apk`. For the model file, edit `model/Modelfile` and run `forge-ide model`. For the optional parts, run `install-extras.sh` again with the part's name (`lsp`, `debug`, `docs`, `voice`, `index`, `android` or `rust`).

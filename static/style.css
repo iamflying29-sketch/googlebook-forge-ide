@@ -696,3 +696,31 @@ pre.nb-out.stream.err { background: rgba(255,107,107,.07); color: #ffb3b3; }
 .lc-line.lv-V { color: var(--fg-3); } .lc-line.lv-D { color: var(--blue); } .lc-line.lv-I { color: var(--fg); }
 .lc-line.lv-W { color: var(--yellow); } .lc-line.lv-E, .lc-line.lv-F { color: var(--red); }
 .lc-info { color: var(--fg-3); font-style: italic; }
+
+/* ---------------------------------------------------------------- devices and the device window */
+.dev-row { border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px 0; margin: 0 0 6px; background: var(--bg-2); }
+.dev-row.target { border-color: var(--accent); }
+.dev-name { display: flex; align-items: center; gap: 6px; }
+.dev-name b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dev-badge { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0 6px; }
+.dev-badge.dim { color: var(--fg-3); border-color: var(--border-2); }
+.dev-facts { color: var(--fg-2); font-size: 12px; margin: 2px 0 0 13px; overflow-wrap: anywhere; }
+.dev-create, .dev-form { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.dev-create select, .dev-form input { flex: 1 1 140px; min-width: 0; padding: 3px 6px; }
+.warn-box { border: 1px solid var(--yellow); color: var(--fg); background: rgba(255,200,80,.08); border-radius: 6px; padding: 6px 8px; margin: 0 0 6px; font-size: 12px; }
+.devwin { position: fixed; right: 24px; top: 64px; z-index: 60; width: min(420px, calc(100vw - 32px)); max-height: calc(100vh - 80px); display: flex; flex-direction: column;
+  background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 12px; box-shadow: 0 14px 40px rgba(0,0,0,.55); overflow: hidden; }
+.devwin.hidden { display: none; }
+.devwin-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: var(--bg-3); cursor: move; user-select: none; }
+.devwin-title { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.devwin-look { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 8px 0; }
+.devwin-look.hidden, .devwin-nav.hidden { display: none; }
+.devwin-look select { flex: 1 1 120px; min-width: 0; padding: 2px 4px; }
+.devwin-look .btn.on { background: var(--accent-soft); color: var(--accent); }
+.devwin-body { flex: 1; min-height: 0; display: flex; justify-content: center; align-items: center; padding: 8px; background: #000; margin: 6px 8px; border-radius: 10px; }
+.devwin-frame { display: flex; max-width: 100%; max-height: 100%; overflow: hidden; border-radius: 6px; }
+.devwin-frame.round { border-radius: 50%; }
+.devwin-screen { display: block; max-width: 100%; max-height: calc(100vh - 290px); object-fit: contain; cursor: pointer; outline: none; touch-action: none; background: #111; min-width: 80px; min-height: 80px; }
+.devwin-nav { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 8px 6px; }
+.devwin-text { flex: 1 1 140px; min-width: 0; padding: 3px 6px; }
+.devwin-note { color: var(--fg-3); font-size: 11px; padding: 0 8px 8px; }

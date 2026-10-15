@@ -1,0 +1,134 @@
+#!/usr/bin/python3 -I
+"""forge-device: Forge's devices from the terminal (and for the agent).
+
+  forge-device                         list devices and virtual devices (* marks the target)
+  forge-device use <device>            make a device the target (a serial, a virtual device id or part of a name)
+  forge-device new <version> <type>    create a virtual device (version 11 to 17; type phone, small-phone, foldable,
+                                       tablet, watch-round, watch-square, tv or desktop)
+  forge-device start <id> [--wait]     start a virtual device (it becomes the target when it is ready)
+  forge-device stop <id>               stop a virtual device
+  forge-device download <version>      download an Android version for virtual devices
+  forge-device profile <profile>       switch the target's screen (virtual devices): phone, small-phone, foldable,
+                                       foldable-cover, tablet, watch-round, watch-square, tv, desktop
+  forge-device dark on|off             dark theme on the target (virtual devices)
+  forge-device font <scale>            text size, for example 1.3 (virtual devices)
+  forge-device rotate <0-3>            rotation in quarter turns (virtual devices)
+  forge-device screenshot [file]       save the target's screen as a PNG (default ~/.forge-ide/screen.png)
+  forge-device pair <ip:port> <code>   pair a phone, tablet, watch or TV (Wireless debugging, Pair with code)
+  forge-device connect <ip:port>       connect a paired device"""
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE = os.environ.get("FORGE_URL", "http://127.0.0.1:8765")
+
+
+def call(path, body=None, raw=False, timeout=120):
+    req = urllib.request.Request(BASE + path, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"}, method="GET" if body is None else "POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read()
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error")
+        except ValueError:
+            msg = str(e)
+        sys.exit(f"forge-device: {msg}")
+    except urllib.error.URLError as e:
+        sys.exit(f"forge-device: Forge is not running ({e.reason}).")
+    return data if raw else json.loads(data)
+
+
+def say(result):
+    print(result.get("message") or ("Done." if result.get("ok") else "It did not work."))
+    if not result.get("ok", True):
+        sys.exit(1)
+
+
+def find(state, word):
+    """A device by serial, virtual device id or part of its name."""
+    w = word.lower()
+    for d in state["devices"]:
+        if w in (d["serial"].lower(), (d.get("virtual_id") or "").lower()):
+            return d
+    for d in state["devices"]:
+        if w in (d.get("name") or "").lower() or w in (d.get("model") or "").lower():
+            return d
+    sys.exit(f"forge-device: no connected device matches '{word}'. Run forge-device to see them.")
+
+
+def vd(state, word):
+    w = word.lower()
+    for d in state["virtual"]["devices"]:
+        if w == d["id"].lower() or w in d["name"].lower():
+            return d
+    sys.exit(f"forge-device: no virtual device matches '{word}'.")
+
+
+def main(argv):
+    state = call("/api/devices")
+    cmd = argv[0] if argv else "list"
+    t = state.get("target") or {}
+    if cmd in ("list", "ls"):
+        print("Devices:")
+        for d in state["devices"]:
+            mark = "*" if (d["serial"], d["port"]) == (t.get("serial"), t.get("port")) else " "
+            extra = ", ".join(x for x in (f"Android {d.get('android')}" if d.get("android") else "", d.get("one_ui") or "",
+                                          f"{d.get('width')}x{d.get('height')}" if d.get("width") else "", d["kind"]) if x)
+            print(f" {mark} {d.get('name') or d['serial']}  [{d['serial']}]  {d['state']}  {extra}")
+        if not state["devices"]:
+            print("   none connected")
+        print("Virtual devices:")
+        for d in state["virtual"]["devices"]:
+            print(f"   {d['id']}  {d['name']}  {d['phase']}" + (f"  {d['memory_mb']} MB" if d.get("memory_mb") else ""))
+        if not state["virtual"]["devices"]:
+            print("   none yet (forge-device new 17 phone)")
+        print("Android versions for virtual devices: " + ", ".join(f"{v['version']}{'' if v['installed'] else ' (not downloaded)'}" for v in state["virtual"]["versions"]))
+        return
+    if cmd == "use" and len(argv) > 1:
+        d = find(state, argv[1])
+        return say(call("/api/devices/target", {"serial": d["serial"], "port": d["port"]}))
+    if cmd == "new" and len(argv) > 2:
+        return say(call("/api/vd/create", {"version": argv[1], "type": argv[2], "name": " ".join(argv[3:])}))
+    if cmd == "start" and len(argv) > 1:
+        d = vd(state, argv[1])
+        say(call("/api/vd/start", {"id": d["id"]}))
+        if "--wait" in argv:
+            for _ in range(150):
+                time.sleep(2)
+                cur = next(x for x in call("/api/devices")["virtual"]["devices"] if x["id"] == d["id"])
+                if cur["phase"] in ("ready", "failed", "stopped"):
+                    print(cur["message"] or cur["phase"])
+                    sys.exit(0 if cur["phase"] == "ready" else 1)
+        return
+    if cmd == "stop" and len(argv) > 1:
+        return say(call("/api/vd/stop", {"id": vd(state, argv[1])["id"]}))
+    if cmd == "download" and len(argv) > 1:
+        return say(call("/api/vd/download", {"version": argv[1]}))
+    if cmd in ("profile", "dark", "font", "rotate") and len(argv) > 1:
+        key = {"profile": "profile", "dark": "dark", "font": "font_scale", "rotate": "rotation"}[cmd]
+        value = {"dark": lambda v: v in ("on", "yes", "1", "true"), "font": float, "rotate": int}.get(cmd, str)(argv[1])
+        return say(call("/api/devices/look", {key: value}))
+    if cmd == "screenshot":
+        out = os.path.expanduser(argv[1] if len(argv) > 1 else "~/.forge-ide/screen.png")
+        q = urllib.parse.urlencode({"serial": t.get("serial", ""), "port": t.get("port", "")})
+        data = call("/api/devices/screen?" + q, raw=True)
+        with open(out, "wb") as fh:
+            fh.write(data)
+        print(f"Saved {out}")
+        return
+    if cmd == "pair" and len(argv) > 2:
+        return say(call("/api/devices/pair", {"address": argv[1], "code": argv[2]}))
+    if cmd == "connect" and len(argv) > 1:
+        return say(call("/api/devices/connect", {"address": argv[1]}))
+    print(__doc__)
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -492,12 +492,10 @@ class State:
         cached = getattr(self, "_host_mem_cache", None)
         if cached and time.time() - cached[0] < 10:
             return cached[1]
-        value = None
+        # Ask the Googlebook by its own serial: with virtual or paired devices connected, a plain "adb shell" would fail.
+        from .devices import googlebook_free_mb
         try:
-            r = subprocess.run(["adb", "shell", "grep MemAvailable /proc/meminfo"], capture_output=True, text=True, timeout=5)
-            m = re.search(r"MemAvailable:\s+(\d+)\s+kB", r.stdout or "")
-            if r.returncode == 0 and m:
-                value = int(m.group(1)) / 1024.0
+            value = googlebook_free_mb()
         except (OSError, subprocess.TimeoutExpired):
             value = None
         self._host_mem_cache = (time.time(), value)
@@ -684,7 +682,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             if path not in ("/api/status", "/api/dirs", "/api/events", "/api/run", "/api/engine/config", "/api/engine/model",
                             "/api/engine/status", "/api/settings", "/api/image", "/api/image/analysis", "/api/engine/control",
-                            "/api/engine/vision_file", "/api/vision/status", "/api/memcheck", "/api/toolchains"):
+                            "/api/engine/vision_file", "/api/vision/status", "/api/memcheck", "/api/toolchains",
+                            "/api/devices", "/api/devices/screen", "/api/devices/scan"):
                 return self._error(400, f"This window's folder is not available ({e}). Open another folder.")
             folder_missing = str(e)
             ws = st.workspace
@@ -743,9 +742,37 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/toolchains":
             from . import toolchains
             return self._json(200, toolchains.status())
+        if path == "/api/devices":
+            from . import devices, vdevice
+            devs = devices.list_devices()
+            t = devices.target(devs)
+            return self._json(200, {"devices": devs, "target": t, "virtual": vdevice.status(),
+                                    "profiles": {k: {"label": v[0], "width": v[1], "height": v[2], "density": v[3]} for k, v in devices.PROFILES.items()}})
+        if path == "/api/devices/scan":
+            from . import devices
+            return self._json(200, {"found": devices.scan()})
+        if path == "/api/devices/screen":
+            from . import devices, vdevice
+            serial, port = devices.resolve(arg("serial") or None, int(arg("port") or 0) or None)
+            png = devices.screen_png(serial, port)
+            if png is None:
+                return self._error(503, "The device did not send a screenshot.")
+            vd = vdevice.by_serial(serial) if port == devices.FORGE_PORT else None
+            if vd:
+                vdevice.touch_active(vd)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(png)
+            return None
         if path == "/api/android/status":
             from . import android, toolchains
-            return self._json(200, {"toolchains": toolchains.status(), "devices": android.devices(), "project": android.project_info(ws.root)})
+            from . import devices
+            devs = devices.list_devices()
+            return self._json(200, {"toolchains": toolchains.status(), "devices": devs, "target": devices.target(devs),
+                                    "project": android.project_info(ws.root)})
         if path == "/api/roots":
             return self._json(200, {"primary": ws.root, "extra": st.extra_roots(ws.root)})
         if path == "/api/raw":
@@ -967,7 +994,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             # A window whose folder disappeared may still open another folder and use machine-wide actions.
             if not (path in ("/api/workspace", "/api/approve", "/api/cancel", "/api/unload", "/api/notepads",
-                             "/api/terminal/kill", "/api/image") or path.startswith("/api/engine/")
+                             "/api/terminal/kill", "/api/image") or path.startswith(("/api/engine/", "/api/devices/", "/api/vd/"))
                     or (path == "/api/settings" and b.get("_scope", "user") == "user")):
                 raise
             ws = st.workspace
@@ -1232,25 +1259,33 @@ class Handler(BaseHTTPRequestHandler):
             meta["url"] = "/api/image?id=" + meta["id"]
             return self._json(200, meta)
         if path == "/api/android/connect":
-            from . import android
-            return self._json(200, android.connect())
+            from . import devices
+            return self._json(200, devices.connect_googlebook())
         if path == "/api/android/install":
-            from . import android
+            from . import devices, vdevice
             apk = ws.resolve(str(b.get("apk", "")), must_exist=True)
             if not apk.endswith(".apk"):
                 return self._error(400, "That is not an APK file.")
-            return self._json(200, android.install(apk))
+            serial, port = devices.resolve(b.get("serial"), b.get("port"))
+            vd = vdevice.by_serial(serial) if port == devices.FORGE_PORT else None
+            if vd:
+                vdevice.touch_active(vd)
+            return self._json(200, devices.install(apk, serial, port))
         if path == "/api/android/launch":
-            from . import android
-            return self._json(200, android.launch(str(b.get("app_id", ""))))
+            from . import devices
+            serial, port = devices.resolve(b.get("serial"), b.get("port"))
+            return self._json(200, devices.launch(str(b.get("app_id", "")), serial, port))
         if path == "/api/android/screenshot":
-            from . import android
-            png = android.screenshot()
+            from . import devices
+            serial, port = devices.resolve(b.get("serial"), b.get("port"))
+            png = devices.screen_png(serial, port)
             if png is None:
-                return self._error(503, "The screenshot failed. Check that adb is connected (Android view, Connect).")
-            meta = st.vision.images.save(png, "googlebook-screen.png")
+                return self._error(503, "The screenshot failed. Check that the device is connected (Android view).")
+            meta = st.vision.images.save(png, "device-screen.png")
             meta["url"] = "/api/image?id=" + meta["id"]
             return self._json(200, meta)
+        if path.startswith("/api/devices/") or path.startswith("/api/vd/"):
+            return self._json(200, self._devices_post(path, b))
         if path == "/api/replace":
             import fnmatch
             q = str(b.get("q", ""))
@@ -1710,6 +1745,48 @@ class Handler(BaseHTTPRequestHandler):
             listener.close()
             sock.close()
 
+    def _devices_post(self, path: str, b: Dict[str, Any]) -> dict:
+        """Device actions from the Android view, the forge-device command and the agent."""
+        from . import devices, vdevice
+        st = STATE
+        assert st is not None
+        if path == "/api/devices/target":
+            serial, port = devices.resolve(str(b.get("serial") or ""), b.get("port"))
+            devices.set_target(serial, port)
+            return {"ok": True, "message": f"Builds, logcat and adb now use {serial}."}
+        if path == "/api/devices/pair":
+            return devices.pair(str(b.get("address", "")), str(b.get("code", "")))
+        if path == "/api/devices/connect":
+            return devices.connect(str(b.get("address", "")))
+        if path == "/api/devices/disconnect":
+            serial, port = devices.resolve(str(b.get("serial") or ""), b.get("port"))
+            return devices.disconnect(serial, port)
+        if path == "/api/devices/input":
+            serial, port = devices.resolve(b.get("serial"), b.get("port"))
+            vd = vdevice.by_serial(serial) if port == devices.FORGE_PORT else None
+            if vd:
+                vdevice.touch_active(vd)
+            return devices.send_input(serial, port, str(b.get("kind", "")), b)
+        if path == "/api/devices/look":
+            serial, port = devices.resolve(b.get("serial"), b.get("port"))
+            return devices.set_look(serial, port, {k: b[k] for k in ("profile", "dark", "font_scale", "rotation") if k in b})
+        if path == "/api/vd/create":
+            d = vdevice.create(str(b.get("version", "")), str(b.get("type", "phone")), str(b.get("name", "")))
+            return {"ok": True, "message": f"Created {d['name']}.", "device": d}
+        if path == "/api/vd/rename":
+            vdevice.rename(str(b.get("id", "")), str(b.get("name", "")))
+            return {"ok": True, "message": "Renamed."}
+        if path == "/api/vd/start":
+            def ready(d: dict) -> None:
+                if b.get("make_target", True):
+                    devices.set_target(f"127.0.0.1:{d['port']}", devices.FORGE_PORT)
+            return vdevice.start(str(b.get("id", "")), ready)
+        if path == "/api/vd/stop":
+            return vdevice.stop(str(b.get("id", "")))
+        if path == "/api/vd/download":
+            return vdevice.download(str(b.get("version", "")), lambda: st.small_memory_block("a download", 1200, 3300))
+        raise ValueError("unknown device action")
+
     def _ws_logcat(self, q: Dict[str, list]) -> None:
         """A live logcat for the Android view; it ends when the window closes or at its limits."""
         from .android import Logcat
@@ -1719,7 +1796,15 @@ class Handler(BaseHTTPRequestHandler):
         sock = handshake(self)
         if sock is None:
             return
-        lc = Logcat(sock.send_text, q.get("app_id", [""])[0][:200], q.get("level", ["V"])[0][:1])
+        from . import devices
+        try:
+            serial, port = devices.resolve(q.get("serial", [""])[0] or None, int(q.get("port", ["0"])[0] or 0) or None)
+        except ValueError as e:
+            sock.send_text(json.dumps({"type": "info", "text": str(e)}))
+            sock.send_text(json.dumps({"type": "end"}))
+            sock.close()
+            return
+        lc = Logcat(sock.send_text, q.get("app_id", [""])[0][:200], q.get("level", ["V"])[0][:1], serial, port)
         try:
             lc.run()
             while True:
