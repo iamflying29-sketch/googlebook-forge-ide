@@ -1,4 +1,4 @@
-# Forge IDE Manual (version 1.6.0)
+# Forge IDE Manual (version 1.7.0)
 
 Forge is a Cursor-style AI coding IDE that runs entirely on your Lenovo Googlebook 15. The editor, the agent, the terminal and the models all live on the laptop, and nothing you type leaves it. This manual explains every part of it.
 
@@ -9,7 +9,7 @@ Forge is a Cursor-style AI coding IDE that runs entirely on your Lenovo Googlebo
 - **Ollama with forge-coder**: your Llama 3.1 8B model, tuned for code, running on the CPU inside the VM.
 - **Forge GPU engine**: the same Llama 3.1 weights on the Intel graphics, through llama.cpp's Vulkan backend, inside the Forge app.
 - **The vision model**: Qwen3-VL, which looks at screenshots for Llama. It runs on the Intel graphics in the Forge app (4B, or 2B when memory is tighter), or on the CPU in the VM as a fallback. Text recognition (tesseract) reads the words in every image.
-- **Helpers that start only when needed**: language servers for code intelligence, the Python debugger, notebook kernels, a small embedding model for the codebase index, and whisper.cpp for voice input in a browser. Each one starts when you use its feature, only when memory allows, and stops again when it is no longer used.
+- **Helpers that start only when needed**: language servers for code intelligence, the debuggers, notebook kernels, a small embedding model for the codebase index, and whisper.cpp for voice input in a browser. Each one starts when you use its feature, only when memory allows, and stops again when it is no longer used.
 - **Toolchains**: the Android SDK, Kotlin, Gradle, Java 21 and Rust, ready in Forge's terminal and for the agent (see section 15).
 
 ## 2. Starting and stopping
@@ -140,17 +140,24 @@ Click the microphone button in the AI panel (or press Ctrl Shift Space) and spea
 - Files the agent removes go to `.forge-trash` inside the project, or to `~/.forge-ide/trash` outside it. Nothing is deleted outright.
 - Every save and agent edit runs a syntax check, and the language servers check open files as you type. Problems lists both, with Open, Fix with AI for each problem, and Fix all with AI.
 
-## 13. Debugging Python
+## 13. Debugging
 
-Open the **Run and Debug** view (the play icon in the activity bar).
+Forge debugs **Python, C, C++, Rust, Kotlin and Java** programs, and **Android apps** on a device. Open the **Run and Debug** view (the play icon in the activity bar).
 
 1. Click left of a line number to set a **breakpoint** (a red dot), or press F9 on the line. Breakpoints are remembered per folder and move with the code when you edit.
-2. Press **F5** (or Start debugging). Forge saves your files and runs the Python file you have open; you can type another file and arguments in the view.
-3. When the program stops, the line is highlighted. The view shows the **variables** (click ▸ to look inside lists, dictionaries and objects), your **watch** expressions and the **call stack** (click a frame to jump there).
+2. Press **F5** (or Start debugging). Forge saves your files and runs the file you have open; you can type another file and arguments in the view. Forge picks the debugger from the file:
+   - **Python** runs with debugpy.
+   - **C and C++** are compiled first with debug information (`gcc` or `g++` with `-g -O0`, next to the source file) and run under GDB.
+   - **Rust** is built with `forge-cargo build` and runs under rust-gdb, GDB with Rust's own display of strings, vectors and other types.
+   - **Kotlin and Java** are compiled with the Kotlin compiler (and javac for Java files) into Forge's build folder, together with the libraries of the project, and run under the debugger built into JetBrains' Kotlin language server. Forge uses the Kotlin server the editor already runs for the folder; if none is open (in a Java project, for example), it starts one of its own for the session, which needs about 4.1 GB free on the Googlebook. The file needs a `main` function.
+   The build output appears in the Debug console.
+3. When the program stops, the line is highlighted. The view shows the **variables** (click ▸ to look inside lists, dictionaries, structures and objects), your **watch** expressions and the **call stack** (click a frame to jump there).
 4. Step with **F10** (over), **F11** (into) and **Shift F11** (out). **F5** continues, **F6** pauses a running program, **Ctrl Shift F5** restarts and **Shift F5** stops.
 5. The **Debug console** in the bottom panel shows the program's output. While the program is paused, type an expression there and press Enter to evaluate it in the current frame.
 
-"Run without debugging" (Ctrl F5) runs the file with its output in the Debug console. The debugger is debugpy; it needs `python3-debugpy` (`install-extras.sh debug`). Stopping a session also stops the program and everything it started.
+**Android apps.** In the Android view, Debug on device starts the installed debug build on the target device (a virtual device, the Googlebook or a paired phone) so that it waits for the debugger, connects through adb, and attaches the Kotlin debugger. Set breakpoints in your Kotlin or Java code first; the app stops there, with its variables and the call stack down into Android's own classes. Build and install the app before (Build, install and run does both). While attached to Android, expressions in the Debug console may not work yet; this is a known limit of JetBrains' debugger.
+
+"Run without debugging" (Ctrl F5) runs the file with its output in the Debug console. The debugged program and its debugger run inside a memory cap (1 GB, or the Kotlin server's cap with a 256 MB Java heap for the program). Python debugging needs `python3-debugpy` (`install-extras.sh debug`); C, C++ and Rust need GDB 14 or newer (Debian 13 has 16.3). Stopping a session also stops the program and everything it started.
 
 ## 14. Notebooks
 
@@ -160,7 +167,8 @@ Jupyter notebooks (`.ipynb` files) open as cells, like in Cursor.
 - **Output** appears under each cell: printed text, the value of the last line, tables (for example from pandas), images (matplotlib figures are shown automatically) and errors. An error has a **Fix with AI** button that sends the cell and the error to the agent.
 - **Markdown cells** show formatted text; double-click to edit, Shift Enter to finish.
 - Point at a cell for ▲ and ▼ (move), M or { } (switch between Markdown and code) and ✕ (delete). The toolbar adds cells, interrupts a running cell, restarts the kernel and clears all output.
-- The **kernel** is a Python process that keeps your variables between cells. It starts when you run the first cell, keeps running while the notebook is open (also across reloads), and stops after 10 minutes without an open window or 30 minutes without use. It runs inside its own 1.5 GB memory limit, so a cell that uses too much memory stops the kernel instead of the system, and it starts only when that much memory plus the Googlebook's 2.3 GB reserve is free.
+- The **kernel** runs your code and keeps your variables between cells. The kernel menu in the toolbar chooses the language: **Python 3** (Forge's own kernel), **Kotlin** (JetBrains' Kotlin kernel, with Kotlin 2.4, data classes, collections and the Kotlin standard library) or **Bash** (your shell commands, with variables kept between cells). Any other Jupyter kernel installed into Forge's kernel folder (`~/.local/lib/forge-jupyter/venv`) appears in the menu too. The notebook remembers its kernel in the file, and its cells are highlighted in that language. `install-extras.sh kernels` installs the Kotlin and Bash kernels.
+- A kernel starts when you run the first cell (the Kotlin kernel needs about 5 seconds), keeps running while the notebook is open (also across reloads), and stops after 10 minutes without an open window or 30 minutes without use. It runs inside its own 1.5 GB memory limit (the Kotlin kernel's Java heap is 640 MB), so a cell that uses too much memory stops the kernel instead of the system, and it starts only when that much memory plus the Googlebook's 2.3 GB reserve is free.
 - The notebook is still a normal file: Ctrl S saves it with its outputs, and "{ } JSON" shows the file itself. "New Jupyter notebook" in the command palette creates one.
 
 ## 15. Android, Kotlin, Java and Rust

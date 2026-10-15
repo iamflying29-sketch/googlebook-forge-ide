@@ -187,6 +187,144 @@ def kotlin_plan(root: str, preference: str, host_free_mb: Optional[float]) -> tu
     return False, (KOTLIN_LIGHT_ANDROID_NEEDS if android else KOTLIN_LIGHT_NEEDS)
 
 
+class LiveServer:
+    """A running language server that Forge itself can also ask something (the Kotlin server's debugger port, for
+    example). Forge's own requests use ids starting with "forge-"; their answers are not passed to the editor."""
+
+    def __init__(self, proc: subprocess.Popen, lock: threading.Lock):
+        self.proc, self.lock = proc, lock
+        self.pending: Dict[str, dict] = {}
+        self.n = 0
+
+    def request(self, method: str, params: dict, timeout: float = 60.0):
+        with self.lock:
+            self.n += 1
+            rid = f"forge-{self.n}"
+        box: dict = {"event": threading.Event()}
+        self.pending[rid] = box
+        data = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}).encode()
+        with self.lock:
+            self.proc.stdin.write(b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
+            self.proc.stdin.flush()
+        if not box["event"].wait(timeout):
+            self.pending.pop(rid, None)
+            raise TimeoutError(f"The language server did not answer {method} in time.")
+        if "error" in box["msg"]:
+            raise RuntimeError((box["msg"]["error"] or {}).get("message", "request failed"))
+        return box["msg"].get("result")
+
+    def notify(self, method: str, params: dict) -> None:
+        data = json.dumps({"jsonrpc": "2.0", "method": method, "params": params}).encode()
+        with self.lock:
+            self.proc.stdin.write(b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
+            self.proc.stdin.flush()
+
+    def take(self, msg: bytes) -> bool:
+        """True when this message answers one of Forge's own requests (then it is not passed on)."""
+        if b'"forge-' not in msg:
+            return False
+        try:
+            m = json.loads(msg)
+        except ValueError:
+            return False
+        box = self.pending.pop(str(m.get("id")), None) if "method" not in m else None
+        if box is None:
+            return False
+        box["msg"] = m
+        box["event"].set()
+        return True
+
+
+LIVE: Dict[tuple, LiveServer] = {}   # (lang, root) -> the language server an editor window has open
+
+
+def headless_kotlin(root: str, memory_ok, log_dir: str):
+    """Start a Kotlin language server without an editor (for the debugger when no Kotlin file is open, or in a
+    Java project). It always uses Forge's light project model, runs inside its memory cap, and answers the
+    server's own requests itself. Returns (server, stop function)."""
+    from . import toolchains
+    from .kotlin_workspace import shadow_dir
+    cmd = server_command("kotlin", root)
+    if not cmd:
+        raise RuntimeError("The Kotlin language server is not installed (install-extras.sh android).")
+    _, needs = kotlin_plan(root, "light", None)
+    why = memory_ok(needs[0], needs[1])
+    if why:
+        raise RuntimeError(why)
+    shadow = shadow_dir(root)
+    os.makedirs(log_dir, exist_ok=True)
+    err = open(os.path.join(log_dir, "lsp-kotlin-debug.log"), "ab")
+    prefix, unit = toolchains.scope_argv("lsp-kotlin-debug", needs[2])
+    proc = subprocess.Popen(prefix + ["nice", "-n", "5"] + cmd, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=err, env=toolchains.tool_env(), start_new_session=True)
+    live = LiveServer(proc, threading.Lock())
+    folder = [{"uri": "file://" + shadow, "name": os.path.basename(root) or "project"}]
+    busy: Dict[str, float] = {}          # progress tokens the server reported as begun and not yet ended
+    last_change = [time.time()]
+
+    def pump() -> None:
+        try:
+            while True:
+                msg = _read_message(proc.stdout)
+                if msg is None:
+                    break
+                if not msg or live.take(msg):
+                    continue
+                try:
+                    m = json.loads(msg)
+                except ValueError:
+                    continue
+                if m.get("method") == "$/progress":
+                    p = m.get("params") or {}
+                    kind = (p.get("value") or {}).get("kind")
+                    if kind == "begin":
+                        busy[str(p.get("token"))] = time.time()
+                    elif kind == "end":
+                        busy.pop(str(p.get("token")), None)
+                    last_change[0] = time.time()
+                if "method" in m and "id" in m:   # a request from the server: answer it the way an editor would
+                    if m["method"] == "workspace/workspaceFolders":
+                        result = folder
+                    elif m["method"] == "workspace/configuration":
+                        result = [None] * len((m.get("params") or {}).get("items") or [])
+                    else:
+                        result = None
+                    data = json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": result}).encode()
+                    with live.lock:
+                        proc.stdin.write(b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
+                        proc.stdin.flush()
+        except (OSError, ValueError):
+            pass
+
+    threading.Thread(target=pump, name="lsp-kotlin-debug", daemon=True).start()
+
+    def stop() -> None:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        _stop_group(proc)
+        toolchains.stop_scope(unit)
+        err.close()
+
+    try:
+        live.request("initialize", {"processId": os.getpid(), "rootUri": folder[0]["uri"], "rootPath": shadow, "workspaceFolders": folder,
+                                    "capabilities": {"workspace": {"workspaceFolders": True, "configuration": True},
+                                                     "window": {"workDoneProgress": True}}}, timeout=180)
+        live.notify("initialized", {})
+        # Wait until the server has loaded the project (its progress reports have ended and stayed quiet), so the
+        # debugger knows the source files when breakpoints arrive. At most 90 seconds.
+        start = time.time()
+        while time.time() - start < 90:
+            time.sleep(0.5)
+            if not busy and time.time() - last_change[0] > 3 and time.time() - start > 4:
+                break
+    except Exception:
+        stop()
+        raise
+    return live, stop
+
+
 def serve(ws: WebSocket, lang: str, root: str, memory_ok, log_dir: str, cmd: Optional[List[str]] = None,
           what: str = "language server", cap: Optional[str] = None, needs: Optional[tuple] = None,
           kotlin_pref: str = "auto", host_free_mb: Optional[float] = None) -> None:
@@ -235,6 +373,10 @@ def serve(ws: WebSocket, lang: str, root: str, memory_ok, log_dir: str, cmd: Opt
                              "mode": ("light project model" if shadow else ("Gradle import" if lang == "kotlin" else ""))}))
     folder_requests: set = set()    # ids of the server's workspace/workspaceFolders requests (light mode answers them)
     stop = threading.Event()
+    write_lock = threading.Lock()
+    live = LiveServer(proc, write_lock) if what == "language server" else None
+    if live is not None:
+        LIVE[(lang, root)] = live
 
     def pump_out() -> None:
         try:
@@ -243,6 +385,8 @@ def serve(ws: WebSocket, lang: str, root: str, memory_ok, log_dir: str, cmd: Opt
                 if msg is None:
                     break
                 if msg:
+                    if live is not None and live.take(msg):
+                        continue
                     if shadow and b"workspace/workspaceFolders" in msg:
                         try:
                             m = json.loads(msg)
@@ -293,14 +437,17 @@ def serve(ws: WebSocket, lang: str, root: str, memory_ok, log_dir: str, cmd: Opt
                 except ValueError:
                     pass
             try:
-                proc.stdin.write(b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
-                proc.stdin.flush()
+                with write_lock:
+                    proc.stdin.write(b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
+                    proc.stdin.flush()
             except (OSError, ValueError):
                 break
     except (ConnectionError, OSError):
         pass
     finally:
         stop.set()
+        if live is not None and LIVE.get((lang, root)) is live:
+            LIVE.pop((lang, root), None)
         try:
             proc.stdin.close()
         except OSError:
@@ -338,3 +485,61 @@ def _stop_group(proc: subprocess.Popen) -> None:
             continue
         except OSError:
             return   # no process of the group is left
+
+
+def serve_tcp(ws: WebSocket, host: str, port: int, what: str = "debugger") -> None:
+    """Bridge one browser WebSocket to a debug adapter that listens on a TCP port (the Kotlin server's debugger)
+    until either side closes. Content-Length framed both ways; every read has the socket's own time limit."""
+    import socket
+    sock = None
+    for _ in range(40):
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+            break
+        except OSError:
+            time.sleep(0.25)
+    if sock is None:
+        ws.send_text(json.dumps({"forge": "error", "message": f"The {what} did not open its port."}))
+        ws.close()
+        return
+    sock.settimeout(None)
+    stream = sock.makefile("rb")
+    ws.send_text(json.dumps({"forge": "ready", "lang": "jvm", "command": what}))
+    stop = threading.Event()
+
+    def pump_out() -> None:
+        try:
+            while not stop.is_set():
+                msg = _read_message(stream)
+                if msg is None:
+                    break
+                if msg:
+                    ws.send_text(msg.decode("utf-8", errors="replace"))
+        except (OSError, ValueError):
+            pass
+        finally:
+            stop.set()
+            try:
+                ws.send_text(json.dumps({"forge": "exit", "lang": "jvm"}))
+            except OSError:
+                pass
+
+    threading.Thread(target=pump_out, name="dap-tcp-out", daemon=True).start()
+    try:
+        while not stop.is_set():
+            op, data = ws.recv()
+            if op == 8:
+                break
+            if op not in (1, 2) or not data:
+                continue
+            sock.sendall(b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        stop.set()
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+        ws.close()

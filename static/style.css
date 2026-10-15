@@ -724,3 +724,4 @@ pre.nb-out.stream.err { background: rgba(255,107,107,.07); color: #ffb3b3; }
 .devwin-nav { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 8px 6px; }
 .devwin-text { flex: 1 1 140px; min-width: 0; padding: 3px 6px; }
 .devwin-note { color: var(--fg-3); font-size: 11px; padding: 0 8px 8px; }
+.nb-kernel { padding: 2px 4px; max-width: 200px; font-size: 12px; }

@@ -683,7 +683,7 @@ class Handler(BaseHTTPRequestHandler):
             if path not in ("/api/status", "/api/dirs", "/api/events", "/api/run", "/api/engine/config", "/api/engine/model",
                             "/api/engine/status", "/api/settings", "/api/image", "/api/image/analysis", "/api/engine/control",
                             "/api/engine/vision_file", "/api/vision/status", "/api/memcheck", "/api/toolchains",
-                            "/api/devices", "/api/devices/screen", "/api/devices/scan"):
+                            "/api/devices", "/api/devices/screen", "/api/devices/scan", "/api/notebook/kernels"):
                 return self._error(400, f"This window's folder is not available ({e}). Open another folder.")
             folder_missing = str(e)
             ws = st.workspace
@@ -742,6 +742,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/toolchains":
             from . import toolchains
             return self._json(200, toolchains.status())
+        if path == "/api/notebook/kernels":
+            from .notebook import available_kernels
+            return self._json(200, {"kernels": available_kernels()})
         if path == "/api/devices":
             from . import devices, vdevice
             devs = devices.list_devices()
@@ -1284,6 +1287,19 @@ class Handler(BaseHTTPRequestHandler):
             meta = st.vision.images.save(png, "device-screen.png")
             meta["url"] = "/api/image?id=" + meta["id"]
             return self._json(200, meta)
+        if path == "/api/debug/android":
+            from . import debugging, devices
+            serial, port = devices.resolve(b.get("serial"), b.get("port"))
+            if b.get("release"):
+                debugging.android_release(int(b.get("local_port") or 0), serial, port)
+                return self._json(200, {"ok": True})
+            r = debugging.android_prepare(str(b.get("app_id", "")), serial, port)
+            r.update({"serial": serial, "port": port})
+            return self._json(200, r)
+        if path == "/api/debug/prepare":
+            from . import debugging
+            p = ws.resolve(str(b.get("path", "")), must_exist=True)
+            return self._json(200, debugging.prepare(p, ws.root))
         if path.startswith("/api/devices/") or path.startswith("/api/vd/"):
             return self._json(200, self._devices_post(path, b))
         if path == "/api/replace":
@@ -1662,10 +1678,11 @@ class Handler(BaseHTTPRequestHandler):
                   host_free_mb=st.host_free_mb() if lang == "kotlin" else None)
 
     def _ws_dap(self, q: Dict[str, list]) -> None:
-        """The debugger for this window: the browser speaks the Debug Adapter Protocol to debugpy."""
+        """The debugger for this window: the browser speaks the Debug Adapter Protocol to the adapter for the
+        language (debugpy, GDB, rust-gdb, or the Kotlin server's debugger for Kotlin and Java)."""
         st = STATE
         assert st is not None
-        from . import lsp
+        from . import debugging, lsp
         if not _origin_ok(self):
             self.send_response(403); self.send_header("Content-Length", "0"); self.end_headers()
             return
@@ -1674,13 +1691,41 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
             return
+        lang = q.get("lang", ["python"])[0]
         sock = handshake(self)
         if sock is None:
             return
-        import importlib.util
-        cmd = [sys.executable, "-m", "debugpy.adapter"] if importlib.util.find_spec("debugpy") else None
-        lsp.serve(sock, "python", folder, lambda vm, host: st.small_memory_block("the debugger", vm, host),
-                  os.path.join(DATA_DIR, "logs"), cmd=cmd, what="debugger (debugpy)", cap="1G", needs=(700, 3300))
+        gate = lambda vm, host: st.small_memory_block("the debugger", vm, host)
+        if lang in ("kotlin", "java"):
+            # The Kotlin server the editor has open for this folder, or else one of Forge's own for this session.
+            live, stop_own = lsp.LIVE.get(("kotlin", folder)), None
+            try:
+                why = gate(400, 2800)   # the debugged program runs inside the server's memory cap with a 256 MB heap
+                if why:
+                    raise RuntimeError(why)
+                if live is None:
+                    live, stop_own = lsp.headless_kotlin(folder, gate, os.path.join(DATA_DIR, "logs"))
+                port = int(live.request("workspace/executeCommand", {"command": "start_debug_server", "arguments": ["file://" + folder]}, timeout=120))
+            except (RuntimeError, TimeoutError, OSError, TypeError, ValueError) as e:
+                if stop_own:
+                    stop_own()
+                sock.send_text(json.dumps({"forge": "error", "message": f"The Kotlin debugger did not start: {e}"}))
+                sock.close()
+                return
+            try:
+                lsp.serve_tcp(sock, "127.0.0.1", port, what="Kotlin debugger")
+            finally:
+                if stop_own:
+                    stop_own()
+            return
+        if lang == "python":
+            import importlib.util
+            cmd = [sys.executable, "-m", "debugpy.adapter"] if importlib.util.find_spec("debugpy") else None
+            what = "debugger (debugpy)"
+        else:
+            cmd = debugging.adapter_command(lang)
+            what = "debugger (GDB)" if lang in ("c", "cpp") else "debugger (rust-gdb)"
+        lsp.serve(sock, lang, folder, gate, os.path.join(DATA_DIR, "logs"), cmd=cmd, what=what, cap="1G", needs=(700, 3300))
 
     def _ws_kernel(self, q: Dict[str, list]) -> None:
         """A notebook window's connection to its Python kernel."""

@@ -86,7 +86,7 @@
         body.append(edHost);
         this.outputs = el('div', { class: 'nb-outputs' });
         body.append(this.outputs);
-        this.mountEditor(edHost, 'python', srcText(d.source));
+        this.mountEditor(edHost, this.doc.language(), srcText(d.source));
         this.renderOutputs();
       } else {
         this.rendered = el('div', { class: 'nb-md md', ondblclick: () => this.editMarkdown() });
@@ -177,6 +177,10 @@
   }
 
   // ------------------------------------------------------------------ notebook document
+  const MONACO_LANG = { python: 'python', kotlin: 'kotlin', bash: 'shell', sh: 'shell', rust: 'rust', javascript: 'javascript', typescript: 'typescript', java: 'java', r: 'r', julia: 'julia', 'c++': 'cpp', c: 'c' };
+  let kernelList = null;
+  const loadKernels = async () => { if (!kernelList) { try { kernelList = (await F.get('/api/notebook/kernels')).kernels; } catch (e) { kernelList = [{ name: 'python3', display_name: 'Python 3 (Forge)', language: 'python' }]; } } return kernelList; };
+
   class NotebookDoc {
     constructor(path) {
       this.path = path; this.cells = []; this.kernel = new KernelConn(this); this.timer = null; this.selfUpdate = false;
@@ -190,12 +194,37 @@
         el('button', { class: 'btn ghost sm', text: '↻ Restart', onclick: async () => { await this.kernel.open(); this.kernel.send({ op: 'restart' }); } }),
         el('button', { class: 'btn ghost sm', text: 'Clear outputs', onclick: () => { for (const c of this.cells) if (c.data.cell_type === 'code') { c.data.outputs = []; c.data.execution_count = null; c.countEl.textContent = '[ ]'; c.renderOutputs(); } this.changed(); } }),
         el('button', { class: 'btn ghost sm', text: '{ } JSON', title: 'Show the notebook file as JSON', onclick: () => { rawMode.add(this.path); sync(); } }),
+        this.kpick = el('select', { class: 'nb-kernel', title: 'Kernel: the language the code cells run in' }),
         this.status);
+      this.kpick.onchange = () => this.setKernel(this.kpick.value);
       this.list = el('div', { class: 'nb-cells' });
       this.root.append(bar, this.list);
       this.load();
     }
     fileModel() { const f = F.files.get(this.path); return f && f.model; }
+    spec() { return (this.nb && this.nb.metadata && this.nb.metadata.kernelspec) || { name: 'python3', language: 'python', display_name: 'Python 3' }; }
+    language() { return MONACO_LANG[(this.spec().language || 'python').toLowerCase()] || 'plaintext'; }
+    async fillKernels() {
+      const list = await loadKernels(), cur = this.spec().name || 'python3';
+      this.kpick.innerHTML = '';
+      for (const k of list) this.kpick.append(el('option', { value: k.name, text: k.display_name }));
+      if (!list.some((k) => k.name === cur)) this.kpick.append(el('option', { value: cur, text: (this.spec().display_name || cur) + ' (not installed)' }));
+      this.kpick.value = (cur === 'python' ? 'python3' : cur);
+    }
+    /** Switch the notebook to another kernel: the notebook remembers it, cells get its language, and the kernel restarts. */
+    async setKernel(name) {
+      const k = (await loadKernels()).find((x) => x.name === name);
+      if (!k || !this.nb) return;
+      this.nb.metadata = this.nb.metadata || {};
+      this.nb.metadata.kernelspec = { name: k.name === 'python3' ? 'python3' : k.name, display_name: k.display_name.replace(' (Forge)', ''), language: k.language };
+      this.nb.metadata.language_info = { name: k.language };
+      this.flush();
+      if (F.saveFile) await F.saveFile(this.path, true);
+      for (const c of this.cells) if (c.model) F.monaco.editor.setModelLanguage(c.model, this.language());
+      if (this.kernel.state !== 'not started' && this.kernel.state !== 'stopped') { await this.kernel.open(); this.kernel.send({ op: 'restart' }); }
+      toast('This notebook now runs ' + k.display_name + '. The kernel starts when you run a cell.', 'ok', 4000);
+      this.renderStatus();
+    }
     load() {
       const m = this.fileModel();
       let nb;
@@ -210,11 +239,13 @@
       for (const d of nb.cells) { const c = new Cell(this, d); this.cells.push(c); this.list.append(c.node); }
       this.list.append(el('div', { class: 'nb-add' }, el('button', { class: 'btn ghost sm', text: '+ Code', onclick: () => this.insert(null, 'code') }), el('button', { class: 'btn ghost sm', text: '+ Markdown', onclick: () => this.insert(null, 'markdown') })));
       this.renderStatus();
+      this.fillKernels();
       if (!text.trim()) this.changed();
     }
     renderStatus() {
       const k = this.kernel;
-      const py = k.info && k.info.python ? 'Python ' + k.info.python : 'Python';
+      const sp = this.spec();
+      const py = k.info && k.info.python ? 'Python ' + k.info.python : k.info && k.info.display_name ? k.info.display_name : (sp.display_name || 'Python');
       this.status.textContent = py + ' · ' + (k.state === 'not started' ? 'kernel starts when you run a cell' : k.state);
       this.status.className = 'nb-status ' + k.state.replace(/\s/g, '-');
     }

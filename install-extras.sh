@@ -166,6 +166,20 @@ do_rust() {
     -c rust-analyzer -c rust-src -c clippy -c rustfmt
 }
 
+do_kernels() {
+  echo "== Notebook kernels: Kotlin (JetBrains) and Bash, through Jupyter"
+  need_mem 800
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-jupyter-client python3-zmq python3-ipykernel python3-pexpect python3-venv
+  local J=$HOME/.local/lib/forge-jupyter
+  mkdir -p "$J"
+  [ -x "$J/venv/bin/python" ] || python3 -m venv --system-site-packages "$J/venv"
+  cp "$HERE/jupyter/requirements.txt" "$J/requirements.txt"
+  # Exact versions with their published SHA-256 sums; pip refuses anything else.
+  capped 800 "$J/venv/bin/pip" install --no-deps --require-hashes -r "$J/requirements.txt"
+  "$J/venv/bin/python" -m bash_kernel.install --prefix "$J/venv"
+  echo "Other Jupyter kernels installed into $J/venv appear in the notebook's kernel menu too."
+}
+
 do_devices() {
   echo "== Virtual devices (Podman) and the Forge Android guard"
   need_mem 800
@@ -183,7 +197,8 @@ case "$WANT" in
   android) do_android ;;
   rust) do_rust ;;
   devices) do_devices ;;
-  all) do_docs; do_debug; do_lsp; do_voice; do_index; do_android; do_rust; do_devices ;;
-  *) echo "Usage: $0 [lsp|debug|docs|voice|index|android|rust|devices|all]"; exit 2 ;;
+  kernels) do_kernels ;;
+  all) do_docs; do_debug; do_lsp; do_voice; do_index; do_android; do_rust; do_kernels; do_devices ;;
+  *) echo "Usage: $0 [lsp|debug|docs|voice|index|android|rust|kernels|devices|all]"; exit 2 ;;
 esac
 echo "Done. Restart Forge with: forge-ide restart"

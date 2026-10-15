@@ -1,6 +1,8 @@
-/* Forge IDE: debugger for Python (Run and Debug, like Cursor and VS Code). The page speaks the Debug Adapter
- * Protocol to debugpy through the server's /ws/dap bridge: breakpoints in the gutter, step controls, variables,
- * watch expressions, the call stack and a Debug console that evaluates expressions in the paused frame. */
+/* Forge IDE: Run and Debug, like Cursor and VS Code, for Python (debugpy), C and C++ (GDB), Rust (rust-gdb) and
+ * Kotlin and Java (the Kotlin language server's debugger). The page speaks the Debug Adapter Protocol through the
+ * server's /ws/dap bridge: breakpoints in the gutter, step controls, variables, watch expressions, the call stack
+ * and a Debug console that evaluates expressions in the paused frame. C, C++ and Rust are built with debug
+ * information first, and the build output appears in the Debug console. */
 (function () {
   'use strict';
   const F = window.Forge;
@@ -19,12 +21,12 @@
 
   // ------------------------------------------------------------------ DAP connection
   class Dap {
-    constructor(onEvent) { this.seq = 1; this.pending = new Map(); this.onEvent = onEvent; this.ws = null; this.closed = false; }
+    constructor(onEvent, lang) { this.seq = 1; this.pending = new Map(); this.onEvent = onEvent; this.ws = null; this.closed = false; this.lang = lang; }
     connect() {
       return new Promise((resolve, reject) => {
         const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-        const ws = this.ws = new WebSocket(proto + location.host + '/ws/dap?folder=' + encodeURIComponent(F.folder));
-        const timer = setTimeout(() => reject(new Error('The debugger did not start in time.')), 20000);
+        const ws = this.ws = new WebSocket(proto + location.host + '/ws/dap?folder=' + encodeURIComponent(F.folder) + '&lang=' + encodeURIComponent(this.lang || 'python'));
+        const timer = setTimeout(() => reject(new Error('The debugger did not start in time.')), this.lang === 'kotlin' || this.lang === 'java' ? 120000 : 20000);
         ws.onmessage = (m) => {
           let msg;
           try { msg = JSON.parse(m.data); } catch (e) { return; }
@@ -77,7 +79,11 @@
     if (session && session.dap) await sendBreakpoints(rel).catch(() => {});
   }
   D.toggleAtCursor = () => { const ed = (window.ForgeSplit && window.ForgeSplit.focused()) ? window.ForgeSplit.editor : F.editor, m = ed && ed.getModel(); if (m) toggleBreakpoint(m, ed.getPosition().lineNumber); };
+  const FAMILY = { python: /\.py$/i, c: /\.(c|h|cc|cpp|cxx|hpp)$/i, cpp: /\.(c|h|cc|cpp|cxx|hpp)$/i, rust: /\.rs$/i, kotlin: /\.(kt|kts|java)$/i, java: /\.(kt|kts|java)$/i };
+  const LANG_OF = (p) => (/\.py$/i.test(p) ? 'python' : /\.(c|h)$/i.test(p) ? 'c' : /\.(cc|cpp|cxx|hpp)$/i.test(p) ? 'cpp' : /\.rs$/i.test(p) ? 'rust' : /\.(kt|kts)$/i.test(p) ? 'kotlin' : /\.java$/i.test(p) ? 'java' : null);
+  const srcPath = (p) => (p && p.startsWith('file://') ? decodeURIComponent(p.slice(7)) : p);   // the Kotlin debugger sends URIs
   async function sendBreakpoints(rel) {
+    if (session && session.lang && !FAMILY[session.lang].test(rel)) return;
     const lines = [...(bps.get(rel) || [])].sort((a, b) => a - b);
     await session.dap.request('setBreakpoints', { source: { path: F.absPath(rel), name: rel.split('/').pop() }, breakpoints: lines.map((line) => ({ line })), lines });
   }
@@ -129,24 +135,39 @@
     if (session) { if (session.state === 'stopped') return cont(); return toast('A debug session is already running.', 'error'); }
     const progInput = $('#dbg-program');
     let program = (progInput && progInput.value.trim()) || F.activePath || '';
-    if (!program) return toast('Open the Python file you want to run, or type its path in Run and Debug.', 'error');
-    if (!/\.py$/i.test(program)) return toast('The debugger supports Python files (.py).', 'error');
+    if (!program) return toast('Open the file you want to run, or type its path in Run and Debug.', 'error');
+    const lang = LANG_OF(program);
+    if (!lang) return toast('Forge can debug Python, C, C++, Rust, Kotlin and Java files.', 'error');
     if (F.saveAll) await F.saveAll();
     const args = ($('#dbg-args') && $('#dbg-args').value.trim()) ? $('#dbg-args').value.trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g).map((a) => a.replace(/^["']|["']$/g, '')) : [];
     F.showPanel('debug');
     $('#debug-output').innerHTML = '';
     out((noDebug ? 'Running ' : 'Debugging ') + program + (args.length ? ' ' + args.join(' ') : ''), 'info');
-    const s = session = { dap: null, state: 'starting', threadId: null, frames: [], frameId: null, reason: '', noDebug };
+    const s = session = { dap: null, state: 'starting', threadId: null, frames: [], frameId: null, reason: '', noDebug, lang };
     renderSidebar();
-    s.dap = new Dap((ev) => onEvent(s, ev));
     try {
+      let prep = { program: F.absPath(program) };
+      if (lang !== 'python') {
+        out('Building with debug information…', 'info');
+        prep = await F.post('/api/debug/prepare', { path: program });
+        if (prep.build) out('$ ' + prep.build, 'info');
+        if (prep.output && prep.output.trim()) out(prep.output.trim(), prep.ok ? '' : 'err');
+        if (!prep.ok) throw new Error(prep.message || 'The program could not be prepared.');
+      }
+      s.dap = new Dap((ev) => onEvent(s, ev), lang);
       await s.dap.connect();
-      await s.dap.request('initialize', { clientID: 'forge', clientName: 'Forge IDE', adapterID: 'debugpy', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true, supportsVariableType: true, supportsRunInTerminalRequest: false, locale: 'en' });
+      const adapterID = lang === 'python' ? 'debugpy' : (lang === 'kotlin' || lang === 'java') ? 'intellij_jvm' : 'gdb';
+      await s.dap.request('initialize', { clientID: 'forge', clientName: 'Forge IDE', adapterID, pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true, supportsVariableType: true, supportsRunInTerminalRequest: false, locale: 'en' });
       s.initialized = new Promise((res) => { s.onInitialized = res; });
-      const launched = s.dap.request('launch', { type: 'python', request: 'launch', name: 'Forge', program: F.absPath(program), args, cwd: F.folder, console: 'internalConsole', redirectOutput: true, justMyCode: true, showReturnValue: true, noDebug: !!noDebug, stopOnEntry: false }, 60000);
+      let launchArgs;
+      if (lang === 'python') launchArgs = { type: 'python', request: 'launch', name: 'Forge', program: F.absPath(program), args, cwd: F.folder, console: 'internalConsole', redirectOutput: true, justMyCode: true, showReturnValue: true, noDebug: !!noDebug, stopOnEntry: false };
+      else if (lang === 'kotlin' || lang === 'java') launchArgs = { type: 'intellij_jvm', request: 'launch', name: 'Forge', tool: 'java', mainClass: prep.main_class, file: prep.file, args, cwd: F.folder, console: 'internalConsole', noDebug: !!noDebug,
+        classPaths: prep.class_paths, javaExec: prep.java_exec, vmArgs: ['-Xmx256m', '-XX:TieredStopAtLevel=1', '-XX:+UseSerialGC'] };
+      else launchArgs = { name: 'Forge', program: prep.program, args, cwd: prep.cwd || F.folder, stopAtBeginningOfMainSubprogram: false };
+      const launched = s.dap.request('launch', launchArgs, lang === 'kotlin' || lang === 'java' ? 600000 : 60000);
       await Promise.race([s.initialized, launched]);
-      for (const rel of bps.keys()) await sendBreakpoints(rel).catch(() => {});
-      await s.dap.request('setExceptionBreakpoints', { filters: ['uncaught'] }).catch(() => {});
+      if (!noDebug) for (const rel of bps.keys()) await sendBreakpoints(rel).catch(() => {});
+      if (lang === 'python') await s.dap.request('setExceptionBreakpoints', { filters: ['uncaught'] }).catch(() => {});
       await s.dap.request('configurationDone', {}).catch(() => {});
       await launched;
       if (s.state === 'starting') s.state = 'running';
@@ -157,8 +178,41 @@
       end(s);
     }
   }
+  /** Debug an Android app on the target device: start it waiting for the debugger, then attach the Kotlin
+   * debugger through an adb forwarded port. The app must be a debug build that is installed. */
+  async function attachAndroid(app) {
+    if (session) return toast('A debug session is already running.', 'error');
+    F.showPanel('debug');
+    $('#debug-output').innerHTML = '';
+    out('Starting ' + app.app_id + ' on the target device so that it waits for the debugger…', 'info');
+    const s = session = { dap: null, state: 'starting', threadId: null, frames: [], frameId: null, reason: '', noDebug: false, lang: 'kotlin', android: null };
+    renderSidebar();
+    try {
+      const prep = await F.post('/api/debug/android', { app_id: app.app_id });
+      if (!prep.ok) throw new Error(prep.message);
+      s.android = prep;
+      out(prep.message, 'info');
+      s.dap = new Dap((ev) => onEvent(s, ev), 'kotlin');
+      await s.dap.connect();
+      await s.dap.request('initialize', { clientID: 'forge', clientName: 'Forge IDE', adapterID: 'intellij_jvm', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true, supportsVariableType: true, supportsRunInTerminalRequest: false, locale: 'en' });
+      s.initialized = new Promise((res) => { s.onInitialized = res; });
+      const attached = s.dap.request('attach', { type: 'intellij_jvm', request: 'attach', name: 'Forge', hostName: '127.0.0.1', port: prep.local_port, timeout: 30000 }, 120000);
+      await Promise.race([s.initialized, attached]);
+      for (const rel of bps.keys()) await sendBreakpoints(rel).catch(() => {});
+      await s.dap.request('configurationDone', {}).catch(() => {});
+      await attached;
+      out('Attached. The app continues; it stops at your breakpoints. Expressions in the Debug console may not work while attached to Android (a known limit of the Kotlin debugger).', 'info');
+      if (s.state === 'starting') s.state = 'running';
+      renderSidebar();
+    } catch (e) {
+      out('Could not attach: ' + e.message, 'err');
+      toast(e.message, 'error', 7000);
+      end(s);
+    }
+  }
   function end(s) {
     if (session !== s) return;
+    if (s.android && s.android.local_port) F.post('/api/debug/android', { release: true, local_port: s.android.local_port, serial: s.android.serial, port: s.android.port }).catch(() => {});
     session = null;
     try { s.dap && s.dap.close(); } catch (e) { /* ignore */ }
     clearCurrentLine();
@@ -210,6 +264,7 @@
     s.frameId = frame.id;
     s.frame = frame;
     if (frame.source && frame.source.path) {
+      frame.source.path = srcPath(frame.source.path);
       await F.openFile(frame.source.path, { line: frame.line, column: frame.column || 1 });
       showCurrentLine();
     }
@@ -258,7 +313,7 @@
     const mine = ++renderSeq;
     const host = el('div');
     const s = session;
-    const prog = el('input', { id: 'dbg-program', type: 'text', placeholder: 'Python file (default: the open file)', value: (D.lastProgram || '') });
+    const prog = el('input', { id: 'dbg-program', type: 'text', placeholder: 'File to run (default: the open file)', title: 'Python, C, C++, Rust, Kotlin or Java', value: (D.lastProgram || '') });
     prog.addEventListener('change', () => { D.lastProgram = prog.value; });
     const args = el('input', { id: 'dbg-args', type: 'text', placeholder: 'Arguments (optional)', value: D.lastArgs || '' });
     args.addEventListener('change', () => { D.lastArgs = args.value; });
@@ -289,7 +344,7 @@
       const vars = el('div');
       host.append(section('Variables', vars));
       for (const sc of s.scopes || []) {
-        if (sc.expensive && sc.name !== 'Locals') { vars.append(varNode({ name: sc.name, value: '', variablesReference: sc.variablesReference })); continue; }
+        if ((sc.expensive || sc.presentationHint === 'registers' || /^registers$/i.test(sc.name)) && sc.name !== 'Locals') { vars.append(varNode({ name: sc.name, value: '', variablesReference: sc.variablesReference })); continue; }   // registers and other large scopes start collapsed
         vars.append(el('div', { class: 'dscope', text: sc.name }));
         try { const r = await s.dap.request('variables', { variablesReference: sc.variablesReference }); for (const v of (r.variables || []).slice(0, 300)) vars.append(varNode(v)); }
         catch (e) { vars.append(el('div', { class: 'muted small', text: e.message })); }
@@ -328,7 +383,7 @@
     $('#sb-debug').textContent = s ? (s.state === 'stopped' ? 'Debugger paused' : 'Debugging') : '';
   }
   D.render = renderSidebar;
-  D.start = start; D.stop = stop; D.active = () => !!session;
+  D.start = start; D.stop = stop; D.active = () => !!session; D.attachAndroid = attachAndroid;
 
   window.addEventListener('keydown', (e) => {
     if (e.key === 'F5' && !e.shiftKey && !e.ctrlKey) { e.preventDefault(); session && session.state === 'stopped' ? cont() : start(false); }

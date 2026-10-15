@@ -157,6 +157,7 @@
         el('button', { class: 'btn ghost sm', text: 'Build debug APK', onclick: () => buildInstallRun(m, false) }),
         el('button', { class: 'btn ghost sm', text: 'Install', disabled: !m.apk || !t, onclick: () => installApk(m) }),
         el('button', { class: 'btn ghost sm', text: 'Run', disabled: !m.application_id || !t, onclick: () => launchApp(m) }),
+        el('button', { class: 'btn ghost sm', text: 'Debug on device', disabled: !m.application_id || !t, title: 'Starts the installed debug build on ' + targetName() + ' and attaches the debugger (breakpoints in the gutter, F9)', onclick: () => window.ForgeDebug && window.ForgeDebug.attachAndroid({ app_id: m.application_id }) }),
         el('button', { class: 'btn ghost sm', text: 'App logcat', disabled: !m.application_id, onclick: () => openLogcat(m.application_id) })));
     }
     box.append(actions(

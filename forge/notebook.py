@@ -18,6 +18,35 @@ import time
 from typing import Callable, Dict, Optional, Set
 
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel_runner.py")
+JUPYTER_RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jupyter_runner.py")
+JUPYTER_PY = os.path.join(os.path.expanduser("~"), ".local", "lib", "forge-jupyter", "venv", "bin", "python")
+PYTHON_NAMES = ("", "python3", "python", "forge-python")
+# The Kotlin kernel is a Java program; its heap and code caches stay well inside the kernel's memory cap.
+KOTLIN_JAVA_OPTS = "-Xmx640m -XX:+UseSerialGC -XX:MaxMetaspaceSize=384m -XX:ReservedCodeCacheSize=128m"
+
+
+def available_kernels() -> list:
+    """Forge's own Python kernel plus every Jupyter kernel installed for Forge (Kotlin, Bash, ...)."""
+    kernels = [{"name": "python3", "display_name": "Python 3 (Forge)", "language": "python"}]
+    if os.path.isfile(JUPYTER_PY):
+        try:
+            r = subprocess.run([JUPYTER_PY, "-I", "-c", "import json; from jupyter_client.kernelspec import KernelSpecManager as K; "
+                                "print(json.dumps({n: [s['spec']['display_name'], s['spec']['language']] for n, s in K().get_all_specs().items()}))"],
+                               capture_output=True, text=True, timeout=30)
+            for name, (display, lang) in sorted(json.loads(r.stdout or "{}").items()):
+                if name not in PYTHON_NAMES:
+                    kernels.append({"name": name, "display_name": display, "language": lang})
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+    return kernels
+
+
+def kernel_name_of(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return str(((json.load(fh).get("metadata") or {}).get("kernelspec") or {}).get("name") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
 KERNEL_MEMORY_MAX = "1536M"
 IDLE_STOP_S = 30 * 60          # a kernel nobody has used for 30 minutes is stopped
 DETACHED_STOP_S = 10 * 60      # a kernel with no open notebook window is stopped after 10 minutes
@@ -38,9 +67,14 @@ class Kernel:
         self.busy = False
 
     def start(self) -> None:
-        env = dict(os.environ, PYTHONUNBUFFERED="1", MPLBACKEND="Agg", FORGE_PARENT_PID=str(os.getpid()),
-                   FORGE_NOTEBOOK_DIR=os.path.dirname(self.path))
-        cmd = [sys.executable, "-u", RUNNER]
+        from .toolchains import tool_env
+        env = dict(tool_env(), PYTHONUNBUFFERED="1", MPLBACKEND="Agg", FORGE_PARENT_PID=str(os.getpid()),
+                   FORGE_NOTEBOOK_DIR=os.path.dirname(self.path), KOTLIN_JUPYTER_JAVA_OPTS=KOTLIN_JAVA_OPTS)
+        name = kernel_name_of(self.path)
+        if name in PYTHON_NAMES or not os.path.isfile(JUPYTER_PY):
+            cmd = [sys.executable, "-u", RUNNER]
+        else:
+            cmd = [JUPYTER_PY, "-I", "-u", JUPYTER_RUNNER, name]
         self.unit = None
         if shutil.which("systemd-run"):
             from .toolchains import scope_argv
