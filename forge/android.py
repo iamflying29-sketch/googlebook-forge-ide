@@ -57,6 +57,26 @@ def project_info(root: str) -> dict:
     return info
 
 
+def kmp_info(root: str) -> List[dict]:
+    """Kotlin Multiplatform modules of a project and their targets (from their source sets)."""
+    from .kotlin_workspace import is_kmp_module, _kmp_split
+    out = []
+    for gradle in sorted(glob.glob(os.path.join(root, "*", "build.gradle*")) + glob.glob(os.path.join(root, "build.gradle*"))):
+        mod = os.path.dirname(gradle)
+        if mod in [os.path.join(root, m["module"]) for m in out] or not is_kmp_module(mod):
+            continue
+        sets = sorted(os.path.basename(s) for s in glob.glob(os.path.join(mod, "src", "*")) if os.path.isdir(s))
+        targets = sorted({_kmp_split(s)[0] for s in sets} - {"common"})
+        try:
+            text = open(gradle, encoding="utf-8", errors="replace").read(300000)
+        except OSError:
+            text = ""
+        out.append({"module": os.path.relpath(mod, root), "gradle_path": ":" + os.path.relpath(mod, root).replace(os.sep, ":") if mod != root else "",
+                    "sets": sets, "targets": targets, "compose_desktop": "compose.desktop" in text or "org.jetbrains.compose" in text,
+                    "android_app": "com.android.application" in text or "androidApplication" in text})
+    return out
+
+
 class Logcat:
     """One live logcat for one window. `send` delivers a JSON text batch to the browser."""
 

@@ -182,7 +182,10 @@ def kotlin_plan(root: str, preference: str, host_free_mb: Optional[float]) -> tu
     android = is_android_project(root)
     gradle_needs = KOTLIN_GRADLE_ANDROID_NEEDS if android else KOTLIN_GRADLE_NEEDS
     gradle_project = bool(_build_files(root))
-    if gradle_project and (preference == "gradle" or (preference == "auto" and (host_free_mb or 0) >= gradle_needs[1])):
+    # The server's own Gradle import does not handle Kotlin Multiplatform, so auto always uses Forge's model there.
+    from .kotlin_workspace import is_kmp_module
+    kmp = gradle_project and any(is_kmp_module(os.path.dirname(f)) for f in _build_files(root))
+    if gradle_project and (preference == "gradle" or (preference == "auto" and not kmp and (host_free_mb or 0) >= gradle_needs[1])):
         return True, gradle_needs
     return False, (KOTLIN_LIGHT_ANDROID_NEEDS if android else KOTLIN_LIGHT_NEEDS)
 

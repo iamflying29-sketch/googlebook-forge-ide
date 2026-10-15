@@ -119,6 +119,74 @@ def _find_jars(group: str, artifact: str, version: str) -> List[str]:
     return jars[:1]
 
 
+KMP_PLUGIN = re.compile(r"kotlin\(\s*[\"']multiplatform[\"']\s*\)|org\.jetbrains\.kotlin\.multiplatform|plugins\.kotlin[.\-_]?[mM]ultiplatform|kotlinMultiplatform")
+# The default Kotlin Multiplatform hierarchy: each source set and the one it builds on. Sets that a project does not
+# have are skipped, so iosArm64Main builds on iosMain, appleMain, nativeMain and commonMain as far as they exist.
+KMP_PARENT = {"jvm": "common", "desktop": "common", "android": "common", "web": "common", "js": "web", "wasmJs": "web",
+              "wasmWasi": "common", "native": "common", "apple": "native", "ios": "apple", "iosArm64": "ios", "iosX64": "ios",
+              "iosSimulatorArm64": "ios", "macos": "apple", "macosArm64": "macos", "macosX64": "macos", "tvos": "apple",
+              "watchos": "apple", "linux": "native", "linuxX64": "linux", "linuxArm64": "linux", "mingw": "native", "mingwX64": "mingw"}
+KMP_COMPILER_ARGS = 'J{"jvmTarget":"17","multiPlatform":true,"expectActualClasses":true}'
+
+
+def is_kmp_module(mod: str) -> bool:
+    for name in ("build.gradle.kts", "build.gradle"):
+        try:
+            with open(os.path.join(mod, name), "r", encoding="utf-8", errors="replace") as fh:
+                if KMP_PLUGIN.search(fh.read(300000)):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def _kmp_sets(mod: str) -> Dict[str, List[dict]]:
+    """Source sets of a multiplatform module: name -> source roots (kotlin and java folders)."""
+    sets = {}
+    for sset in sorted(glob.glob(os.path.join(mod, "src", "*"))):
+        name = os.path.basename(sset)
+        test = name.endswith("Test")
+        roots = [{"path": os.path.join(sset, lang), "type": "java-test" if test else "java-source"}
+                 for lang in ("kotlin", "java") if os.path.isdir(os.path.join(sset, lang))]
+        if roots:
+            sets[name] = roots
+    return sets
+
+
+def _kmp_split(name: str) -> Tuple[str, str]:
+    """("androidUnit", "Test") style split of a source set name into its target and Main or Test."""
+    for suffix in ("Main", "Test"):
+        if name.endswith(suffix):
+            base = name[: -len(suffix)]
+            if suffix == "Test":   # Android's test set names: androidUnitTest, androidHostTest, androidInstrumentedTest, androidDeviceTest
+                for extra in ("Unit", "Host", "Instrumented", "Device"):
+                    if base.startswith("android") and base.endswith(extra):
+                        base = "android"
+            return base, suffix
+    return name, ""
+
+
+def _kmp_ancestors(name: str, existing: set) -> List[str]:
+    base, suffix = _kmp_split(name)
+    out, cur = [], base
+    while cur in KMP_PARENT:
+        cur = KMP_PARENT[cur]
+        if cur + suffix in existing:
+            out.append(cur + suffix)
+    return out
+
+
+def _kotlin_settings(module: str, depends: List[str], friends: List[str], test: bool, ext_id: str, roots: List[str]) -> dict:
+    """One kotlinSettings entry (the Kotlin facet) for a multiplatform source set, in the server's JSON format."""
+    return {"name": "Kotlin", "module": module, "sourceRoots": roots, "configFileItems": [], "useProjectSettings": False,
+            "implementedModuleNames": [], "dependsOnModuleNames": depends, "additionalVisibleModuleNames": friends,
+            "productionOutputPath": None, "testOutputPath": None, "sourceSetNames": [], "isTestModule": test,
+            "externalProjectId": ext_id, "isHmppEnabled": True, "pureKotlinSourceFolders": [], "kind": "source_set_holder",
+            "compilerArguments": KMP_COMPILER_ARGS, "additionalArguments": None, "scriptTemplates": None,
+            "scriptTemplatesClasspath": None, "outputDirectoryForJsLibraryFiles": None, "targetPlatform": "JVM [17]",
+            "externalSystemRunTasks": [], "version": 5, "flushNeeded": False}
+
+
 def build_model(root: str) -> Tuple[dict, dict]:
     """The workspace model and a short summary of what it contains."""
     from .toolchains import is_android_project, paths
@@ -169,8 +237,50 @@ def build_model(root: str) -> Tuple[dict, dict]:
     deps = [{"type": "moduleSource"}, {"type": "sdk", "name": sdk_name, "kind": "JavaSDK"}]
     deps += [{"type": "library", "name": n, "scope": "compile"} for n in lib_names]
     modules = []
+    kotlin_settings: List[dict] = []
+    kmp_names: List[str] = []
     used = set()
+
+    def unique(name: str) -> str:
+        while name in used:
+            name += "_"
+        used.add(name)
+        return name
+
     for mod in mods:
+        modname = os.path.relpath(mod, root).replace(os.sep, ".") if mod != root else os.path.basename(root) or "project"
+        if not loose and is_kmp_module(mod):
+            # Kotlin Multiplatform: one module per source set, linked the way the Kotlin plugin links them, so expect and
+            # actual declarations resolve. Every set is analyzed as JVM code: common, JVM, desktop and Android code is
+            # checked fully, while the platform APIs of iOS, JavaScript and Wasm sets (UIKit, the browser) are not known.
+            sets = _kmp_sets(mod)
+            existing = set(sets)
+            names = {s: unique(f"{modname}.{s}") for s in sets}
+            ext_id = ":" + os.path.relpath(mod, root).replace(os.sep, ":") if mod != root else ":"
+            r_jars = _android_generated(mod)[0] if android else []
+            if r_jars:
+                add_lib("R:" + modname, r_jars)
+            for s, roots in sets.items():
+                test = s.endswith("Test")
+                scope = "test" if test else "compile"
+                ancestors = _kmp_ancestors(s, existing)
+                friends = []
+                if test:
+                    base, _ = _kmp_split(s)
+                    friends = [names[x] for x in [m.replace("Test", "Main") for m in ancestors] + [base + "Main"] if x in names]
+                mod_deps = [{"type": "moduleSource"}, {"type": "sdk", "name": sdk_name, "kind": "JavaSDK"}]
+                mod_deps += [{"type": "module", "name": names[a], "scope": scope} for a in ancestors]
+                mod_deps += [{"type": "module", "name": f, "scope": scope} for f in friends if f not in [names[a] for a in ancestors]]
+                mod_deps += [{"type": "library", "name": n, "scope": scope} for n in lib_names if not n.startswith("R:") and n != "android-sdk"]
+                if s.startswith("android") and "android-sdk" in lib_names:
+                    mod_deps.append({"type": "library", "name": "android-sdk", "scope": "provided"})
+                    if r_jars:
+                        mod_deps.append({"type": "library", "name": "R:" + modname, "scope": "compile"})
+                modules.append({"name": names[s], "type": "JAVA_MODULE", "dependencies": mod_deps,
+                                "contentRoots": [{"path": os.path.join(mod, "src", s), "sourceRoots": roots}]})
+                kotlin_settings.append(_kotlin_settings(names[s], [names[a] for a in ancestors], friends, test, ext_id, [r["path"] for r in roots]))
+                kmp_names.append(names[s])
+            continue
         roots = _source_roots(mod, loose)
         if not roots and not loose and len(mods) > 1:
             continue   # a folder with only build settings (the root of a multi-module project) has no code
@@ -182,18 +292,14 @@ def build_model(root: str) -> Tuple[dict, dict]:
                 lib = "R:" + (os.path.relpath(mod, root) if mod != root else "app")
                 add_lib(lib, r_jars)
                 mod_deps.append({"type": "library", "name": lib, "scope": "compile"})
-        name = os.path.relpath(mod, root).replace(os.sep, ".") if mod != root else os.path.basename(root) or "project"
-        while name in used:
-            name += "_"
-        used.add(name)
-        modules.append({"name": name, "type": "JAVA_MODULE", "dependencies": mod_deps,
+        modules.append({"name": unique(modname), "type": "JAVA_MODULE", "dependencies": mod_deps,
                         "contentRoots": [{"path": mod, "sourceRoots": roots}]})
     sdks = []
     if tp["java_home"]:
         sdks.append({"name": sdk_name, "type": "JavaSDK", "version": "21", "homePath": tp["java_home"], "additionalData": ""})
-    model = {"modules": modules, "libraries": libraries, "sdks": sdks, "kotlinSettings": [], "javaSettings": []}
+    model = {"modules": modules, "libraries": libraries, "sdks": sdks, "kotlinSettings": kotlin_settings, "javaSettings": []}
     summary = {"modules": len(modules), "libraries": lib_names, "found": found_coords, "missing": missing_coords,
-               "android": android, "loose": loose}
+               "android": android, "loose": loose, "multiplatform_sets": kmp_names}
     return model, summary
 
 

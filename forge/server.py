@@ -775,7 +775,7 @@ class Handler(BaseHTTPRequestHandler):
             from . import devices
             devs = devices.list_devices()
             return self._json(200, {"toolchains": toolchains.status(), "devices": devs, "target": devices.target(devs),
-                                    "project": android.project_info(ws.root)})
+                                    "project": android.project_info(ws.root), "multiplatform": android.kmp_info(ws.root)})
         if path == "/api/roots":
             return self._json(200, {"primary": ws.root, "extra": st.extra_roots(ws.root)})
         if path == "/api/raw":

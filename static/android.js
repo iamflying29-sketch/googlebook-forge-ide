@@ -30,6 +30,7 @@
     host.innerHTML = '';
     host.append(devicesSection(), virtualSection(), pairSection());
     projectSection(host);
+    multiplatformSection(host);
     toolchainSection(host);
     await rustSection(host);
     keepPolling();
@@ -167,6 +168,33 @@
     if (!p.gradlew) box.append(el('div', { class: 'hint', text: 'This project has no gradlew; forge-gradle uses Gradle ' + (info.toolchains.gradle || '') + ' instead.' }));
     box.append(el('div', { class: 'hint', text: 'Target device: ' + targetName() + '.' }));
     host.append(section('This Android project', box));
+  }
+  /** Kotlin Multiplatform modules: build, test and run each target with forge-gradle. iOS needs macOS and Xcode. */
+  function multiplatformSection(host) {
+    const mods = info.multiplatform || [];
+    if (!mods.length) return;
+    const box = el('div');
+    const T = { jvm: 'JVM', desktop: 'Desktop', android: 'Android', js: 'JavaScript', wasmJs: 'Wasm', ios: 'iOS', iosArm64: 'iOS', iosX64: 'iOS', iosSimulatorArm64: 'iOS', native: 'Native', apple: 'Apple', web: 'Web', linuxX64: 'Linux', macos: 'macOS' };
+    for (const m of mods) {
+      const p = m.gradle_path;
+      const targets = [...new Set(m.targets.map((x) => T[x] || x))];
+      box.append(row(m.module, 'targets: ' + (targets.join(', ') || 'none found'), true));
+      const btn = (text, task, title) => el('button', { class: 'btn ghost sm', text, title: title || task, onclick: () => runInTerminal('forge-gradle ' + p + ':' + task, text) });
+      const has = (x) => m.targets.includes(x);
+      box.append(actions(
+        btn('Check common code', 'compileCommonMainKotlinMetadata'),
+        has('jvm') ? btn('Build JVM', 'compileKotlinJvm') : null,
+        has('jvm') ? btn('JVM tests', 'jvmTest') : null,
+        has('desktop') ? btn('Build desktop', 'compileKotlinDesktop') : null,
+        m.compose_desktop ? btn('Run desktop app', 'run', 'Compose Multiplatform desktop app (it opens in the Linux VM\'s display)') : null,
+        has('android') && m.android_app ? btn('Build Android', 'assembleDebug') : null,
+        has('js') ? btn('Run in browser (JS)', 'jsBrowserDevelopmentRun') : null,
+        has('wasmJs') ? btn('Run in browser (Wasm)', 'wasmJsBrowserDevelopmentRun') : null,
+        btn('All tests', 'allTests')));
+      if (m.targets.some((x) => x.startsWith('ios') || x === 'apple' || x.startsWith('macos'))) box.append(el('div', { class: 'hint', text: 'iOS and macOS targets can only be compiled on a Mac with Xcode. Forge still checks their shared Kotlin code, but not their Apple APIs.' }));
+    }
+    box.append(el('div', { class: 'hint', text: 'Code intelligence treats each source set as its own module (commonMain, jvmMain, androidMain and so on), so expect and actual declarations link up and Android APIs only resolve in Android code. JavaScript, Wasm and iOS sets are checked as shared Kotlin; their platform APIs are not known to the Kotlin server.' }));
+    host.append(section('Kotlin Multiplatform', box));
   }
   function toolchainSection(host) {
     const t = info.toolchains, tc = el('div');

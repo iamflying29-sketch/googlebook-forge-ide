@@ -191,8 +191,9 @@ def status() -> dict:
 
 
 def is_android_project(root: str) -> bool:
-    for name in ("build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"):
-        f = os.path.join(root, name)
+    files = [os.path.join(root, n) for n in ("build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts")]
+    files += sorted(glob.glob(os.path.join(root, "*", "build.gradle")) + glob.glob(os.path.join(root, "*", "build.gradle.kts")))[:30]
+    for f in files:   # the project's own build files and its modules' (a multiplatform module names the Android plugin itself)
         if os.path.isfile(f):
             try:
                 with open(f, "r", encoding="utf-8", errors="replace") as fh:
@@ -233,6 +234,17 @@ def prompt_section(root: str) -> str:
                      "call look_at_image with that path and a question; the vision model looks at it for you. For errors, read "
                      "`adb logcat -d -t 300 '*:E'`.")
         lines.append("- Builds run inside a 2 GB memory limit and need free memory; keep Gradle builds to one at a time.")
+    try:
+        from .android import kmp_info
+        kmp = kmp_info(root) if jvm else []
+    except Exception:  # noqa: BLE001
+        kmp = []
+    for m in kmp:
+        lines.append(f"- Kotlin Multiplatform module {m['module']} (targets: {', '.join(m['targets']) or 'none'}). Source sets are "
+                     "src/<set>/kotlin (commonMain, jvmMain, androidMain, ...); put shared code in commonMain with expect "
+                     "declarations and the actual ones in each platform set. Build and test with forge-gradle, for example "
+                     f"`forge-gradle {m['gradle_path']}:compileKotlinJvm`, `{m['gradle_path']}:jvmTest` or `{m['gradle_path']}:allTests`. "
+                     "iOS and macOS targets cannot be compiled on Linux.")
     if s["cargo"] and rust:
         lines.append(f"- Rust toolchain ({s['rust']}): cargo, rustc, clippy and rustfmt are on the PATH. Use cargo check or cargo build.")
     if not lines:
