@@ -23,8 +23,9 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
+from . import personas
 from .devices import FORGE_PORT, PROFILES, adb, googlebook_free_mb, ensure_forge_server
 
 HOME = os.path.expanduser("~")
@@ -33,12 +34,26 @@ DEFS = os.path.join(VD_DIR, "devices.json")
 CONF = os.path.join(VD_DIR, "containers.conf")
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
 HOST_RESERVE_MB = 2300
-CAP_DROP = "MAC_ADMIN,MAC_OVERRIDE,SYS_TIME,SYS_MODULE,SYS_RAWIO"
+# SYS_BOOT: kexec and reboot (Android's init then just exits when it would restart), SYS_TIME: the VM's clock,
+# SYS_MODULE: kernel modules, SYS_RAWIO: raw hardware ports, MAC_*: security policies.
+CAP_DROP = "MAC_ADMIN,MAC_OVERRIDE,SYS_TIME,SYS_MODULE,SYS_RAWIO,SYS_BOOT"
+# Podman allows 2048 threads per container by default; Android with Google's apps needs more (its system process
+# crashed when it could not start a thread). 8192 still leaves most of the VM's 62,000 threads to everything else.
+PIDS_LIMIT = 8192
+SHIELD = 3          # the version of the startup script cleaning below; a new version makes new protected images
+RC_DIR = os.path.join(VD_DIR, "shield")
 FIRST_PORT = 6601   # outside 5555 to 5585, which every adb server scans for emulators
 
 VERSIONS: Dict[str, dict] = {
     "17": {"label": "Android 17", "detail": "LineageOS 24.0, API 37", "image": "localhost/forge-android:17", "backend": "waydroid",
            "cap_mb": 3072, "build": "forge-vd-image 17", "size": "1.4 GB download, 3.3 GB on disk"},
+    "17-google": {"label": "Android 17 with Google apps", "detail": "LineageOS 24.0 with Google Play and Play services, API 37",
+                  "image": "localhost/forge-android:17-google", "backend": "waydroid", "cap_mb": 3072, "build": "forge-vd-image 17-google",
+                  "size": "1.5 GB download (it shares Android 17's vendor files), 3.6 GB on disk",
+                  "types": ["phone", "small-phone", "foldable", "tablet", "watch-round", "watch-square", "desktop"]},
+    "tv16-google": {"label": "Android TV 16 with Google apps", "detail": "LineageOS 23.0 Android TV with Google Play and a Google TV mode, API 36",
+                    "image": "localhost/forge-android:tv16-google", "backend": "waydroid", "cap_mb": 3072, "build": "forge-vd-image tv16-google",
+                    "size": "1.2 GB download, 2.9 GB on disk", "types": ["tv"], "args": ["atv.setup.bt_remote_pairing=false"]},
     "16": {"label": "Android 16", "detail": "AOSP, API 36", "image": "docker.io/redroid/redroid:16.0.0_64only-latest", "backend": "redroid", "cap_mb": 2560, "size": "0.8 GB download"},
     "15": {"label": "Android 15", "detail": "AOSP, API 35", "image": "docker.io/redroid/redroid:15.0.0_64only-latest", "backend": "redroid", "cap_mb": 2560, "size": "0.7 GB download"},
     "14": {"label": "Android 14", "detail": "AOSP, API 34", "image": "docker.io/redroid/redroid:14.0.0_64only-latest", "backend": "redroid", "cap_mb": 2560, "size": "0.7 GB download"},
@@ -87,6 +102,10 @@ def setup_files() -> None:
     _write_if_changed(os.path.join(VD_DIR, "features", "tv.xml"), TV_FEATURES)
     _write_if_changed(os.path.join(VD_DIR, "weston-vd.ini"), WESTON_INI)
     _write_if_changed(os.path.join(VD_DIR, "empty"), "")
+    for pid in personas.PERSONAS:
+        xml = personas.features_xml(pid)
+        if xml:
+            _write_if_changed(os.path.join(VD_DIR, "features", f"persona-{pid}.xml"), xml)
 
 
 def podman_available() -> bool:
@@ -104,6 +123,106 @@ def pod(args: List[str], timeout: float = 60.0) -> subprocess.CompletedProcess:
 def images() -> set:
     r = pod(["images", "--format", "{{.Repository}}:{{.Tag}}"], timeout=30)
     return set(r.stdout.split()) if r.returncode == 0 else set()
+
+
+# ------------------------------------------------------------------ protected images
+# Android's startup scripts were written for a phone that Android owns. In a container they would change the VM's
+# own kernel: global settings (memory overcommit and watermarks, panic when a task hangs, SysRq), the owners of kernel
+# files (Android's "system" user is uid 1000, which in the VM is you, so it could suspend the VM through
+# /sys/power/state or install a SafeSetID policy that kills sudo), kernel trace buffers, and the console log level.
+# Forge runs every virtual device from a protected copy of its image whose startup scripts leave all of that out,
+# and the root guard service puts back anything that still changes.
+RC_PLACES = ("system/etc/init", "vendor/etc/init", "system_ext/etc/init", "product/etc/init", "odm/etc/init")
+UEVENTD_FILES = ("system/etc/ueventd.rc", "vendor/etc/ueventd.rc", "vendor/ueventd.rc", "odm/etc/ueventd.rc")
+_KERNEL_PATH = re.compile(r"^/(proc|sys)(/|$)")
+_OWN_PATH = re.compile(r"^/(proc/(self|thread-self|\d+|net|sys/net)(/|$)|sys/fs/(cgroup|bpf)(/|$))")   # per process or container
+_DROP_LINE = re.compile(r"^(swapon_all|loglevel|sysclktz|insmod|modprobe|start\s+llkd|exec\S*\s.*extra_free_kbytes"
+                        r"|mount\s+(tracefs|debugfs))\b")
+
+
+def clean_rc(text: str, ueventd: bool = False) -> Tuple[str, List[str]]:
+    """Android startup script text without the lines that would change the VM. Returns the text and what was removed."""
+    out, removed = [], []
+    for line in text.splitlines():
+        s = line.strip()
+        drop = False
+        if ueventd:
+            drop = s.startswith("/sys/")   # permissions for the VM's own devices
+        elif s and not s.startswith("#"):
+            words = s.split()
+            if words[0] == "onrestart" and len(words) > 1:
+                words = words[1:]
+            cmd = words[0]
+            path = ""
+            if cmd in ("write", "mkdir") and len(words) >= 2:
+                path = words[1]
+            elif cmd == "chmod" and len(words) >= 3:
+                path = words[2]
+            elif cmd == "chown" and len(words) >= 3:
+                path = words[-1]
+            elif cmd == "copy" and len(words) >= 3:
+                path = words[2]   # copy <from> <to>: only writing into the kernel matters
+            drop = bool(path and _KERNEL_PATH.match(path) and not _OWN_PATH.match(path)) or bool(_DROP_LINE.match(" ".join(words)))
+        if drop:
+            removed.append(s)
+            out.append(line[:len(line) - len(line.lstrip())] + "# removed by Forge (it would change the Linux VM): " + s)
+        else:
+            out.append(line)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else ""), removed
+
+
+def _image_id(image: str) -> str:
+    r = pod(["image", "inspect", "--format", "{{.Id}}", image], timeout=30)
+    iid = r.stdout.strip()
+    return iid if re.match(r"^[0-9a-f]{64}$", iid) else ""
+
+
+def shield_image(image: str, progress: Optional[Callable[[str], None]] = None) -> str:
+    """The protected copy of an Android image (built on first use, in a few seconds). Raises RuntimeError."""
+    iid = _image_id(image)
+    if not iid:
+        raise RuntimeError(f"{image} is not downloaded.")
+    tag = f"localhost/forge-shield:{iid[:12]}-v{SHIELD}"
+    if tag in images():
+        return tag
+    if progress:
+        progress("Preparing the protected copy of the Android image")
+    work = os.path.join(RC_DIR, f"{iid[:12]}-v{SHIELD}-{int(time.time())}")   # a new folder each time, nothing is deleted
+    files = os.path.join(work, "files")
+    os.makedirs(files)
+    r = pod(["image", "mount", image], timeout=120)
+    mnt = r.stdout.strip()
+    if r.returncode != 0 or not mnt.startswith("/"):
+        raise RuntimeError("Could not open the image to check its startup scripts: " + (r.stderr or r.stdout).strip()[-200:])
+    try:
+        found = subprocess.run(["sudo", "-n", "find"] + [os.path.join(mnt, p) for p in RC_PLACES] +
+                               ["-maxdepth", "2", "-type", "f", "-name", "*.rc"], capture_output=True, text=True, timeout=60).stdout.split()
+        found += [os.path.join(mnt, p) for p in UEVENTD_FILES]
+        report = []
+        for path in found:
+            rel = os.path.relpath(path, mnt)
+            got = subprocess.run(["sudo", "-n", "cat", path], capture_output=True, timeout=30)
+            if got.returncode != 0 or len(got.stdout) > 2_000_000:
+                continue
+            text = got.stdout.decode("utf-8", errors="surrogateescape")
+            cleaned, removed = clean_rc(text, ueventd=rel in UEVENTD_FILES)
+            if removed:
+                dest = os.path.join(files, rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "w", encoding="utf-8", errors="surrogateescape") as fh:
+                    fh.write(cleaned)
+                os.chmod(dest, 0o644)
+                report.append(f"/{rel}: " + "; ".join(removed))
+    finally:
+        pod(["image", "unmount", image], timeout=60)
+    with open(os.path.join(work, "removed.txt"), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(report) + "\n")
+    with open(os.path.join(work, "Containerfile"), "w", encoding="utf-8") as fh:
+        fh.write(f"FROM {image}\nCOPY files/ /\nLABEL forge.shield={SHIELD} forge.base={iid}\n")
+    b = pod(["build", "--pull=never", "-q", "-t", tag, "-f", os.path.join(work, "Containerfile"), work], timeout=600)
+    if b.returncode != 0:
+        raise RuntimeError("Could not build the protected image: " + (b.stderr or b.stdout).strip()[-300:])
+    return tag
 
 
 def mem_info_vm() -> int:
@@ -182,21 +301,33 @@ def save_look(dev_id: str, look: dict) -> None:
         _save(defs)
 
 
-def create(version: str, dev_type: str, name: str = "") -> dict:
+def create(version: str, dev_type: str, name: str = "", persona: str = "") -> dict:
     if version not in VERSIONS:
         raise ValueError("Unknown Android version.")
+    pers = personas.PERSONAS.get(persona) if persona else None
+    if persona and not pers:
+        raise ValueError("Unknown persona.")
+    if pers:
+        dev_type = pers["kind"]
     if dev_type not in TYPES:
         raise ValueError("Unknown device type.")
+    allowed = VERSIONS[version].get("types")
+    if allowed and dev_type not in allowed:
+        raise ValueError(f"{VERSIONS[version]['label']} is for " + ("TV devices." if allowed == ["tv"] else "phones, tablets, watches and desktops, not TVs."))
     with _lock:
         defs = definitions()
-        base = f"android{version}-{dev_type}"
+        base = f"android{version}-{persona or dev_type}"
         dev_id, n = base, 2
         while any(d["id"] == dev_id for d in defs):
             dev_id, n = f"{base}-{n}", n + 1
         used = {d["port"] for d in defs}
         port = next(p for p in range(FIRST_PORT, FIRST_PORT + 400) if p not in used)
-        d = {"id": dev_id, "name": name.strip()[:60] or f"{VERSIONS[version]['label']} {TYPE_NAMES[dev_type]}", "version": version,
-             "type": dev_type, "port": port, "created": time.time(), "look": {"profile": TYPES[dev_type]}}
+        d = {"id": dev_id, "name": name.strip()[:60] or (f"{pers['name']} persona ({VERSIONS[version]['label']})" if pers else
+                                                         f"{VERSIONS[version]['label']} {TYPE_NAMES[dev_type]}"),
+             "version": version, "type": dev_type, "port": port, "created": time.time(),
+             "look": {"profile": f"persona:{persona}" if pers else TYPES[dev_type]}}
+        if pers:
+            d["persona"] = persona
         defs.append(d)
         _save(defs)
         return d
@@ -213,7 +344,23 @@ def rename(dev_id: str, name: str) -> None:
 
 # ------------------------------------------------------------------ state
 def container(d: dict) -> str:
-    return "forge-vd-" + d["id"]
+    """The device's current container. Each protected image gets its own container (the Android data lives in the
+    device's volume, so a new container keeps it); older containers stay stopped until you remove them."""
+    return d.get("container") or "forge-vd-" + d["id"]
+
+
+def _use_container(d: dict, name: str) -> None:
+    with _lock:
+        defs = definitions()
+        for e in defs:
+            if e["id"] == d["id"] and e.get("container") != name:
+                old = e.get("container") or "forge-vd-" + e["id"]
+                e.setdefault("old_containers", [])
+                if old not in e["old_containers"]:
+                    e["old_containers"].append(old)
+                e["container"] = name
+        _save(defs)
+    d["container"] = name
 
 
 def conmon_running(name: str) -> bool:
@@ -241,12 +388,15 @@ def memory_mb(d: dict) -> Optional[int]:
     cid = r.stdout.strip()
     if r.returncode != 0 or not re.match(r"^[0-9a-f]{64}$", cid):
         return None
+    # Android's own memory: anonymous, shared and kernel memory. The rest of the cgroup's usage is file cache, which
+    # the kernel gives back whenever something needs it, so counting it would make a device look full.
     for base in ("/sys/fs/cgroup/machine.slice", "/sys/fs/cgroup"):
-        p = os.path.join(base, f"libpod-{cid}.scope", "memory.current")
+        p = os.path.join(base, f"libpod-{cid}.scope", "memory.stat")
         try:
             with open(p) as fh:
-                return int(fh.read()) // 1048576
-        except OSError:
+                stat = {k: int(v) for k, v in (line.split() for line in fh if line.count(" ") == 1)}
+            return (stat.get("anon", 0) + stat.get("shmem", 0) + stat.get("kernel", 0)) // 1048576
+        except (OSError, ValueError):
             continue
     return None
 
@@ -271,7 +421,7 @@ def status() -> dict:
                      "serial": f"127.0.0.1:{d['port']}", "version_label": VERSIONS[d["version"]]["label"],
                      "memory_mb": memory_mb(d) if run else None})
     vers = [{"version": v, **{k: info[k] for k in ("label", "detail", "backend", "cap_mb", "size")},
-             "installed": info["image"] in present, "job": _jobs.get(v)} for v, info in VERSIONS.items()]
+             "installed": info["image"] in present, "job": _jobs.get(v), "types": info.get("types")} for v, info in VERSIONS.items()]
     notices = []
     for path in (os.path.join(VD_DIR, "notices.jsonl"),):
         try:
@@ -286,8 +436,18 @@ def status() -> dict:
     except (OSError, ValueError, KeyError):
         pass
     notices = [n for n in notices if time.time() - n.get("time", 0) < 900]
+    shield = {}
+    try:
+        with open("/run/forge-android-guard/shield.json") as fh:
+            g = json.load(fh)
+        recent = [r for r in g.get("recent", []) if time.time() - r.get("time", 0) < 900]
+        shield = {"fixed": len(recent), "fresh": time.time() - g.get("time", 0) < 60,
+                  "hibernation_blocked": bool(g.get("hibernation_blocked")),
+                  "warning": next((r["fix"] for r in recent if r["fix"].startswith("WARNING")), "")}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
     return {"available": podman_available(), "devices": devs, "versions": vers, "types": TYPES, "notices": notices,
-            "guard": _guard_active()}
+            "guard": _guard_active(), "shield": shield}
 
 
 def _guard_active() -> bool:
@@ -348,31 +508,51 @@ def _start_display(d: dict) -> Optional[str]:
     return "The invisible display for Android 17 did not appear."
 
 
-def _run_args(d: dict) -> List[str]:
+def _run_args(d: dict, image: str) -> List[str]:
     info = VERSIONS[d["version"]]
     prof = PROFILES[(d.get("look") or {}).get("profile") or TYPES[d["type"]]]
     cap = info["cap_mb"]
-    args = ["run", "-d", "--privileged", f"--cap-drop={CAP_DROP}", "--name", container(d), "--label", "forge.vd=" + d["id"],
-            f"--memory={cap}m", f"--memory-swap={cap}m", "--cpus=4", "-p", f"127.0.0.1:{d['port']}:5555",
+    args = ["run", "-d"] + (["--rm"] if info["backend"] == "waydroid" else []) + ["--privileged", f"--cap-drop={CAP_DROP}", "--name", container(d), "--label", "forge.vd=" + d["id"],
+            f"--memory={cap}m", f"--memory-swap={cap}m", "--cpus=4", f"--pids-limit={PIDS_LIMIT}", "-p", f"127.0.0.1:{d['port']}:5555",
             "-v", f"forge-vd-{d['id']}-data:/data"]
     if d["type"] == "tv":
         args += ["-v", f"{os.path.join(VD_DIR, 'features', 'tv.xml')}:/vendor/etc/permissions/forge-device-type.xml:ro"]
+    if personas.features_xml(d.get("persona")):
+        args += ["-v", f"{os.path.join(VD_DIR, 'features', 'persona-' + d['persona'] + '.xml')}:/vendor/etc/permissions/forge-persona.xml:ro"]
     if info["backend"] == "waydroid":
         args += ["-v", f"{os.path.join(VD_DIR, 'empty')}:/.dockerenv:ro",
                  "-v", f"/run/user/{os.getuid()}/forge-vd-{d['id']}:/run/xdg/wayland-0",
-                 info["image"], "gralloc.gbm.device=/dev/dri/renderD128", "waydroid.xdg_runtime_dir=/run/xdg",
+                 image, "gralloc.gbm.device=/dev/dri/renderD128", "waydroid.xdg_runtime_dir=/run/xdg",
                  "waydroid.wayland_display=wayland-0", "ro.adb.secure=0", f"waydroid.host.uid={os.getuid()}",
                  f"waydroid.host.gid={os.getgid()}", "waydroid.background_start=true", "persist.waydroid.multi_windows=false"]
     else:
-        args += [info["image"], f"androidboot.redroid_width={prof[1]}", f"androidboot.redroid_height={prof[2]}",
+        args += [image, f"androidboot.redroid_width={prof[1]}", f"androidboot.redroid_height={prof[2]}",
                  f"androidboot.redroid_dpi={prof[3]}", "androidboot.redroid_gpu_mode=guest", "androidboot.use_memfd=true"]
     if d["type"] == "tv":
         args.append("ro.build.characteristics=tv")
+    args += info.get("args", []) + personas.init_args(d.get("persona"))
     return args
 
 
 def _in_android(d: dict, script: str, timeout: float = 30) -> subprocess.CompletedProcess:
     return pod(["exec", container(d), "/system/bin/sh", "-c", script], timeout=timeout)
+
+
+def persona_display_ok(d: dict) -> bool:
+    """True when the persona's cutout overlay is switched on (or the persona has none)."""
+    p = personas.PERSONAS.get(d.get("persona") or "")
+    if not p or not p["cutout"]:
+        return True
+    r = _in_android(d, "cmd overlay list android", timeout=20)
+    return "[x] com.android.shell:forge_cut" in r.stdout
+
+
+def apply_persona_display(d: dict) -> str:
+    """The persona's cutout and navigation mode, through overlays that need Android's root shell (so they are made
+    from outside, with podman exec). Older Android versions cannot take a custom cutout; the rest still applies."""
+    r = _in_android(d, personas.display_script(d.get("persona")), timeout=40)
+    out = (r.stdout + r.stderr).strip()
+    return "" if r.returncode == 0 and "Error" not in out else out[-300:]
 
 
 def start(dev_id: str, on_ready: Optional[Callable[[dict], None]] = None) -> dict:
@@ -408,8 +588,27 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
             if err:
                 _set(d["id"], "failed", err)
                 return
+        try:
+            image = shield_image(info["image"], lambda m: _set(d["id"], "starting", m))
+        except RuntimeError as e:
+            _set(d["id"], "failed", str(e))
+            _stop_display(d)
+            return
+        # WayDroid's start step converts /etc on the first boot and then deletes files in /system/etc (among them
+        # task_profiles.json, without which Android's storage service aborts) when it finds that already done. So the
+        # WayDroid-based images start from a fresh container every time; Podman discards it when the device stops,
+        # and the Android data stays in the device's volume. Redroid's containers are reused.
+        ephemeral = info["backend"] == "waydroid"
+        name = f"forge-vd-{d['id']}-{image.split(':')[-1]}" + ("-e" if ephemeral else "")
+        n = 2
+        while ephemeral and pod(["container", "exists", name], timeout=20).returncode == 0:
+            name = f"forge-vd-{d['id']}-{image.split(':')[-1]}-e{n}"   # one left behind when the VM stopped abruptly
+            n += 1
+        _use_container(d, name)
         exists = pod(["container", "exists", container(d)], timeout=20).returncode == 0
-        r = pod(["start", container(d)] if exists else _run_args(d), timeout=120)
+        if exists:   # containers made before the thread limit was raised get it now
+            pod(["update", "--pids-limit", str(PIDS_LIMIT), container(d)], timeout=30)
+        r = pod(["start", container(d)] if exists else _run_args(d, image), timeout=120)
         if r.returncode != 0:
             _set(d["id"], "failed", "The container did not start: " + (r.stderr or r.stdout).strip()[-300:])
             _stop_display(d)
@@ -433,7 +632,8 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
                     # A fresh LineageOS waits in its setup wizard and refuses adb until the device counts as set up.
                     _in_android(d, "settings put global device_provisioned 1; settings put secure user_setup_complete 1; "
                                    "settings put global development_settings_enabled 1; settings put global adb_enabled 1; "
-                                   "pm disable-user --user 0 org.lineageos.setupwizard >/dev/null 2>&1; "
+                                   "for w in org.lineageos.setupwizard com.google.android.setupwizard com.google.android.tungsten.setupwraith; do "
+                                   "pm disable-user --user 0 $w >/dev/null 2>&1; done; "
                                    "setprop ctl.start adbd; input keyevent 3", timeout=40)
                     provisioned = True
             adb(["connect", serial], port=FORGE_PORT, timeout=8)
@@ -457,7 +657,23 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
             cmds.append(f"settings put system font_scale {float(look['font_scale']):g}")
         if "rotation" in look:
             cmds += ["settings put system accelerometer_rotation 0", f"settings put system user_rotation {int(look['rotation']) % 4}"]
-        adb(["shell", "; ".join(cmds)], serial=serial, port=FORGE_PORT, timeout=20)
+        # Android reports itself booted before its window and overlay services have settled (the Google build takes
+        # longest), so the look is applied again until Android shows it took effect.
+        want_density = f"Override density: {prof[3]}" if prof and info["backend"] == "waydroid" else ""
+        for _ in range(6):
+            adb(["shell", "; ".join(cmds)], serial=serial, port=FORGE_PORT, timeout=20)
+            if not want_density:
+                break
+            rc, out, _ = adb(["shell", "wm density"], serial=serial, port=FORGE_PORT, timeout=10)
+            if want_density in (out or ""):
+                break
+            time.sleep(3)
+        if d.get("persona"):
+            _set(d["id"], "booting", "Giving the screen the persona's cutout and navigation")
+            for _ in range(6):
+                if apply_persona_display(d) == "" and persona_display_ok(d):
+                    break
+                time.sleep(3)
         _set(d["id"], "ready", f"Ready after {int(time.time() - t0)} seconds")
         if on_ready:
             on_ready(d)

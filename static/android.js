@@ -28,7 +28,7 @@
     try { [dev, info] = await Promise.all([get('/api/devices'), get('/api/android/status')]); }
     catch (e) { host.innerHTML = ''; host.append(el('div', { class: 'muted pad', text: e.message })); return; }
     host.innerHTML = '';
-    host.append(devicesSection(), virtualSection(), pairSection());
+    host.append(devicesSection(), virtualSection(), labSection(), pairSection());
     projectSection(host);
     multiplatformSection(host);
     toolchainSection(host);
@@ -71,11 +71,16 @@
     if (!v.available) return section('Virtual devices', el('div', { class: 'hint', text: 'Virtual devices need Podman and sudo without a password in the Linux VM. See the manual, section "Virtual devices".' }));
     if (!v.guard) box.append(el('div', { class: 'warn-box', text: 'The Forge Android guard service is not running. It protects the Linux VM while Android runs, so virtual devices will not start. Install it with guard/install.sh in the Forge folder.' }));
     for (const n of v.notices || []) box.append(el('div', { class: 'warn-box', text: n.message }));
+    const sh = v.shield || {};
+    if (v.guard && sh.warning) box.append(el('div', { class: 'warn-box', text: sh.warning }));
+    else if (v.guard && sh.fresh === false) box.append(el('div', { class: 'warn-box', text: 'The guard\'s VM shield has not reported for over a minute. Check it with: systemctl status forge-android-guard' }));
+    else if (v.guard && sh.fresh) box.append(el('div', { class: 'hint', text: 'VM shield on: Android cannot suspend, hibernate, restart or crash the Linux VM, and Android\'s changes to the VM\'s kernel settings are put back.' + (sh.fixed ? ' In the last 15 minutes it put back ' + sh.fixed + (sh.fixed === 1 ? ' change.' : ' changes.') : '') }));
     for (const d of v.devices) {
       const busy = d.phase === 'starting' || d.phase === 'booting' || d.phase === 'stopping';
       const live = dev.devices.find((x) => x.serial === d.serial && x.port === 5041 && x.state === 'device');
       box.append(el('div', { class: 'dev-row' + (live && same(live, dev.target) ? ' target' : '') },
         el('div', { class: 'dev-name' }, el('span', { class: 'tc-dot ' + (d.running ? 'ok' : 'no') }), el('b', { text: d.name }),
+          d.persona ? el('span', { class: 'dev-badge', text: 'persona', title: 'Android with this device\'s screen, identity, features and battery behavior. It is not the maker\'s own interface; for that, use a real device or a device lab.' }) : null,
           el('span', { class: 'dev-badge dim', text: d.phase })),
         el('div', { class: 'dev-facts', text: [d.version_label, (dev.profiles[(d.look || {}).profile] || {}).label, d.memory_mb ? d.memory_mb + ' MB in use' : '', d.message].filter(Boolean).join(', ') }),
         actions(
@@ -87,6 +92,21 @@
     // create
     const ver = el('select', { title: 'Android version' }, ...v.versions.map((x) => el('option', { value: x.version, text: x.label + (x.installed ? '' : ' (download first)') })));
     const typ = el('select', { title: 'Device type and screen' }, ...Object.keys(v.types).map((k) => el('option', { value: k, text: (dev.profiles[v.types[k]] || {}).label || k })));
+    const pers = el('select', { title: 'Persona: Android dressed as a specific device (its screen, cutout, identity, features and the maker\'s battery behavior)' },
+      el('option', { value: '', text: 'No persona' }));
+    const makers = {};
+    for (const x of dev.personas || []) (makers[x.maker + ' (' + x.skin + ')'] = makers[x.maker + ' (' + x.skin + ')'] || []).push(x);
+    for (const [m, list] of Object.entries(makers)) {
+      const g = el('optgroup', { label: m });
+      for (const x of list) g.append(el('option', { value: x.id, text: x.name + ' persona' + (x.certainty === 'exact' ? '' : ' (approximate)') }));
+      pers.append(g);
+    }
+    const persHint = el('div', { class: 'hint' });
+    pers.onchange = () => {
+      const x = (dev.personas || []).find((y) => y.id === pers.value);
+      typ.disabled = !!x;
+      persHint.textContent = x ? x.name + ': ' + x.width + '×' + x.height + ' at ' + x.density + ' dpi' + (x.cutout ? ', camera hole' : '') + ', ' + x.maker + ' identity and features' + (x.behavior && x.behavior !== 'stock' && x.behavior !== 'pixel' ? ', ' + x.maker + ' battery behavior available' : '') + '. ' + (x.certainty === 'exact' ? 'Screen values from the maker\'s published data or the device\'s own source tree. ' : 'Some screen values are approximate. ') + (x.note || '') : '';
+    };
     const dl = el('div');
     const showDl = () => {
       dl.innerHTML = '';
@@ -94,19 +114,24 @@
       if (!x) return;
       if (x.job && x.job.running) dl.append(el('div', { class: 'hint', text: 'Downloading ' + x.label + ': ' + ((x.job.lines || []).slice(-1)[0] || 'starting') }));
       else if (!x.installed) {
-        dl.append(el('div', { class: 'hint', text: x.label + ' (' + x.detail + ') is not downloaded yet: ' + x.size + '.' + (x.version === '17' ? ' Android 17 is LineageOS 24.0 from the WayDroid-ATV project; Forge checks the published checksums.' : ' Android 11 to 16 come from the open-source Redroid project.') }),
+        dl.append(el('div', { class: 'hint', text: x.label + ' (' + x.detail + ') is not downloaded yet: ' + x.size + '.' + (x.backend === 'waydroid' ? ' It is LineageOS from the WayDroid-ATV project, a community build made for containers; Forge checks the published checksums.' + (x.version.includes('google') ? ' Its Google apps are the ones that project includes. Signing in to Google Play may first need the device registered at google.com/android/uncertified.' : '') : ' Android 11 to 16 come from the open-source Redroid project.') }),
           actions(el('button', { class: 'btn ghost sm', text: 'Download ' + x.label, onclick: async () => { const r = await post('/api/vd/download', { version: x.version }); toast(r.message, r.ok ? 'ok' : 'error', 6000); render(); } })));
       } else if (x.job && x.job.ok === false) dl.append(el('div', { class: 'warn-box', text: 'The last download failed: ' + (x.job.lines || []).slice(-2).join(' ') }));
     };
-    ver.onchange = showDl;
-    showDl();
-    box.append(el('div', { class: 'dev-create' }, ver, typ,
+    ver.onchange = () => {   // some images are only for TVs, others only for phones and tablets
+      const x = v.versions.find((y) => y.version === ver.value) || {};
+      for (const o of typ.options) o.disabled = !!(x.types && !x.types.includes(o.value));
+      if (typ.selectedOptions[0] && typ.selectedOptions[0].disabled) typ.value = [...typ.options].find((o) => !o.disabled).value;
+      showDl();
+    };
+    ver.onchange();
+    box.append(el('div', { class: 'dev-create' }, ver, typ, pers,
       el('button', { class: 'btn ghost sm', text: 'Create', onclick: async () => {
         const x = v.versions.find((y) => y.version === ver.value);
         if (!x.installed) return toast('Download ' + x.label + ' first.', 'error');
-        const r = await post('/api/vd/create', { version: ver.value, type: typ.value });
+        const r = await post('/api/vd/create', { version: ver.value, type: typ.value, persona: pers.value });
         toast(r.message, r.ok ? 'ok' : 'error'); render();
-      } })), dl);
+      } })), persHint, dl);
     return section('Virtual devices', box, el('div', { class: 'hint', text: 'Real Android running in the Linux VM, without hardware virtualization. One device needs its memory limit (2.5 to 3 GB) plus 2.3 GB free on the Googlebook, so stop it, or unload the Llama model, when memory is short. Screen profiles, dark theme and text size change live in the device window. Watches are watch-sized, round screens of phone Android, because Wear OS itself cannot run here.' }));
   }
   async function vdAction(path, d) {
@@ -119,6 +144,88 @@
     const v = dev && dev.virtual;
     const active = v && (v.devices.some((d) => ['starting', 'booting', 'stopping'].includes(d.phase)) || v.versions.some((x) => x.job && x.job.running));
     if (active && $('.sidebar .view.active[data-view="android"]')) poller = setTimeout(render, 2500);
+  }
+
+  // ---------------------------------------------------------------- device labs (the makers' real software)
+  const link = (url, text) => el('a', { href: url, target: '_blank', rel: 'noopener', text: text || url });
+  function labSection() {
+    const box = el('div');
+    box.append(el('div', { class: 'hint', text: 'Samsung\'s One UI, Motorola\'s My UX, OnePlus\'s OxygenOS and Google\'s Pixel UI only run on the makers\' own phones, so for the real thing Forge connects real devices: yours over Wi-Fi (below), or a device in Google\'s or Samsung\'s lab. A lab device appears under Devices and works in the device window, with installs, logcat and the debugger.' }));
+    // Google's device lab
+    const g = el('div', { class: 'lab-card' }, el('b', { text: 'Google\'s device lab' }), el('div', { class: 'hint', text: 'Real Pixel, Samsung Galaxy, Motorola, OnePlus, OPPO, realme, Xiaomi, Sony and Nothing phones, a Pixel Tablet and a Pixel Watch, reserved through Google\'s Android command line tool.' }));
+    const gBody = el('div', { class: 'hint', text: 'Checking…' });
+    g.append(gBody);
+    box.append(g);
+    (async () => {
+      let st;
+      try { st = await get('/api/cloud/google'); } catch (e) { gBody.textContent = e.message; return; }
+      gBody.innerHTML = '';
+      if (!st.installed) { gBody.textContent = 'Google\'s Android command line tool is not installed in the Linux VM.'; return; }
+      if (!st.signed_in) {
+        gBody.append(el('div', { text: 'Sign in once with your Google account: run "android auth login" in a terminal and follow the link it shows. Forge never sees your password.' }),
+          actions(el('button', { class: 'btn ghost sm', text: 'Open a terminal for sign-in', onclick: () => runInTerminal('android auth login', 'Google sign-in') })));
+      }
+      gBody.append(el('div', { class: 'hint', text: st.price }));
+      const project = el('input', { placeholder: 'Google Cloud project ID', spellcheck: 'false', value: localStorage.getItem('forge.labProject') || '' });
+      const pick = el('select', { title: 'Device and Android version' }, el('option', { value: '', text: 'Loading the lab\'s devices…' }));
+      const out = el('pre', { class: 'lab-out hidden' });
+      const reserve = el('button', { class: 'btn sm', text: 'Reserve', disabled: !st.signed_in, onclick: async () => {
+        const target = pick.value, pj = project.value.trim();
+        if (!target || !pj) return toast('Choose a device and enter your project ID.', 'error');
+        localStorage.setItem('forge.labProject', pj);
+        if (!confirm('Reserve ' + pick.selectedOptions[0].text + ' in Google\'s device lab?\n\n' + st.price + '\n\nReturn the device when you are done, so it stops costing money.')) return;
+        const r = await post('/api/cloud/google/reserve', { target, project: pj, confirmed: true });
+        toast(r.message, r.ok ? 'ok' : 'error', 8000);
+      } });
+      const list = el('button', { class: 'btn ghost sm', text: 'My reservations', disabled: !st.signed_in, onclick: async () => {
+        const pj = project.value.trim();
+        const r = await get('/api/cloud/google/list?' + new URLSearchParams({ project: pj }));
+        out.classList.remove('hidden'); out.textContent = r.text || 'No reservations.';
+      } });
+      const resId = el('input', { placeholder: 'Reservation ID (from My reservations)', spellcheck: 'false' });
+      const giveBack = el('button', { class: 'btn ghost sm', text: 'Return device', disabled: !st.signed_in, onclick: async () => {
+        const r = await post('/api/cloud/google/release', { reservation: resId.value.trim(), project: project.value.trim() });
+        toast(r.message, r.ok ? 'ok' : 'error', 8000); render();
+      } });
+      const extend = el('button', { class: 'btn ghost sm', text: 'Extend 15 minutes', disabled: !st.signed_in, onclick: async () => {
+        if (!confirm('Extend this reservation by 15 minutes?\n\n' + st.price)) return;
+        const r = await post('/api/cloud/google/extend', { reservation: resId.value.trim(), project: project.value.trim(), minutes: 15, confirmed: true });
+        toast(r.message, r.ok ? 'ok' : 'error', 8000);
+      } });
+      gBody.append(el('div', { class: 'dev-create' }, pick, project, reserve), el('div', { class: 'dev-create' }, list, resId, giveBack, extend), out);
+      for (const j of Object.values(st.jobs || {})) gBody.append(el('div', { class: j.ok === false ? 'warn-box' : 'hint', text: j.what + (j.running ? ': running' : j.ok ? ': done' : ': failed') + (j.lines && j.lines.length ? '. ' + j.lines.slice(-3).join(' ') : '') }));
+      try {
+        const m = await get('/api/cloud/google/models');
+        pick.innerHTML = '';
+        pick.append(el('option', { value: '', text: m.ok ? 'Choose a device' : 'The device list could not be read' }));
+        for (const mk of m.makers || []) {
+          const og = el('optgroup', { label: mk.maker + ' (' + mk.models.length + ')' });
+          for (const md of mk.models) for (const t of md.targets) og.append(el('option', { value: t, text: md.name + ', Android API ' + t.split('/')[1] }));
+          pick.append(og);
+        }
+      } catch (e) { pick.innerHTML = ''; pick.append(el('option', { value: '', text: e.message })); }
+    })();
+    // Samsung's Remote Test Lab
+    const sBody = el('div');
+    const conn = el('input', { placeholder: 'localhost:PORT shown by Remote Debug Bridge', spellcheck: 'false' });
+    box.append(el('div', { class: 'lab-card' }, el('b', { text: 'Samsung Remote Test Lab (free)' }),
+      el('div', { class: 'hint' }, document.createTextNode('Real Galaxy phones, foldables, tablets and Galaxy Watches with One UI, including One UI 9 on Android 17. Sign in on Samsung\'s site for 20 free credits a day (one credit is 15 minutes) and reserve a device there: '), link('https://developer.samsung.com/remotetestlab/')),
+      el('div', { class: 'hint', text: 'To use it in Forge: in the lab\'s device screen, open Remote Debug Bridge and download Samsung\'s rdb program for Linux, save it in Documents, unzip it and run it in Forge\'s terminal (cd /mnt/shared/Documents && unzip rdb.zip && ./rdb), click Connect on Samsung\'s page, then enter the localhost port it shows here. Accept the "Allow USB debugging" prompt in the lab\'s screen the first time.' }),
+      el('div', { class: 'dev-create' }, conn, el('button', { class: 'btn ghost sm', text: 'Connect', onclick: async () => {
+        const r = await post('/api/devices/connect', { address: conn.value.trim() });
+        toast(r.message, r.ok ? 'ok' : 'error', 8000); render();
+      } }), el('button', { class: 'btn ghost sm', text: 'What is in the lab', onclick: async () => {
+        sBody.textContent = 'Reading Samsung\'s device list…';
+        const r = await get('/api/cloud/samsung');
+        sBody.innerHTML = '';
+        if (!r.ok) { sBody.textContent = r.message; return; }
+        sBody.append(el('div', { class: 'hint', text: r.units + ' Android devices in Samsung\'s labs (and ' + r.tizen_units + ' Samsung TVs, which run Tizen, not Android). The newest:' }));
+        for (const p of r.products.slice(0, 25)) sBody.append(el('div', { class: 'tc-row' }, el('span', { class: 'tc-l', text: p.name }), el('span', { class: 'tc-v', text: p.versions.slice(0, 2).join(', ') + ' (' + p.units + ')' })));
+      } })), sBody));
+    // Amazon
+    box.append(el('div', { class: 'lab-card' }, el('b', { text: 'Amazon Fire TV' }),
+      el('div', { class: 'hint' }, document.createTextNode('Amazon has no emulator for Fire OS. Its free Appstore Quality Central gives every developer cloud Fire TV devices in the browser: '), link('https://developer.amazon.com/docs/app-testing/live-device-interaction-virtual.html'), document.createTextNode('. In Forge, the Fire TV Stick 4K Max persona gives Android TV Fire TV\'s screen, identity and features.'))));
+    return section('Device labs: the makers\' real software', box);
   }
 
   // ---------------------------------------------------------------- pairing
@@ -151,6 +258,7 @@
     if (!(p && p.android)) return;
     const t = dev.target;
     const box = el('div');
+    A.appId = (p.modules.find((x) => x.application && x.application_id) || {}).application_id || '';
     for (const m of p.modules.filter((x) => x.application)) {
       box.append(row(m.module + ' (' + (m.application_id || 'unknown id') + ')', m.apk ? 'APK built ' + new Date(m.apk_time * 1000).toLocaleString() : 'not built yet', !!m.apk));
       box.append(actions(
@@ -267,7 +375,8 @@
   }
   function buildWindow() {
     const img = el('img', { class: 'devwin-screen', alt: 'Device screen', draggable: 'false', tabindex: '0' });
-    const frame = el('div', { class: 'devwin-frame' }, img);
+    const hole = el('div', { class: 'devwin-hole hidden' });   // Android leaves its own cutout drawing out of screenshots
+    const frame = el('div', { class: 'devwin-frame' }, img, hole);
     const title = el('span', { class: 'devwin-title' });
     const prof = el('select', { title: 'Screen profile' });
     const dark = el('button', { class: 'btn ghost sm', text: 'Dark' });
@@ -280,11 +389,26 @@
     const nav = el('div', { class: 'devwin-nav' }, key('back', 'Back'), key('home', 'Home'), key('recents', 'Recents'), text);
     const note = el('div', { class: 'devwin-note' });
     const look = el('div', { class: 'devwin-look' }, prof, dark, font, rot);
+    const bsel = el('select', { title: 'A maker\'s battery behavior, made with Android\'s own controls, for the app below' });
+    const bpkg = el('input', { class: 'devwin-pkg', placeholder: 'App package, for example com.example.app', spellcheck: 'false' });
+    const bgo = el('button', { class: 'btn ghost sm', text: 'Apply' });
+    const behave = el('div', { class: 'devwin-look' }, bsel, bpkg, bgo);
     const box = el('div', { class: 'devwin hidden' },
-      el('div', { class: 'devwin-head' }, title, shot, close), look, el('div', { class: 'devwin-body' }, frame), nav, note);
+      el('div', { class: 'devwin-head' }, title, shot, close), look, behave, el('div', { class: 'devwin-body' }, frame), nav, note);
     document.body.append(box);
-    let d = null, timer = null, gen = 0, lookState = {};
-    for (const [k, p] of Object.entries((dev && dev.profiles) || {})) prof.append(el('option', { value: k, text: p.label + ' ' + p.width + '×' + p.height }));
+    let d = null, timer = null, gen = 0, lookState = {}, persona = null;
+    function fillProfiles(own) {   // the general profiles and this device's own persona screen
+      prof.innerHTML = '';
+      for (const [k, p] of Object.entries((dev && dev.profiles) || {})) {
+        if (k.startsWith('persona:') && k !== own) continue;
+        prof.append(el('option', { value: k, text: (k === own ? 'Persona: ' : '') + p.label + ' ' + p.width + '×' + p.height }));
+      }
+    }
+    bgo.onclick = async () => {
+      const r = await post('/api/devices/behave', { serial: d.serial, port: d.port, preset: bsel.value, package: bpkg.value.trim() });
+      toast(r.message, r.ok ? 'ok' : 'error', 8000);
+    };
+    bsel.onchange = () => { const b = (dev.behaviors || {})[bsel.value]; bsel.title = b ? b.about : 'Undo every behavior for this app'; };
 
     async function send(kind, extra) {
       try { const r = await post('/api/devices/input', Object.assign({ serial: d.serial, port: d.port, kind }, extra)); if (!r.ok && r.message) toast(r.message, 'error'); }
@@ -302,7 +426,14 @@
       prof.value = lookState.profile || prof.value;
       dark.classList.toggle('on', !!lookState.dark);
       font.value = String(lookState.font_scale || 1);
-      frame.classList.toggle('round', (lookState.profile || '') === 'watch-round');
+      const own = persona && lookState.profile === 'persona:' + persona.id && !(lookState.rotation % 4);
+      frame.classList.toggle('round', (lookState.profile || '') === 'watch-round' || (own && persona.kind === 'watch-round'));
+      // The persona's rounded corners and camera hole, drawn over the picture in proportion.
+      frame.style.borderRadius = own && persona.corner ? (persona.corner / persona.width * 100) + '% / ' + (persona.corner / persona.height * 100) + '%' : '';
+      const c = own && persona.cutout;
+      hole.classList.toggle('hidden', !c);
+      if (c) Object.assign(hole.style, { left: ((c.x - c.r) / persona.width * 100) + '%', top: ((c.y - c.r) / persona.height * 100) + '%',
+        width: (2 * c.r / persona.width * 100) + '%', height: (2 * c.r / persona.height * 100) + '%' });
     }
     prof.onchange = () => setLook({ profile: prof.value });
     dark.onclick = () => setLook({ dark: !lookState.dark });
@@ -372,8 +503,17 @@
         d.input = device.kind !== 'googlebook';
         const vd = device.virtual_id ? (dev.virtual.devices.find((x) => x.id === device.virtual_id) || {}) : null;
         lookState = vd ? Object.assign({}, vd.look || {}) : {};
+        persona = vd && vd.persona ? (dev.personas || []).find((x) => x.id === vd.persona) || null : null;
+        fillProfiles(persona ? 'persona:' + persona.id : '');
         title.textContent = device.name || device.serial;
         look.classList.toggle('hidden', !vd);
+        behave.classList.toggle('hidden', !vd);
+        bsel.innerHTML = '';
+        const order = Object.keys(dev.behaviors || {}).sort((a, b) => (persona && a.startsWith(persona.behavior) ? -1 : 0) - (persona && b.startsWith(persona.behavior) ? -1 : 0));
+        for (const k of order) bsel.append(el('option', { value: k, text: dev.behaviors[k].label }));
+        bsel.append(el('option', { value: 'reset', text: 'Reset the app to normal' }));
+        bsel.onchange();
+        if (!bpkg.value) bpkg.value = A.appId || '';
         nav.classList.toggle('hidden', !d.input);
         note.textContent = d.input ? 'Click to tap, hold to long press, drag to swipe, scroll to scroll. Click the screen, then type to send keys.' : 'This is your Googlebook\'s own screen, so Forge only shows it.';
         applyLook();

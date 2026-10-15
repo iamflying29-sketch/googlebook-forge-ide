@@ -718,10 +718,16 @@ pre.nb-out.stream.err { background: rgba(255,107,107,.07); color: #ffb3b3; }
 .devwin-look select { flex: 1 1 120px; min-width: 0; padding: 2px 4px; }
 .devwin-look .btn.on { background: var(--accent-soft); color: var(--accent); }
 .devwin-body { flex: 1; min-height: 0; display: flex; justify-content: center; align-items: center; padding: 8px; background: #000; margin: 6px 8px; border-radius: 10px; }
-.devwin-frame { display: flex; max-width: 100%; max-height: 100%; overflow: hidden; border-radius: 6px; }
+.devwin-frame { display: flex; position: relative; max-width: 100%; max-height: 100%; overflow: hidden; border-radius: 6px; }
+.devwin-hole { position: absolute; border-radius: 50%; background: #000; pointer-events: none; }
+.devwin-pkg { flex: 1; min-width: 140px; }
 .devwin-frame.round { border-radius: 50%; }
 .devwin-screen { display: block; max-width: 100%; max-height: calc(100vh - 290px); object-fit: contain; cursor: pointer; outline: none; touch-action: none; background: #111; min-width: 80px; min-height: 80px; }
 .devwin-nav { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 8px 6px; }
 .devwin-text { flex: 1 1 140px; min-width: 0; padding: 3px 6px; }
 .devwin-note { color: var(--fg-3); font-size: 11px; padding: 0 8px 8px; }
 .nb-kernel { padding: 2px 4px; max-width: 200px; font-size: 12px; }
+
+.lab-card { border: 1px solid var(--border, #333); border-radius: 6px; padding: 8px 10px; margin: 6px 0; }
+.lab-card a { color: var(--accent, #8ab4f8); word-break: break-all; }
+.lab-out { max-height: 180px; overflow: auto; font-size: 11px; white-space: pre-wrap; }

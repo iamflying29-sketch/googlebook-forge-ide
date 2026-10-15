@@ -16,6 +16,7 @@ import subprocess
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
+from . import personas
 
 ADB = shutil.which("adb") or "adb"
 MAIN_PORT = 5037     # the shared adb server: the Googlebook only
@@ -38,6 +39,7 @@ PROFILES: Dict[str, Tuple[str, int, int, int]] = {
     "tv": ("TV", 1920, 1080, 320),
     "desktop": ("Desktop window", 1920, 1080, 160),
 }
+PROFILES.update(personas.profiles())   # persona:<id>, each device persona's own screen
 
 _lock = threading.Lock()
 _probe_cache: Dict[Tuple[int, str], Tuple[float, dict]] = {}
@@ -392,6 +394,24 @@ def set_look(serial: str, port: int, a: dict) -> dict:
 
 
 # ------------------------------------------------------------------ install, run, screenshot on any device
+def behave(serial: str, port: int, preset: str, pkg: str) -> dict:
+    """A maker's battery behavior (or reset) for one app, on virtual devices only: on a real device these would
+    change your own phone's settings for that app."""
+    from . import vdevice
+    if not (port == FORGE_PORT and vdevice.by_serial(serial)):
+        return {"ok": False, "message": "Maker behaviors can be applied on virtual devices."}
+    if preset != "reset" and preset not in personas.BEHAVIORS:
+        return {"ok": False, "message": "Unknown behavior."}
+    if not re.match(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$", pkg or ""):
+        return {"ok": False, "message": "Enter the app's package name, for example com.example.app."}
+    rc, out, err = adb(["shell", personas.behavior_script(preset, pkg)], serial=serial, port=port, timeout=30)
+    text = ((out or "") + (err or "")).strip()
+    problems = [x for x in text.splitlines() if re.search(r"(?i)error|unknown|exception|not found", x)]
+    label = "Reset to normal" if preset == "reset" else personas.BEHAVIORS[preset]["label"]
+    return {"ok": rc == 0 and not problems, "message": f"{label} for {pkg}." + (" Some steps are not available on this Android version: "
+            + " ".join(problems)[:300] if problems else "")}
+
+
 def install(apk_path: str, serial: str, port: int) -> dict:
     rc, out, err = adb(["install", "-r", "-t", apk_path], serial=serial, port=port, timeout=240)
     text = ((out or "") + (err or "")).strip()

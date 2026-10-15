@@ -1,23 +1,42 @@
 #!/bin/bash
-# forge-vd-image 17: builds Forge's Android 17 virtual device image (localhost/forge-android:17) from the WayDroid-ATV
-# LineageOS 24.0 VANILLA system image and its MAINLINE vendor image. Both downloads are checked against their
-# published SHA-256 sums. The images are only read (mounted read-only); the container image is the system tree with
-# the vendor tree at /vendor and /etc as an empty folder, because the image's Docker-mode start step moves the files
-# a container engine puts into /etc and then restores /etc as a link to /system/etc.
-# Forge runs this inside a memory cap. Downloaded files are kept for a rebuild; nothing is deleted.
+# forge-vd-image <variant>: builds one of Forge's WayDroid-ATV virtual device images from the project's published
+# system and vendor images. Every download is checked against the SHA-256 sum in WayDroid-ATV's update feed.
+#   17           Android 17 (LineageOS 24.0), VANILLA system and MAINLINE vendor     -> localhost/forge-android:17
+#   17-google    Android 17 (LineageOS 24.0) with Google apps (GAPPS system)         -> localhost/forge-android:17-google
+#   tv16-google  Android TV 16 (LineageOS 23.0) with Google apps and Google TV mode  -> localhost/forge-android:tv16-google
+# The images are only read (mounted read-only); the container image is the system tree with the vendor tree at
+# /vendor and /etc as an empty folder, because the image's Docker-mode start step moves the files a container
+# engine puts into /etc and then restores /etc as a link to /system/etc.
+# Forge runs this inside a memory cap. Downloads are kept for a rebuild, and a rebuild unpacks into the same
+# folder again; nothing is deleted.
 set -euo pipefail
-VERSION=${1:-}
-if [ "$VERSION" != 17 ]; then echo "Usage: forge-vd-image 17   (Android 11 to 16 are downloaded with podman pull)"; exit 2; fi
-SYS=lineage-24.0-20260926-VANILLA-waydroid_x86_64-system.zip
-SYS_SHA=182ef734924fd4295bcaeb3712e0fb5ac8ade454353d6910a43c2df7f7ac6203
-VEN=lineage-24.0-20260927-MAINLINE-waydroid_x86_64-vendor.zip
-VEN_SHA=1085bfbc9606d5895fd871e472dad144c13a775ccd1666c898cd4ac107cbc8ba
-BASE=$HOME/.forge-ide/vd/a17
-DL=$BASE/dl-20261015; IMG=$BASE/img-20261015; STAGE=$BASE/stage; MNT=/mnt/forge-a17
+VARIANT=${1:-}
+SF=https://sourceforge.net/projects/waydroid-atv/files/images
+case "$VARIANT" in
+  17)
+    SYS=lineage-24.0-20260926-VANILLA-waydroid_x86_64-system.zip; SYS_SHA=182ef734924fd4295bcaeb3712e0fb5ac8ade454353d6910a43c2df7f7ac6203
+    VEN=lineage-24.0-20260927-MAINLINE-waydroid_x86_64-vendor.zip; VEN_SHA=1085bfbc9606d5895fd871e472dad144c13a775ccd1666c898cd4ac107cbc8ba
+    ARCH=waydroid_x86_64; SDK=37; BASE=$HOME/.forge-ide/vd/a17; DL=$BASE/dl-20261015; IMG=$BASE/img-20261015
+    DESC="LineageOS 24.0 (Android 17) VANILLA 20260926 and MAINLINE vendor 20260927 from WayDroid-ATV, SHA-256 verified" ;;
+  17-google)
+    SYS=lineage-24.0-20260926-GAPPS-waydroid_x86_64-system.zip; SYS_SHA=cbdc8004a35a692ec1be860cb91629210072cdbaf824306618f775980e28350b
+    VEN=lineage-24.0-20260927-MAINLINE-waydroid_x86_64-vendor.zip; VEN_SHA=1085bfbc9606d5895fd871e472dad144c13a775ccd1666c898cd4ac107cbc8ba
+    ARCH=waydroid_x86_64; SDK=37; BASE=$HOME/.forge-ide/vd/a17; DL=$BASE/dl-20261015; IMG=$BASE/img-google
+    DESC="LineageOS 24.0 (Android 17) GAPPS 20260926 and MAINLINE vendor 20260927 from WayDroid-ATV, SHA-256 verified" ;;
+  tv16-google)
+    SYS=lineage-23.0-20260403-GAPPS-waydroid_tv_x86_64-system.zip; SYS_SHA=ddf5995f9104fe7164ad326def8bbed5cbf6340b55da5012e240b5855c44953b
+    VEN=lineage-23.0-20260403-MAINLINE-waydroid_tv_x86_64-vendor.zip; VEN_SHA=8b8b176c7d3b34719889f3c891d86b98af8dbbb2f737a970e89302fa3d0cf077
+    ARCH=waydroid_tv_x86_64; SDK=36; BASE=$HOME/.forge-ide/vd/atv16; DL=$BASE/dl-20261015; IMG=$BASE/img-google
+    DESC="LineageOS 23.0 (Android TV 16) GAPPS 20260403 and MAINLINE TV vendor 20260403 from WayDroid-ATV, SHA-256 verified" ;;
+  *)
+    echo "Usage: forge-vd-image 17 | 17-google | tv16-google   (Android 11 to 16 are downloaded with podman pull)"; exit 2 ;;
+esac
+TAG=localhost/forge-android:$VARIANT
+STAGE=$BASE/stage; MNT=/mnt/forge-$VARIANT
 CONF=$HOME/.forge-ide/vd/containers.conf
 mkdir -p "$DL" "$IMG" "$STAGE/etc"
-if [ "${FORCE:-0}" != 1 ] && sudo -n env CONTAINERS_CONF_OVERRIDE="$CONF" podman image exists localhost/forge-android:17; then
-  echo "Android 17 is already built (FORCE=1 rebuilds it)."; exit 0
+if [ "${FORCE:-0}" != 1 ] && sudo -n env CONTAINERS_CONF_OVERRIDE="$CONF" podman image exists "$TAG"; then
+  echo "$TAG is already built (FORCE=1 rebuilds it)."; exit 0
 fi
 
 fetch() {   # file folder sha256
@@ -25,8 +44,7 @@ fetch() {   # file folder sha256
   if [ -f "$DL/$f" ] && echo "$sum  $DL/$f" | sha256sum -c --status -; then echo "Already downloaded and verified: $f"; return; fi
   echo "Downloading $f"
   for try in 1 2 3; do
-    timeout 3600 curl -fL --retry 3 --retry-delay 5 -C - -sS -o "$DL/$f" \
-      "https://sourceforge.net/projects/waydroid-atv/files/images/$dir/waydroid_x86_64/$f/download" && break
+    timeout 3600 curl -fL --retry 3 --retry-delay 5 -C - -sS -o "$DL/$f" "$SF/$dir/$ARCH/$f/download" && break
     echo "Retrying ($try)"; sleep 5
   done
   echo "$sum  $DL/$f" | sha256sum -c - || { echo "The checksum does not match, so the file is not used."; exit 1; }
@@ -34,17 +52,15 @@ fetch() {   # file folder sha256
 fetch "$VEN" vendor "$VEN_SHA"
 fetch "$SYS" system "$SYS_SHA"
 echo "Unpacking"
-[ -f "$IMG/vendor.img" ] || (cd "$IMG" && timeout 900 nice -n 10 unzip -o -q "$DL/$VEN")
-[ -f "$IMG/system.img" ] || (cd "$IMG" && timeout 900 nice -n 10 unzip -o -q "$DL/$SYS")
+(cd "$IMG" && timeout 900 nice -n 10 unzip -o -q "$DL/$VEN")
+(cd "$IMG" && timeout 900 nice -n 10 unzip -o -q "$DL/$SYS")
 sudo -n mkdir -p "$MNT/system" "$MNT/vendor"
 mountpoint -q "$MNT/system" || sudo -n mount -o ro,loop "$IMG/system.img" "$MNT/system"
 mountpoint -q "$MNT/vendor" || sudo -n mount -o ro,loop "$IMG/vendor.img" "$MNT/vendor"
 trap 'sudo -n umount "$MNT/system" "$MNT/vendor" 2>/dev/null || true' EXIT
-grep -q "^ro.system.build.version.sdk=37" <(sudo -n cat "$MNT/system/system/build.prop") || { echo "This is not an Android 17 (API 37) system image."; exit 1; }
+grep -q "^ro.system.build.version.sdk=$SDK" <(sudo -n cat "$MNT/system/system/build.prop") || { echo "This is not an API $SDK system image."; exit 1; }
 echo "Building the container image"
 sudo -n tar --xattrs --xattrs-include='*' -C "$MNT" -c vendor -C "$MNT/system" --exclude=./vendor --exclude=./etc . -C "$STAGE" etc \
-  | sudo -n env CONTAINERS_CONF_OVERRIDE="$CONF" nice -n 10 podman import -c 'ENTRYPOINT ["/init"]' \
-      -m "LineageOS 24.0 (Android 17) VANILLA 20260926 and MAINLINE vendor 20260927 from WayDroid-ATV, SHA-256 verified" \
-      - localhost/forge-android:17
+  | sudo -n env CONTAINERS_CONF_OVERRIDE="$CONF" nice -n 10 podman import -c 'ENTRYPOINT ["/init"]' -m "$DESC" - "$TAG"
 sync; sudo -n sysctl -q -w vm.drop_caches=1 || true
-echo "Android 17 is ready."
+echo "$TAG is ready."

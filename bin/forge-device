@@ -5,6 +5,13 @@
   forge-device use <device>            make a device the target (a serial, a virtual device id or part of a name)
   forge-device new <version> <type>    create a virtual device (version 11 to 17; type phone, small-phone, foldable,
                                        tablet, watch-round, watch-square, tv or desktop)
+  forge-device new <version> --persona <persona>
+                                       create a device persona: Android with a specific device's screen, cutout,
+                                       identity, features and maker behavior (forge-device personas lists them)
+  forge-device personas                list the device personas
+  forge-device behave <behavior> <package>
+                                       give an app a maker's battery behavior on the target (virtual devices):
+                                       samsung, samsung-deep, oneplus, xiaomi, motorola, lenovo, doze, or reset
   forge-device start <id> [--wait]     start a virtual device (it becomes the target when it is ready)
   forge-device stop <id>               stop a virtual device
   forge-device download <version>      download an Android version for virtual devices
@@ -93,8 +100,18 @@ def main(argv):
     if cmd == "use" and len(argv) > 1:
         d = find(state, argv[1])
         return say(call("/api/devices/target", {"serial": d["serial"], "port": d["port"]}))
+    if cmd == "new" and len(argv) > 3 and argv[2] == "--persona":
+        return say(call("/api/vd/create", {"version": argv[1], "persona": argv[3], "name": " ".join(argv[4:])}))
     if cmd == "new" and len(argv) > 2:
         return say(call("/api/vd/create", {"version": argv[1], "type": argv[2], "name": " ".join(argv[3:])}))
+    if cmd == "personas":
+        for x in state.get("personas", []):
+            print(f"  {x['id']:<28} {x['name']} ({x['maker']}, {x['skin']}): {x['width']}x{x['height']} at {x['density']} dpi"
+                  + ("" if x["certainty"] == "exact" else ", approximate"))
+        print("A persona is Android with that device's screen, identity, features and battery behavior, not the maker's own interface.")
+        return
+    if cmd == "behave" and len(argv) > 2:
+        return say(call("/api/devices/behave", {"serial": t.get("serial"), "port": t.get("port"), "preset": argv[1], "package": argv[2]}))
     if cmd == "start" and len(argv) > 1:
         d = vd(state, argv[1])
         say(call("/api/vd/start", {"id": d["id"]}))

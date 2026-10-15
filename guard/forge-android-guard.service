@@ -1,6 +1,6 @@
 [Unit]
-Description=Forge Android guard: ends Android in a container the moment it starts to shut down, to protect the VM
-After=systemd-journald.service
+Description=Forge Android guard: protects the VM from Android in containers (shutdowns, suspend, global settings)
+After=systemd-journald.service systemd-sysctl.service
 Before=waydroid-container.service
 
 [Service]
@@ -8,7 +8,7 @@ ExecStart=/usr/bin/python3 -I /usr/local/lib/forge-guard/forge_android_guard.py
 Restart=always
 RestartSec=1
 Nice=-5
-MemoryMax=64M
+MemoryMax=128M
 ProtectHome=yes
 ProtectSystem=strict
 ReadWritePaths=/run

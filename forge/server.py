@@ -683,7 +683,9 @@ class Handler(BaseHTTPRequestHandler):
             if path not in ("/api/status", "/api/dirs", "/api/events", "/api/run", "/api/engine/config", "/api/engine/model",
                             "/api/engine/status", "/api/settings", "/api/image", "/api/image/analysis", "/api/engine/control",
                             "/api/engine/vision_file", "/api/vision/status", "/api/memcheck", "/api/toolchains",
-                            "/api/devices", "/api/devices/screen", "/api/devices/scan", "/api/notebook/kernels"):
+                            "/api/devices", "/api/devices/screen", "/api/devices/scan", "/api/notebook/kernels",
+                            "/api/cloud/google", "/api/cloud/google/models", "/api/cloud/google/projects",
+                            "/api/cloud/google/list", "/api/cloud/samsung"):
                 return self._error(400, f"This window's folder is not available ({e}). Open another folder.")
             folder_missing = str(e)
             ws = st.workspace
@@ -749,11 +751,26 @@ class Handler(BaseHTTPRequestHandler):
             from . import devices, vdevice
             devs = devices.list_devices()
             t = devices.target(devs)
-            return self._json(200, {"devices": devs, "target": t, "virtual": vdevice.status(),
+            from . import personas
+            return self._json(200, {"devices": devs, "target": t, "virtual": vdevice.status(), "personas": personas.listing(),
+                                    "behaviors": {k: {"label": v["label"], "about": v["about"]} for k, v in personas.BEHAVIORS.items()},
                                     "profiles": {k: {"label": v[0], "width": v[1], "height": v[2], "density": v[3]} for k, v in devices.PROFILES.items()}})
         if path == "/api/devices/scan":
             from . import devices
             return self._json(200, {"found": devices.scan()})
+        if path.startswith("/api/cloud/"):
+            from . import cloudlab
+            refresh = q.get("refresh", ["0"])[0] == "1"
+            if path == "/api/cloud/google":
+                return self._json(200, cloudlab.google_status())
+            if path == "/api/cloud/google/models":
+                return self._json(200, cloudlab.google_models(refresh))
+            if path == "/api/cloud/google/projects":
+                return self._json(200, cloudlab.google_projects())
+            if path == "/api/cloud/google/list":
+                return self._json(200, cloudlab.google_list(q.get("project", [""])[0]))
+            if path == "/api/cloud/samsung":
+                return self._json(200, cloudlab.samsung_summary(refresh))
         if path == "/api/devices/screen":
             from . import devices, vdevice
             serial, port = devices.resolve(arg("serial") or None, int(arg("port") or 0) or None)
@@ -997,7 +1014,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             # A window whose folder disappeared may still open another folder and use machine-wide actions.
             if not (path in ("/api/workspace", "/api/approve", "/api/cancel", "/api/unload", "/api/notepads",
-                             "/api/terminal/kill", "/api/image") or path.startswith(("/api/engine/", "/api/devices/", "/api/vd/"))
+                             "/api/terminal/kill", "/api/image") or path.startswith(("/api/engine/", "/api/devices/", "/api/vd/", "/api/cloud/"))
                     or (path == "/api/settings" and b.get("_scope", "user") == "user")):
                 raise
             ws = st.workspace
@@ -1302,6 +1319,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, debugging.prepare(p, ws.root))
         if path.startswith("/api/devices/") or path.startswith("/api/vd/"):
             return self._json(200, self._devices_post(path, b))
+        if path.startswith("/api/cloud/google/"):
+            # Reserving costs money: these only run with confirmed=true, which the Android view sends after you agree to
+            # Google's price. The agent has no tool for them.
+            from . import cloudlab
+            if path == "/api/cloud/google/reserve":
+                return self._json(200, cloudlab.google_reserve(str(b.get("target", "")), str(b.get("project", "")), b.get("confirmed") is True))
+            if path == "/api/cloud/google/extend":
+                return self._json(200, cloudlab.google_extend(str(b.get("reservation", "")), int(b.get("minutes", 15)),
+                                                              str(b.get("project", "")), b.get("confirmed") is True))
+            if path == "/api/cloud/google/release":
+                return self._json(200, cloudlab.google_release(str(b.get("reservation", "")), str(b.get("project", ""))))
         if path == "/api/replace":
             import fnmatch
             q = str(b.get("q", ""))
@@ -1819,8 +1847,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/devices/look":
             serial, port = devices.resolve(b.get("serial"), b.get("port"))
             return devices.set_look(serial, port, {k: b[k] for k in ("profile", "dark", "font_scale", "rotation") if k in b})
+        if path == "/api/devices/behave":
+            serial, port = devices.resolve(b.get("serial"), b.get("port"))
+            return devices.behave(serial, port, str(b.get("preset", "")), str(b.get("package", "")).strip())
         if path == "/api/vd/create":
-            d = vdevice.create(str(b.get("version", "")), str(b.get("type", "phone")), str(b.get("name", "")))
+            d = vdevice.create(str(b.get("version", "")), str(b.get("type", "phone")), str(b.get("name", "")), str(b.get("persona", "")))
             return {"ok": True, "message": f"Created {d['name']}.", "device": d}
         if path == "/api/vd/rename":
             vdevice.rename(str(b.get("id", "")), str(b.get("name", "")))

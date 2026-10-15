@@ -226,6 +226,12 @@ def prompt_section(root: str) -> str:
                      "Wi-Fi, and the Googlebook itself (Android 17). To test on another device or screen shape: `forge-device use "
                      "<name or serial>`, `forge-device start <virtual device id>`, `forge-device profile <phone|tablet|foldable|"
                      "watch-round|tv|...>`, `forge-device dark on`, `forge-device font 1.3`.")
+        lines.append("- Device personas are virtual devices dressed as a specific Galaxy, Pixel, OnePlus, Motorola, Lenovo, Xiaomi, "
+                     "Fire TV or Shield: that device's exact screen, camera cutout, maker and model identity, features and the "
+                     "maker's battery behavior (`forge-device personas`, `forge-device new 16 --persona galaxy-s25`). They are not "
+                     "the maker's own interface, so say so when you report results. To check how an app survives a maker's "
+                     "background killing: `forge-device behave <samsung|samsung-deep|oneplus|xiaomi|motorola|lenovo|doze|reset> "
+                     "<package>` on the target, then use the app and read logcat.")
         lines.append("- Build with `forge-gradle assembleDebug` (it runs ./gradlew or Gradle inside the memory limit), install with "
                      "`adb install -r <apk>` (never gradlew installDebug), and start the app with "
                      "`adb shell monkey -p <applicationId> -c android.intent.category.LAUNCHER 1`. Never run `adb reboot` or "
