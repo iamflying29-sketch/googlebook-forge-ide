@@ -1,7 +1,7 @@
 """Real devices with the makers' own software, from device labs in the cloud.
 
-Samsung's One UI, Motorola's My UX, OnePlus's OxygenOS and Google's Pixel UI only run on the makers' own ARM
-hardware, so the way to test on the real thing (besides your own devices over Wi-Fi) is a real device in a lab:
+Samsung's One UI, Motorola's My UX, OnePlus's OxygenOS and Google's Pixel UI are built for the makers' ARM hardware;
+besides the emulated ARM devices and your own devices over Wi-Fi, the fast way to test on the real thing is a lab:
 
 - Google's device lab, through Google's Android command line tool (`android device remote`), which reserves a real
   phone (Pixel, Samsung, Motorola, OnePlus, OPPO, Xiaomi, Sony and more) and connects it to adb over SSL. Reserving

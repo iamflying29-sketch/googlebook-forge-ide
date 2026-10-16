@@ -245,6 +245,20 @@ def prompt_section(root: str) -> str:
                      "tablet,watch-round,watch-square,tv]`. It renders every @Preview (Wear OS ones too) as PNG pictures with "
                      "Robolectric and prints their paths under ~/.forge-ide/previews/; look at them with look_at_image. It does "
                      "not change the project's files, and it is the way to check real Wear OS Compose screens.")
+        lines.append("- Platforms: Wear OS apps use androidx.wear.compose (Compose for Wear OS), androidx.wear.tiles and the Watch "
+                     "Face Format; TV apps use androidx.tv (Compose for TV) and Leanback; cars use androidx.car.app (Android Auto "
+                     "and Android Automotive OS; the Desktop Head Unit for Android Auto is installed at $ANDROID_HOME/extras/google/"
+                     "auto); XR apps use the Jetpack XR SDK (androidx.xr). Test on the matching virtual device: Wear OS 6, Google "
+                     "TV 16, Android Automotive 15, Android XR 14 or Android Desktop 14 (`forge-device new wear6 watch-round`, "
+                     "`new auto15 car`, `new xr14 xr`).")
+        lines.append("- Makers' stores: Samsung's Galaxy Store needs targetSdk 33 or newer and a 64-bit build, and its in-app "
+                     "purchases use the Samsung IAP SDK (an AAR from developer.samsung.com, or RevenueCat's purchases-store-galaxy "
+                     "on Maven); Samsung watch faces are built with Watch Face Studio (Windows and macOS only) or the Watch Face "
+                     "Format. Amazon's Appstore uses com.amazon.device:amazon-appstore-sdk from Maven Central (pin a version). "
+                     "Huawei's AppGallery uses HMS Core: add Huawei's Maven repository (https://developer.huawei.com/repo/) last and "
+                     "the com.huawei.agconnect plugin. Xiaomi, OPPO, vivo, OnePlus and Honor stores take ordinary Android APKs or "
+                     "bundles submitted through their developer sites. Test maker behavior with personas (`forge-device personas`) "
+                     "and the makers' real software with the emulated ARM devices or a lab device.")
         lines.append("- Builds run inside a 2 GB memory limit and need free memory; keep Gradle builds to one at a time.")
     try:
         from .android import kmp_info

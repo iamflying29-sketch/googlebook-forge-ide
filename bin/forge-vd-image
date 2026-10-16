@@ -49,12 +49,24 @@ case "$VARIANT" in
     GOOGLE_PKG="system-images;android-36;google-tv;x86_64"; VENDOR_IMAGE=docker.io/redroid/redroid:16.0.0_64only-latest
     SDK=36; BASE=$HOME/.forge-ide/vd/googletv16; IMG=$BASE/img-20261015
     DESC="Google TV (Android TV 16) x86_64 system image from Google's SDK repository with Redroid 16's vendor partition" ;;
+  auto15)
+    GOOGLE_PKG="system-images;android-35-ext15;android-automotive-playstore;x86_64"; VENDOR_IMAGE=docker.io/redroid/redroid:15.0.0_64only-latest
+    SDK=35; BASE=$HOME/.forge-ide/vd/auto15; IMG=$BASE/img-20261015
+    DESC="Android Automotive 15 with Google Play x86_64 system image from Google's SDK repository with Redroid 15's vendor partition" ;;
+  xr14)
+    GOOGLE_PKG="system-images;android-34;android-xr-preview-playstore;x86_64"; VENDOR_IMAGE=docker.io/redroid/redroid:14.0.0_64only-latest
+    SDK=34; BASE=$HOME/.forge-ide/vd/xr14; IMG=$BASE/img-20261015
+    DESC="Android XR developer preview (API 34) x86_64 system image from Google's SDK repository with Redroid 14's vendor partition" ;;
+  desktop14)
+    GOOGLE_PKG="system-images;android-34;android-desktop;x86_64"; VENDOR_IMAGE=docker.io/redroid/redroid:14.0.0_64only-latest
+    SDK=34; BASE=$HOME/.forge-ide/vd/desktop14; IMG=$BASE/img-20261015
+    DESC="Android desktop (API 34) x86_64 system image from Google's SDK repository with Redroid 14's vendor partition" ;;
   pixel16)
     GOOGLE_PKG="system-images;android-36;google_apis_playstore;x86_64"; VENDOR_IMAGE=docker.io/redroid/redroid:16.0.0_64only-latest
     SDK=36; BASE=$HOME/.forge-ide/vd/pixel16; IMG=$BASE/img-20261015
     DESC="Android 16 with Google Play x86_64 system image from Google's SDK repository with Redroid 16's vendor partition" ;;
   *)
-    echo "Usage: forge-vd-image 17 | 17-google | tv16-google | wear6 | googletv16 | pixel16   (Android 11 to 16 are downloaded with podman pull)"; exit 2 ;;
+    echo "Usage: forge-vd-image 17 | 17-google | tv16-google | wear6 | googletv16 | pixel16 | auto15 | xr14 | desktop14   (Android 11 to 16 are downloaded with podman pull)"; exit 2 ;;
 esac
 TAG=localhost/forge-android:$VARIANT
 STAGE=$BASE/stage; MNT=/mnt/forge-$VARIANT

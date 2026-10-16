@@ -132,7 +132,7 @@
         const r = await post('/api/vd/create', { version: ver.value, type: typ.value, persona: pers.value });
         toast(r.message, r.ok ? 'ok' : 'error'); render();
       } })), persHint, dl);
-    return section('Virtual devices', box, el('div', { class: 'hint', text: 'Real Android running in the Linux VM, without hardware virtualization. One device needs its memory limit (2.5 to 3 GB) plus 2.3 GB free on the Googlebook, so stop it, or unload the Llama model, when memory is short. Screen profiles, dark theme and text size change live in the device window. Watches are watch-sized, round screens of phone Android, because Wear OS itself cannot run here.' }));
+    return section('Virtual devices', box, el('div', { class: 'hint', text: 'Real Android running in the Linux VM, without hardware virtualization. One device needs its memory limit (2.5 to 3 GB) plus 2.3 GB free on the Googlebook, so stop it, or unload the Llama model, when memory is short. Screen profiles, dark theme and text size change live in the device window. Watches are watch-sized, round screens of phone Android, because Wear OS itself cannot run here. Versions marked (ARM, emulated) are the makers\' own Android under ARM emulation: real but slow, 15 to 30 minutes to the first screen.' }));
   }
   async function vdAction(path, d) {
     const r = await post(path, { id: d.id });
@@ -150,7 +150,7 @@
   const link = (url, text) => el('a', { href: url, target: '_blank', rel: 'noopener', text: text || url });
   function labSection() {
     const box = el('div');
-    box.append(el('div', { class: 'hint', text: 'Samsung\'s One UI, Motorola\'s My UX, OnePlus\'s OxygenOS and Google\'s Pixel UI only run on the makers\' own phones, so for the real thing Forge connects real devices: yours over Wi-Fi (below), or a device in Google\'s or Samsung\'s lab. A lab device appears under Devices and works in the device window, with installs, logcat and the debugger.' }));
+    box.append(el('div', { class: 'hint', text: 'Samsung\'s One UI, Motorola\'s My UX, OnePlus\'s OxygenOS and Google\'s Pixel UI are built for the makers\' ARM phones, so besides the emulated ARM devices Forge connects real devices: yours over Wi-Fi (below), or a device in Google\'s or Samsung\'s lab. A lab device appears under Devices and works in the device window, with installs, logcat and the debugger.' }));
     // Google's device lab
     const g = el('div', { class: 'lab-card' }, el('b', { text: 'Google\'s device lab' }), el('div', { class: 'hint', text: 'Real Pixel, Samsung Galaxy, Motorola, OnePlus, OPPO, realme, Xiaomi, Sony and Nothing phones, a Pixel Tablet and a Pixel Watch, reserved through Google\'s Android command line tool.' }));
     const gBody = el('div', { class: 'hint', text: 'Checking…' });

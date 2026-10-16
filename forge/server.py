@@ -775,9 +775,16 @@ class Handler(BaseHTTPRequestHandler):
             from . import devices, vdevice
             serial, port = devices.resolve(arg("serial") or None, int(arg("port") or 0) or None)
             png = devices.screen_png(serial, port)
+            vd = vdevice.by_serial(serial) if port == devices.FORGE_PORT else None
+            if png is None and vd and vdevice.VERSIONS[vd["version"]]["backend"] == "arm":
+                # An emulated ARM device shows its screen through QEMU until Android's adb is up (and if it never is).
+                from . import armvm
+                shot = os.path.join(armvm.ARM_DIR, "devices", vd["id"], "screen.png")
+                if armvm.screenshot(vd, shot):
+                    with open(shot, "rb") as fh:
+                        png = fh.read()
             if png is None:
                 return self._error(503, "The device did not send a screenshot.")
-            vd = vdevice.by_serial(serial) if port == devices.FORGE_PORT else None
             if vd:
                 vdevice.touch_active(vd)
             self.send_response(200)
@@ -1843,7 +1850,11 @@ class Handler(BaseHTTPRequestHandler):
             vd = vdevice.by_serial(serial) if port == devices.FORGE_PORT else None
             if vd:
                 vdevice.touch_active(vd)
-            return devices.send_input(serial, port, str(b.get("kind", "")), b)
+            r = devices.send_input(serial, port, str(b.get("kind", "")), b)
+            if not r.get("ok") and vd and vdevice.VERSIONS[vd["version"]]["backend"] == "arm":
+                from . import armvm   # an emulated ARM device takes input through QEMU until Android's adb is up
+                r = armvm.send_input(vd, str(b.get("kind", "")), b)
+            return r
         if path == "/api/devices/look":
             serial, port = devices.resolve(b.get("serial"), b.get("port"))
             return devices.set_look(serial, port, {k: b[k] for k in ("profile", "dark", "font_scale", "rotation") if k in b})

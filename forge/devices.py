@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -38,6 +39,8 @@ PROFILES: Dict[str, Tuple[str, int, int, int]] = {
     "watch-square": ("Square watch", 384, 384, 320),
     "tv": ("TV", 1920, 1080, 320),
     "desktop": ("Desktop window", 1920, 1080, 160),
+    "car": ("Car display", 1408, 792, 160),   # Google's Automotive emulator profile, 1408 by 792 at 160 dpi
+    "xr": ("XR headset panel", 1920, 1080, 320),   # the 2D panel of Google's XR emulator; approximate
 }
 PROFILES.update(personas.profiles())   # persona:<id>, each device persona's own screen
 
@@ -79,16 +82,56 @@ def _listed(port: int) -> List[Tuple[str, str, dict]]:
 
 
 def _published_addresses() -> List[str]:
-    addrs = []
+    """The Googlebook's Wireless debugging addresses published by the Sleep Guard and Shadow Trackpad helpers,
+    newest file first (Android picks a new port every time it re-joins Wi-Fi, so only the newest one is current)."""
+    found = []
     for f in ADDRESS_FILES:
         try:
             with open(f, "r", encoding="utf-8") as fh:
                 a = fh.read(100).split()[0]
             if re.match(r"^[\w.\-]+:\d+$", a):
-                addrs.append(a)
+                found.append((os.path.getmtime(f), a))
         except (OSError, IndexError):
             pass
-    return addrs
+    found.sort(reverse=True)
+    out: List[str] = []
+    for _, a in found:
+        if a not in out:
+            out.append(a)
+    return out
+
+
+_reconnect = {"last": 0.0, "failures": 0}
+
+
+def log(message: str) -> None:
+    sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S ") + "devices: " + message + "\n")
+    sys.stderr.flush()
+
+
+def _auto_reconnect() -> None:
+    """When the Googlebook is missing from the shared adb server but a published address exists, connect to it, at
+    most once every 20 seconds. Android restarts adb over Wi-Fi with a new port whenever it re-joins Wi-Fi (for
+    example after the screen was off), and the shared adb server sometimes keeps refusing the new port until it is
+    restarted, so after two failures in a row the server is restarted once (this Googlebook is its only device;
+    the helpers and Forge's virtual devices use their own adb servers)."""
+    now = time.time()
+    if now - _reconnect["last"] < 20:
+        return
+    _reconnect["last"] = now
+    addrs = _published_addresses()
+    if not addrs:
+        return
+    if _reconnect["failures"] >= 2:
+        adb(["kill-server"], timeout=15)
+        _reconnect["failures"] = 0
+        log("the shared adb server was restarted because it kept refusing the Googlebook's new address")
+    code, out, _ = adb(["connect", addrs[0]], timeout=15)
+    if "connected" in (out or "") and "unable" not in (out or "") and "failed" not in (out or ""):
+        _reconnect["failures"] = 0
+        log(f"reconnected to the Googlebook at {addrs[0]}")
+    else:
+        _reconnect["failures"] += 1
 
 
 def googlebook_serial(fresh: bool = False) -> Optional[str]:
@@ -102,6 +145,10 @@ def googlebook_serial(fresh: bool = False) -> Optional[str]:
     if not serial:
         others = [s for s in online if not s.startswith(("127.", "192.168.240.", "emulator-", "localhost"))]
         serial = others[0] if len(others) == 1 else (others[0] if others else None)
+    if not serial:
+        _auto_reconnect()
+        online = [s for s, st, _ in _listed(MAIN_PORT) if st == "device"]
+        serial = next((a for a in _published_addresses() if a in online), None)
     _gb_cache = (time.time(), serial)
     return serial
 
@@ -119,11 +166,14 @@ def googlebook_free_mb() -> Optional[float]:
 def connect_googlebook() -> dict:
     """Connect the shared adb server to this Googlebook through its published Wireless debugging address."""
     addrs = _published_addresses()
-    for a in addrs:
-        code, out, _ = adb(["connect", a], timeout=15)
-        if "connected" in (out or "") and "unable" not in (out or ""):
-            googlebook_serial(fresh=True)
-            return {"ok": True, "message": (out or "").strip()}
+    for attempt in (1, 2):
+        for a in addrs:
+            code, out, _ = adb(["connect", a], timeout=15)
+            if "connected" in (out or "") and "unable" not in (out or "") and "failed" not in (out or ""):
+                googlebook_serial(fresh=True)
+                return {"ok": True, "message": (out or "").strip()}
+        if attempt == 1 and addrs:   # the shared server sometimes refuses a new port until it is restarted
+            adb(["kill-server"], timeout=15)
     if not addrs:
         return {"ok": False, "message": "No published Wireless debugging address was found. Turn on Wireless debugging and pair adb once."}
     return {"ok": False, "message": "adb could not connect. Check that Wireless debugging is on."}

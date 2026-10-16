@@ -1,7 +1,7 @@
 """Device personas: a virtual device dressed as a specific phone, foldable, tablet, watch or TV.
 
 The real software of the big Android makers (Samsung's One UI, Motorola's My UX, OnePlus's OxygenOS, Lenovo's ZUI,
-Google's Pixel UI, Amazon's Fire OS) exists only for ARM phones and cannot run in a container. What an app actually
+Google's Pixel UI, Amazon's Fire OS) is ARM software, which runs here only through slow ARM emulation. What an app actually
 meets on those devices can be reproduced on real Android, though, and a persona does exactly that:
 
 - the device's screen: its pixel size and density (so the same dp layout), its camera cutout and the status bar

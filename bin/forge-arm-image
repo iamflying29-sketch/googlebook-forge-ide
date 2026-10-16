@@ -1,0 +1,147 @@
+#!/bin/bash
+# forge-arm-image <version>: downloads what an emulated ARM device needs (part of Forge IDE): the LineageOS ARM
+# virtual machine (android-lineage-qemu project, GitHub) and the maker's system image (a Mystic GSI port,
+# SourceForge). The maker's image is unpacked to a plain ext4 file, and the VM's adb public key is added to it so
+# adb can reach the emulated device. Downloads are kept for a rebuild; nothing is deleted. Forge runs this inside
+# a memory cap. The version list lives in forge/armvm.py.
+set -euo pipefail
+V=${1:-}
+cd "$(dirname "$(readlink -f "$0")")/.."
+eval "$(python3 - "$V" <<'EOF'
+import sys
+sys.path.insert(0, ".")
+from forge import armvm
+v = sys.argv[1]
+info = armvm.ARM_VERSIONS.get(v)
+if not info:
+    print("echo 'Usage: forge-arm-image <version>'; echo 'Versions: " + " ".join(armvm.ARM_VERSIONS) + "'; exit 2")
+    sys.exit(0)
+base = armvm.BASE[info["base"]]
+folder = info["folder"]
+url = f"{armvm.MYSTIC}/{folder + '/' if folder else ''}{info['zip']}/download"
+l23 = armvm.BASE["lineage23"]
+print(f"BASE_ZIP={base['zip']!r}; BASE_URL={base['url']!r}; BASE_DIR={armvm.base_dir(info['base'])!r}; "
+      f"GSI_ZIP={info['zip']!r}; GSI_URL={url!r}; GSI_IMG={armvm.gsi_path(v)!r}; ARM_DIR={armvm.ARM_DIR!r}; "
+      f"L23_ZIP={l23['zip']!r}; L23_URL={l23['url']!r}; L23_DIR={armvm.base_dir('lineage23')!r}")
+EOF
+)"
+DL=$ARM_DIR/dl; mkdir -p "$DL" "$BASE_DIR" "$(dirname "$GSI_IMG")"
+# fetch <file> <url> <seconds>: downloads to <file>.part, resuming and retrying through short network outages (the
+# Googlebook's Wi-Fi re-joins drop the VM's network for a few seconds), and renames the file only when complete, so
+# a partial download is never taken for a finished one.
+fetch() {
+  timeout "$3" curl -fL --retry 40 --retry-all-errors --retry-delay 15 -C - -sS -o "$1.part" "$2" && mv -f "$1.part" "$1"
+}
+if [ -z "$(find "$BASE_DIR" -name efi_vars.fd 2>/dev/null)" ]; then
+  [ -s "$DL/$BASE_ZIP" ] || { echo "Downloading the ARM virtual machine (1 GB)"; fetch "$DL/$BASE_ZIP" "$BASE_URL" 7200; }
+  echo "Unpacking the virtual machine"
+  (cd "$BASE_DIR" && timeout 900 nice -n 10 unzip -o -q "$DL/$BASE_ZIP")
+fi
+if [ ! -s "$GSI_IMG" ]; then
+  [ -s "$DL/$GSI_ZIP" ] || { echo "Downloading the maker's system image: $GSI_ZIP"; fetch "$DL/$GSI_ZIP" "$GSI_URL" 14400; }
+  echo "Unpacking the system image"
+  T=$(dirname "$GSI_IMG")/unpack; mkdir -p "$T"
+  (cd "$T" && timeout 1800 nice -n 10 unzip -o -q "$DL/$GSI_ZIP")
+  IMG=$(find "$T" -name '*.img' -size +500M | head -n 1)
+  [ -n "$IMG" ] || { echo "No system image inside $GSI_ZIP"; exit 1; }
+  file -b "$IMG" | grep -q 'ext4\|ext2' || { echo "The image is not ext4: $(file -b "$IMG" | cut -c1-80)"; exit 1; }
+  mv "$IMG" "$GSI_IMG"
+fi
+if [ ! -f "$GSI_IMG.prepared" ]; then
+  # adb: the key file Android's adbd trusts, inside the image (ro.adb.secure=0 is set as well when the image has it 1)
+  M=/mnt/forge-arm-gsi; sudo -n mkdir -p "$M" && sudo -n mount -o loop,rw "$GSI_IMG" "$M"
+  sudo -n mkdir -p "$M/product/etc/security" && sudo -n install -o 0 -g 0 -m 0644 "$HOME/.android/adbkey.pub" "$M/product/etc/security/adb_keys"
+  sudo -n sed -i 's/^ro\.adb\.secure=1$/ro.adb.secure=0/' "$M/system/build.prop" 2>/dev/null || true
+  # Android's watchdog, "not responding" and binder timeouts all scale with this multiplier (the way Google's own
+  # emulator sets it), and the emulated CPU runs at about a third of real speed.
+  sudo -n sed -i '/^ro\.hw_timeout_multiplier=/d' "$M/system/build.prop" && echo 'ro.hw_timeout_multiplier=10' | sudo -n tee -a "$M/system/build.prop" >/dev/null
+  # adb on the forwarded port from early in the boot, and Android's log on the emulated serial port (the device's
+  # serial.txt), so a boot that stops can be read. The su domain exists in these debug-style ports.
+  sudo -n tee "$M/system/etc/init/forge-debug.rc" >/dev/null <<'RC'
+# Added by Forge IDE for the emulated ARM device: adb over the forwarded port, and Android's log on the serial port.
+on early-boot
+    setprop service.adb.tcp.port 5555
+
+on post-fs-data
+    start forgelog
+
+# Android's own adbd is stopped by the USB rules a moment after it starts (there is no USB adb configuration on the
+# emulated machine), so Forge runs its own copy of adbd, which nothing stops, once the boot is complete.
+on property:sys.boot_completed=1
+    start forgeadbd
+
+service forgeadbd /apex/com.android.adbd/bin/adbd --root_seclabel=u:r:su:s0
+    class core
+    user root
+    disabled
+    seclabel u:r:adbd:s0
+
+service forgelog /system/bin/logcat -b all -v threadtime -f /dev/ttyAMA0
+    class core
+    user root
+    group root log
+    seclabel u:r:su:s0
+    disabled
+RC
+  sudo -n chmod 0644 "$M/system/etc/init/forge-debug.rc"; sudo -n chown 0:0 "$M/system/etc/init/forge-debug.rc"
+  # Samsung's key store insists on a hardware feature (rollback resistance) the virtual machine's software KeyMint
+  # does not have, and panics instead of coping, which stops the boot (found 2026-10-16). Android 16's standard
+  # keystore2 from the LineageOS 23.2 virtual machine takes its place; Samsung's copy is kept as keystore2.samsung.
+  if sudo -n readelf -d "$M/system/bin/keystore2" 2>/dev/null | grep -q libsamsung_keystore_utils; then
+    PARTS=$ARM_DIR/parts; mkdir -p "$PARTS"
+    if [ ! -s "$PARTS/keystore2-android16" ]; then
+      [ -s "$DL/$L23_ZIP" ] || { echo "Downloading the Android 16 virtual machine (1.1 GB) for its standard key store"; fetch "$DL/$L23_ZIP" "$L23_URL" 7200; }
+      mkdir -p "$L23_DIR" && (cd "$L23_DIR" && timeout 900 nice -n 10 unzip -o -q "$DL/$L23_ZIP")
+      VDA=$(find "$L23_DIR" -name 'vda.qcow2' | head -n 1)
+      timeout 900 nice -n 10 qemu-img convert -O raw "$VDA" "$PARTS/l23-vda.raw"
+      START=$(/usr/sbin/sfdisk -d "$PARTS/l23-vda.raw" | awk -F'[=,]' '/name="super"/ {gsub(/ /, "", $2); print $2}')
+      timeout 900 nice -n 10 python3 -I "$(dirname "$(readlink -f "$0")")/../vd/lpunpack.py" "$PARTS/l23-vda.raw" "$PARTS" --offset $((START * 512)) --only system
+      M2=/mnt/forge-arm-l23; sudo -n mkdir -p "$M2" && sudo -n mount -o loop,ro "$PARTS/system.img" "$M2"
+      sudo -n cp "$M2/system/bin/keystore2" "$PARTS/keystore2-android16"; sudo -n chown "$(id -u):$(id -g)" "$PARTS/keystore2-android16"
+      sudo -n umount "$M2"
+    fi
+    sudo -n cp -p "$M/system/bin/keystore2" "$M/system/bin/keystore2.samsung"
+    sudo -n install -o 0 -g 2000 -m 0755 "$PARTS/keystore2-android16" "$M/system/bin/keystore2"
+    echo "Replaced Samsung's key store with Android 16's standard one"
+    # One UI's battery service also needs Samsung's own health service (vendor.samsung.hardware.health.ISehHealth),
+    # which only Samsung's vendor partition has; a stand-in (vd/sehhealth.cpp) answers in its place.
+    NDKXX=$(ls -d "${ANDROID_HOME:-$HOME/tools/android-sdk}"/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android3[0-9]-clang++ 2>/dev/null | sort -V | tail -n 1)
+    [ -n "$NDKXX" ] || { echo "The Android NDK is needed (install-extras.sh android)."; exit 1; }
+    "$NDKXX" -O2 -Wall -fPIE -pie -static-libstdc++ -o "$PARTS/forge-sehhealth" "$(dirname "$(readlink -f "$0")")/../vd/sehhealth.cpp" -lbinder_ndk -llog -ldl
+    sudo -n install -o 0 -g 2000 -m 0755 "$PARTS/forge-sehhealth" "$M/system/bin/forge-sehhealth"
+    sudo -n tee "$M/system/etc/init/forge-sehhealth.rc" >/dev/null <<'RC'
+# Added by Forge IDE: a stand-in for Samsung's ISehHealth service, which only Samsung's own vendor partition has.
+service forge-sehhealth /system/bin/forge-sehhealth
+    class early_hal
+    user system
+    group system
+    seclabel u:r:su:s0
+RC
+    sudo -n mkdir -p "$M/system/etc/vintf/manifest"
+    sudo -n tee "$M/system/etc/vintf/manifest/vendor.samsung.hardware.health-forge.xml" >/dev/null <<'XML'
+<manifest version="1.0" type="framework">
+    <hal format="aidl">
+        <name>vendor.samsung.hardware.health</name>
+        <fqname>ISehHealth/default</fqname>
+    </hal>
+    <hal format="aidl">
+        <name>vendor.samsung.hardware.displayquality</name>
+        <fqname>ISehDisplayQuality/default</fqname>
+    </hal>
+</manifest>
+XML
+    # Samsung's boot checker crashes the kernel on purpose when the boot takes longer than it expects, for a crash
+    # dump; on the emulated CPU every boot takes longer, so it is kept from starting.
+    if [ -f "$M/system/etc/init/bootchecker.rc" ]; then
+      sudo -n sed -i -e '/^service bootchecker/,/^$/{/^    oneshot$/a\    disabled
+}' -e 's/^    restart bootchecker$/    # restart bootchecker (kept off by Forge IDE)/' "$M/system/etc/init/bootchecker.rc"
+      echo "Kept Samsung's boot checker from starting"
+    fi
+    sudo -n chmod 0644 "$M/system/etc/init/forge-sehhealth.rc" "$M/system/etc/vintf/manifest/vendor.samsung.hardware.health-forge.xml"
+    sudo -n chown 0:0 "$M/system/etc/init/forge-sehhealth.rc" "$M/system/etc/vintf/manifest/vendor.samsung.hardware.health-forge.xml"
+    echo "Added the stand-in for Samsung's health service"
+  fi
+  sudo -n umount "$M"
+  date -u > "$GSI_IMG.prepared"
+fi
+echo "$V is ready."

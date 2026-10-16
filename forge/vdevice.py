@@ -28,7 +28,7 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
-from . import personas
+from . import armvm, personas
 from .devices import FORGE_PORT, PROFILES, adb, googlebook_free_mb, ensure_forge_server
 
 HOME = os.path.expanduser("~")
@@ -63,6 +63,15 @@ VERSIONS: Dict[str, dict] = {
     "wear6": {"label": "Wear OS 6", "detail": "Google's official Wear OS 6.0 build, Android 16, API 36",
               "image": "localhost/forge-android:wear6", "backend": "google", "cap_mb": 2048, "build": "forge-vd-image wear6",
               "size": "1.1 GB download, about 6.5 GB on disk", "types": ["watch-round", "watch-square"]},
+    "auto15": {"label": "Android Automotive 15 with Google Play", "detail": "Google's official Android Automotive OS build, API 35",
+               "image": "localhost/forge-android:auto15", "backend": "google", "cap_mb": 3072,
+               "build": "forge-vd-image auto15", "size": "download from Google's SDK repository, about 9 GB on disk", "types": ["car"]},
+    "xr14": {"label": "Android XR 14 with Google Play (preview)", "detail": "Google's official Android XR developer preview build, API 34",
+             "image": "localhost/forge-android:xr14", "backend": "google", "cap_mb": 3072,
+             "build": "forge-vd-image xr14", "size": "download from Google's SDK repository, about 9 GB on disk", "types": ["xr"]},
+    "desktop14": {"label": "Android Desktop 14", "detail": "Google's official Android desktop build, API 34",
+                  "image": "localhost/forge-android:desktop14", "backend": "google", "cap_mb": 2560,
+                  "build": "forge-vd-image desktop14", "size": "download from Google's SDK repository, about 6 GB on disk", "types": ["desktop"]},
     "googletv16": {"label": "Google TV 16", "detail": "Google's official Google TV build, Android TV 16, API 36",
                    "image": "localhost/forge-android:googletv16", "backend": "google", "cap_mb": 2560,
                    "build": "forge-vd-image googletv16", "size": "1 GB download, about 12 GB on disk", "types": ["tv"]},
@@ -80,10 +89,12 @@ VERSIONS: Dict[str, dict] = {
 # Device types: the screen profile a device starts with, and Android features for the type. A true watch type is
 # not possible: phone builds of Android crash when told they are a watch (the Wear OS services are missing), so
 # watches are watch-sized, round-masked screens.
+VERSIONS.update(armvm.ARM_VERSIONS)   # the makers' own Android under ARM emulation (forge/armvm.py)
 TYPES = {"phone": "phone", "small-phone": "small-phone", "foldable": "foldable", "tablet": "tablet",
-         "watch-round": "watch-round", "watch-square": "watch-square", "tv": "tv", "desktop": "desktop"}
+         "watch-round": "watch-round", "watch-square": "watch-square", "tv": "tv", "desktop": "desktop", "car": "car", "xr": "xr"}
 TYPE_NAMES = {"phone": "phone", "small-phone": "small phone", "foldable": "foldable", "tablet": "tablet",
-              "watch-round": "round watch", "watch-square": "square watch", "tv": "TV", "desktop": "desktop"}
+              "watch-round": "round watch", "watch-square": "square watch", "tv": "TV", "desktop": "desktop",
+              "car": "car", "xr": "XR headset"}
 TV_FEATURES = """<?xml version="1.0" encoding="utf-8"?>
 <!-- Forge virtual device type: TV. Declares the TV features so Android uses its television UI mode. -->
 <permissions>
@@ -295,7 +306,7 @@ def mem_info_vm() -> int:
 # Terminal's display setup reads). Forge puts them back after each start and the watchdog checks them every 10 s.
 VM_FILES = (("/proc/cmdline", 0o444), ("/proc/bootconfig", 0o444), ("/proc/kmsg", 0o400), ("/proc/sysrq-trigger", 0o200),
             ("/sys/power/state", 0o644), ("/sys/power/wakeup_count", 0o644), ("/sys/devices/virtual/block/zram0/idle", 0o200),
-            ("/sys/devices/virtual/block/zram0/writeback", 0o200), ("/sys/fs/pstore", 0o755), ("/sys/firmware/acpi/tables", 0o755))
+            ("/sys/devices/virtual/block/zram0/writeback", 0o200), ("/sys/fs/pstore", 0o750), ("/sys/firmware/acpi/tables", 0o755))
 
 
 def restore_vm_permissions(full: bool = False) -> List[str]:
@@ -433,10 +444,14 @@ def conmon_running(name: str) -> bool:
 
 
 def running(d: dict, fresh: bool = False) -> bool:
+    if VERSIONS.get(d["version"], {}).get("backend") == "arm":
+        return armvm.running(d)
     return conmon_running(container(d))
 
 
 def memory_mb(d: dict) -> Optional[int]:
+    if VERSIONS.get(d["version"], {}).get("backend") == "arm":
+        return armvm.memory_mb(d)
     r = pod(["inspect", "-f", "{{.Id}}", container(d)], timeout=20)
     cid = r.stdout.strip()
     if r.returncode != 0 or not re.match(r"^[0-9a-f]{64}$", cid):
@@ -474,7 +489,8 @@ def status() -> dict:
                      "serial": f"127.0.0.1:{d['port']}", "version_label": VERSIONS[d["version"]]["label"],
                      "memory_mb": memory_mb(d) if run else None})
     vers = [{"version": v, **{k: info[k] for k in ("label", "detail", "backend", "cap_mb", "size")},
-             "installed": info["image"] in present, "job": _jobs.get(v), "types": info.get("types")} for v, info in VERSIONS.items()]
+             "installed": armvm.installed(v) if info["backend"] == "arm" else info["image"] in present,
+             "job": _jobs.get(v), "types": info.get("types"), "maker": info.get("maker")} for v, info in VERSIONS.items()]
     notices = []
     for path in (os.path.join(VD_DIR, "notices.jsonl"),):
         try:
@@ -715,9 +731,18 @@ def start(dev_id: str, on_ready: Optional[Callable[[dict], None]] = None) -> dic
         return {"ok": True, "message": f"{d['name']} is already starting."}
     if running(d, fresh=True):
         return {"ok": True, "message": f"{d['name']} is already running."}
+    info = VERSIONS[d["version"]]
+    if info["backend"] == "arm":
+        why = memory_block(d)
+        if why:
+            return {"ok": False, "message": why}
+        _set(dev_id, "starting", "Starting the ARM emulation")
+        r = armvm.start(d, lambda phase, msg: _set(dev_id, phase, msg), on_ready)
+        if not r["ok"]:
+            _set(dev_id, "failed", r["message"])
+        return r
     if not podman_available():
         return {"ok": False, "message": "Podman is not installed (or sudo needs a password), so virtual devices cannot run."}
-    info = VERSIONS[d["version"]]
     if info["image"] not in images():
         return {"ok": False, "message": f"{info['label']} is not downloaded yet. Use Download in the Virtual devices section first."}
     why = memory_block(d)
@@ -873,6 +898,10 @@ def stop(dev_id: str) -> dict:
         return {"ok": False, "message": "There is no such virtual device."}
     _set(dev_id, "stopping", "Stopping")
     serial = f"127.0.0.1:{d['port']}"
+    if VERSIONS[d["version"]]["backend"] == "arm":
+        r = armvm.stop(d)
+        _set(dev_id, "stopped", "")
+        return r
     adb(["shell", "sync"], serial=serial, port=FORGE_PORT, timeout=15)
     r = pod(["kill", container(d)], timeout=40)
     adb(["disconnect", serial], port=FORGE_PORT, timeout=8)
@@ -908,7 +937,9 @@ def download(version: str, gate: Callable[[], Optional[str]]) -> dict:
     except OSError:
         pass
     info = VERSIONS[version]
-    if info["backend"] in EPHEMERAL:
+    if info["backend"] == "arm":
+        cmd = ["systemd-run", "--user", "--wait", "--quiet", "--pipe", "-p", "MemoryMax=1300M", "-p", "MemorySwapMax=0"] + armvm.download_command(version)
+    elif info["backend"] in EPHEMERAL:
         cmd = ["systemd-run", "--user", "--wait", "--quiet", "--pipe", "-p", "MemoryMax=1300M", "-p", "MemorySwapMax=0",
                os.path.join(BIN, "forge-vd-image"), version]
     else:

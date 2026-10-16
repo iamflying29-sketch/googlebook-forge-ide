@@ -190,7 +190,9 @@ do_devices() {
   need_mem 800
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends podman crun passt fuse-overlayfs
   "$HERE/guard/install.sh"
-  echo "Download Android versions in Forge's Android view, under Virtual devices (Android 17: forge-vd-image 17)."
+  echo "== Emulated ARM devices (the makers' own Android): QEMU for ARM, its firmware and the screenshot library"
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-system-arm qemu-efi-aarch64 qemu-utils python3-pil
+  echo "Download Android versions in Forge's Android view, under Virtual devices (Android 17: forge-vd-image 17; makers' systems: forge-arm-image <version>)."
 }
 
 case "$WANT" in
