@@ -45,6 +45,15 @@ public class MainActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile boolean checking = false;
     private boolean showingOffline = false;
+    /** The offline screen: loaded once per outage and then only told the latest state (reloading it every few
+     *  seconds made the window flash and restart its count forever, found 2026-10-18). */
+    private boolean offlineLoaded = false;
+    private long offlineSince = 0;
+    private int failedProbes = 0;
+    private boolean terminalOpened = false;
+    private boolean started = false;
+    private static final int PROBE_MS = 3000;
+    private final Runnable probeTask = this::connect;
     /** Path this window opens on the Forge server, for example "/?folder=/home/you/projects". */
     private String startPath = "/";
     private ValueCallback<Uri[]> fileCallback;
@@ -149,24 +158,53 @@ public class MainActivity extends Activity {
         if (getIntent() != null && getIntent().getBooleanExtra("start_engine", false)) EngineService.start(this);
     }
 
-    /** Load the IDE if the server answers, otherwise show the offline page which retries by itself. */
+    /** Load the IDE if the server answers, otherwise show the offline screen and keep probing every few seconds
+     *  while this window is open. Forge runs inside the Linux Terminal, so when nothing answers right after this
+     *  window was opened, the Terminal is opened too (once per outage): its VM boots in about half a minute and
+     *  starts Forge with it, and this window loads the IDE by itself as soon as the server answers. */
     private void connect() {
+        main.removeCallbacks(probeTask);
         if (checking) return;
         checking = true;
         new Thread(() -> {
             boolean up = serverUp();
             main.post(() -> {
                 checking = false;
-                if (up) { showingOffline = false; web.loadUrl(SERVER + startPath); }
-                else showOffline();
+                if (up) {
+                    showingOffline = false; offlineLoaded = false; failedProbes = 0; terminalOpened = false;
+                    web.loadUrl(SERVER + startPath);
+                } else {
+                    failedProbes++;
+                    showOffline();
+                    if (started) main.postDelayed(probeTask, PROBE_MS);
+                }
             });
         }, "forge-probe").start();
     }
 
     private void showOffline() {
-        if (showingOffline) return;
-        showingOffline = true;
-        web.loadUrl("file:///android_asset/offline.html");
+        if (!showingOffline) { showingOffline = true; offlineSince = System.currentTimeMillis(); failedProbes = Math.max(failedProbes, 1); }
+        if (!offlineLoaded) {
+            offlineLoaded = true;
+            web.loadUrl("file:///android_asset/offline.html");
+        }
+        // Two misses in a row (about four seconds) rule out a server restart; then the Terminal is opened for you.
+        if (!terminalOpened && failedProbes >= 2) { terminalOpened = true; openTerminalApp(); }
+        tellOfflinePage();
+    }
+
+    private void tellOfflinePage() {
+        if (!offlineLoaded) return;
+        long secs = offlineSince > 0 ? (System.currentTimeMillis() - offlineSince) / 1000 : 0;
+        String js = "window.ForgeOffline && ForgeOffline.update({probes:" + failedProbes + ", seconds:" + secs
+                + ", terminalOpened:" + terminalOpened + ", every:" + (PROBE_MS / 1000) + "})";
+        try { web.evaluateJavascript(js, null); } catch (Exception ignored) { }
+    }
+
+    private void openTerminalApp() {
+        Intent i = getPackageManager().getLaunchIntentForPackage(TERMINAL_PACKAGE);
+        if (i == null) { Log.w(TAG, "the Terminal app is not installed"); return; }
+        try { startActivity(i); } catch (Exception e) { Log.w(TAG, "cannot open the Terminal", e); }
     }
 
     private static boolean serverUp() {
@@ -201,7 +239,7 @@ public class MainActivity extends Activity {
 
 
         @JavascriptInterface
-        public String appVersion() { return "1.4"; }
+        public String appVersion() { return "1.5"; }
 
         /** Voice input with Android's speech recognizer. Events come back through window.ForgeVoice._native(). */
         @JavascriptInterface
@@ -240,16 +278,12 @@ public class MainActivity extends Activity {
             });
         }
 
+        /** Check now (the offline screen stays until the server answers). */
         @JavascriptInterface
-        public void retry() { main.post(() -> { showingOffline = false; connect(); }); }
+        public void retry() { main.post(MainActivity.this::connect); }
 
         @JavascriptInterface
-        public void openTerminal() {
-            main.post(() -> {
-                Intent i = getPackageManager().getLaunchIntentForPackage(TERMINAL_PACKAGE);
-                if (i != null) { try { startActivity(i); } catch (Exception e) { Log.w(TAG, "cannot open Terminal", e); } }
-            });
-        }
+        public void openTerminal() { main.post(() -> { terminalOpened = true; openTerminalApp(); tellOfflinePage(); }); }
     }
 
     private static org.json.JSONObject voiceError(String text) {
@@ -293,7 +327,7 @@ public class MainActivity extends Activity {
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         // Ctrl+R reloads the IDE (handy after a server restart); everything else goes to the page.
-        if (keyCode == KeyEvent.KEYCODE_R && event.isCtrlPressed()) { showingOffline = false; connect(); return true; }
+        if (keyCode == KeyEvent.KEYCODE_R && event.isCtrlPressed()) { connect(); return true; }
         if (keyCode == KeyEvent.KEYCODE_BACK) {
             // The IDE is a single page; Back should not leave it by accident.
             moveTaskToBack(true);
@@ -328,9 +362,18 @@ public class MainActivity extends Activity {
     }
 
     @Override
-    protected void onResume() {
-        super.onResume();
-        if (showingOffline) { showingOffline = false; connect(); }
+    protected void onStart() {
+        super.onStart();
+        started = true;
+        // Coming back to an offline window: check at once and keep checking while the window is open.
+        if (showingOffline) { terminalOpened = false; connect(); }
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        started = false;
+        main.removeCallbacks(probeTask);
     }
 
     @Override

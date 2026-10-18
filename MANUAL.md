@@ -5,7 +5,7 @@ Forge is a Cursor-style AI coding IDE that runs entirely on your Lenovo Googlebo
 ## 1. The pieces
 
 - **Forge IDE server**: a Python program in the Linux Terminal VM. It serves the editor and runs the agent, the tools and the terminal. It starts automatically with the VM.
-- **Forge app**: the windows you open from the taskbar. It also hosts the GPU engine, the vision model and voice input.
+- **Forge app**: the windows you open from the taskbar. It also hosts the GPU engine, the vision model and voice input. Forge itself runs inside the Linux Terminal, so when you open the app while the Terminal is closed, the app shows one steady "Forge is not running yet" screen, opens the Terminal for you (its VM boots in about half a minute and starts Forge with it), checks every three seconds without reloading anything, and shows the IDE by itself as soon as Forge answers (app version 1.5; the earlier app reloaded that screen on every check, which looked like an endless loop and swallowed clicks on its buttons).
 - **Ollama with forge-coder**: your Llama 3.1 8B model, tuned for code, running on the CPU inside the VM.
 - **Forge GPU engine**: the same Llama 3.1 weights on the Intel graphics, through llama.cpp's Vulkan backend, inside the Forge app.
 - **The vision model**: Qwen3-VL, which looks at screenshots for Llama. It runs on the Intel graphics in the Forge app (4B, or 2B when memory is tighter), or on the CPU in the VM as a fallback. Text recognition (tesseract) reads the words in every image.

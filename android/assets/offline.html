@@ -15,19 +15,21 @@
 <body><div class="box">
   <div class="logo">F</div>
   <h1>Forge is not running yet</h1>
-  <p>Forge lives in the Linux Terminal VM. Open the Terminal app once so the VM starts; Forge starts with it automatically. This screen keeps checking and opens the IDE as soon as it answers.</p>
-  <ol>
-    <li>Open the <b>Terminal</b> app (it can stay in the background).</li>
-    <li>Wait a few seconds for the VM to boot.</li>
-    <li>Forge opens here by itself, or press Retry.</li>
-  </ol>
-  <button class="btn" onclick="ForgeApp.retry()">Retry now</button>
-  <button class="btn ghost" onclick="ForgeApp.openTerminal()">Open Terminal app</button>
-  <div class="status" id="status"></div>
+  <p>Forge runs inside the Linux Terminal. This window opens the Terminal for you when nothing answers, waits for its VM to boot (about half a minute), and shows the IDE by itself as soon as Forge answers. The Terminal can stay in the background.</p>
+  <button class="btn" onclick="ForgeApp.retry()">Check now</button>
+  <button class="btn ghost" onclick="ForgeApp.openTerminal()">Open the Terminal</button>
+  <div class="status" id="status">Checking…</div>
+  <div class="status" id="hint"></div>
 </div>
 <script>
-  let n = 0;
-  function tick() { n++; document.getElementById('status').textContent = 'Checking… (' + n + ')'; ForgeApp.retry(); }
-  setInterval(tick, 3000);
+  // The app probes the server itself and reports here; this page never reloads, so the buttons always work.
+  window.ForgeOffline = {
+    update: function (s) {
+      document.getElementById('status').textContent = 'Checking every ' + s.every + ' seconds… (' + s.probes + (s.seconds >= 60 ? ', ' + Math.floor(s.seconds / 60) + ' min ' + (s.seconds % 60) + ' s' : ', ' + s.seconds + ' s') + ')';
+      document.getElementById('hint').textContent = s.terminalOpened
+        ? 'The Terminal was opened. Its VM boots in about half a minute and starts Forge with it; if the Terminal shows a question, answer it there.'
+        : '';
+    }
+  };
 </script>
 </body></html>
