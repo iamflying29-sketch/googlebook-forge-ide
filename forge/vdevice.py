@@ -90,6 +90,22 @@ VERSIONS: Dict[str, dict] = {
 # not possible: phone builds of Android crash when told they are a watch (the Wear OS services are missing), so
 # watches are watch-sized, round-masked screens.
 VERSIONS.update(armvm.ARM_VERSIONS)   # the makers' own Android under ARM emulation (forge/armvm.py)
+
+
+def _load_extra_versions() -> None:
+    """Versions added as upgrades by forge/updates.py (a newer LineageOS or a newer Google build), kept in
+    catalog-overrides.json next to the device definitions."""
+    try:
+        with open(os.path.join(VD_DIR, "catalog-overrides.json"), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return
+    for v, o in ((data.get("extra") if isinstance(data, dict) else None) or {}).items():
+        if isinstance(o, dict) and o.get("backend") in ("waydroid", "google", "redroid") and o.get("image"):
+            VERSIONS.setdefault(v, {}).update(o)
+
+
+_load_extra_versions()
 TYPES = {"phone": "phone", "small-phone": "small-phone", "foldable": "foldable", "tablet": "tablet",
          "watch-round": "watch-round", "watch-square": "watch-square", "tv": "tv", "desktop": "desktop", "car": "car", "xr": "xr"}
 TYPE_NAMES = {"phone": "phone", "small-phone": "small phone", "foldable": "foldable", "tablet": "tablet",
@@ -515,8 +531,15 @@ def status() -> dict:
                   "warning": next((r["fix"] for r in recent if r["fix"].startswith("WARNING")), "")}
     except (OSError, ValueError, KeyError, TypeError):
         pass
+    try:
+        from . import updates
+        upd = updates.summary(present)
+        for dv in devs:
+            dv["upgrades"] = updates.upgrade_targets(dv, present)
+    except Exception as e:  # noqa: BLE001  (the view must still render)
+        upd = {"error": str(e), "items": [], "checked": 0}
     return {"available": podman_available(), "devices": devs, "versions": vers, "types": TYPES, "notices": notices,
-            "guard": _guard_active(), "shield": shield}
+            "guard": _guard_active(), "shield": shield, "updates": upd}
 
 
 def _guard_active() -> bool:

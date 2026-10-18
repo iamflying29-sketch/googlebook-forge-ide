@@ -10,6 +10,7 @@ and, once Android is up, through adb on a forwarded port like every other virtua
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -64,12 +65,33 @@ ARM_VERSIONS: Dict[str, dict] = {
                       "base": "lineage22", "folder": "OriginOS", "zip": "Originos-PD2266-15-compiler250711173629-AB-20260208-MysticGSI.zip",
                       "size": "6.4 GB download plus the 1 GB base", "maker": "vivo"},
     "arm-realmeui7": {"label": "Realme UI 7 (ARM, emulated)", "detail": "Realme UI 7 on Android 16, a Mystic GSI port, under ARM emulation",
-                      "base": "lineage22", "folder": "", "zip": "Realmeui-RE6030L1-CinnamonBun-1773651170858-AB-20260326-MysticGSI.zip",
+                      "base": "lineage22", "folder": "Generic", "zip": "Realmeui-RE6030L1-CinnamonBun-1773651170858-AB-20260326-MysticGSI.zip",
                       "size": "7 GB download plus the 1 GB base", "maker": "Realme"},
     "arm-pixel17": {"label": "Google Pixel software, Android 17 (ARM, emulated)", "detail": "A Pixel 7 Pro Android 17 build, a Mystic GSI port, under ARM emulation",
                     "base": "lineage22", "folder": "Pixel", "zip": "Pixel-cheetah-Baklava-12992050-AB-20251223-MysticGSI.zip",
                     "size": "2.1 GB download plus the 1 GB base", "maker": "Google"},
 }
+
+
+def _load_overrides() -> None:
+    """Updates and upgrades installed through forge/updates.py: a newer build of a port, a newer base machine, and
+    ports added as upgrades, kept in catalog-overrides.json so the scripts (which load this module) see them too."""
+    try:
+        with open(os.path.join(ARM_DIR, "..", "catalog-overrides.json"), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    for v, o in (data.get("arm") or {}).items():
+        if isinstance(o, dict):
+            ARM_VERSIONS.setdefault(v, {}).update({k: o[k] for k in ("zip", "label", "detail", "size", "folder", "base", "maker", "family", "rank") if k in o})
+    for b, o in (data.get("base") or {}).items():
+        if b in BASE and isinstance(o, dict):
+            BASE[b].update({k: o[k] for k in ("zip", "url") if k in o})
+
+
+_load_overrides()
 for _v in ARM_VERSIONS.values():
     _v.update({"backend": "arm", "cap_mb": CAP_MB, "image": "", "types": ["tablet", "phone"], "build": "forge-arm-image"})
 
@@ -249,7 +271,10 @@ def start(d: dict, set_phase: Callable[[str, str], None], on_ready: Optional[Cal
                "-accel", "tcg,tb-size=256,thread=multi", "-smp", "4", "-m", "2048",
                "-drive", f"if=pflash,unit=0,file={FIRMWARE},file.locking=off,format=raw,readonly=on",
                "-drive", f"if=pflash,unit=1,file={vars_}",
-               "-device", "virtio-gpu-pci", "-display", f"vnc=127.0.0.1:{vnc}",
+               # edid=off: with QEMU's EDID the preferred 1280x800 mode runs at 75 Hz while every other size runs at 60 Hz,
+               # and a system that insists on 60 Hz (OxygenOS) then switches to 640x480 and the display stops (2026-10-17);
+               # without EDID every mode is 60 Hz and the size stays.
+               "-device", "virtio-gpu-pci,edid=off", "-display", f"vnc=127.0.0.1:{vnc}",
                "-device", "usb-ehci,id=usb-bus", "-device", "usb-tablet,bus=usb-bus.0", "-device", "usb-kbd,bus=usb-bus.0",
                "-device", "virtio-blk-pci,drive=vda,bootindex=0", "-device", "virtio-blk-pci,drive=vdb,bootindex=1",
                "-drive", f"file={vda},if=none,id=vda,discard=unmap,detect-zeroes=unmap",
@@ -268,17 +293,72 @@ def start(d: dict, set_phase: Callable[[str, str], None], on_ready: Optional[Cal
     return {"ok": True, "message": f"Starting {d['name']} under ARM emulation. The first screen takes 15 to 30 minutes."}
 
 
+def _reconnect(serial: str) -> None:
+    """A connection made before the emulated adbd listens (QEMU accepts it anyway) stays "offline" for ever; adb must
+    let go of it, and only after a moment does a new connection reach adbd (found 2026-10-17)."""
+    adb(["disconnect", serial], port=FORGE_PORT, timeout=8)
+    time.sleep(2)
+    adb(["connect", serial], port=FORGE_PORT, timeout=8)
+
+
+def _connect_once(serial: str) -> None:
+    """Connects Forge's adb server to the device, letting go of a connection that is listed as offline first."""
+    rc, out, _ = adb(["devices"], port=FORGE_PORT, timeout=8)
+    if rc == 0 and f"{serial}\toffline" in (out or ""):
+        _reconnect(serial)
+    elif rc == 0 and f"{serial}\tdevice" not in (out or ""):
+        adb(["connect", serial], port=FORGE_PORT, timeout=8)
+
+
+def _display_guard(d: dict) -> None:
+    """Keeps the emulated display at its real size while the device runs. Some makers' systems (OxygenOS, ColorOS) ask
+    the display for an exact 60 Hz mode a few minutes into the boot, and the only exact-60 modes the virtual display
+    offers have other sizes, so the system switches to 640x480 or 4096x2160; the virtual display cannot scale, every
+    frame then fails, and a window manager that starts on the wrong size never shows its windows. SurfaceFlinger's
+    mode 0 is the real size; asking for it again is free when it is already active, so the guard asks every ten
+    seconds from the moment adb answers, without first reading the size (reading it took minutes on a booting
+    emulated system, found 2026-10-17). A connection left "offline" by the port's second adbd is made again."""
+    serial = f"127.0.0.1:{d['port']}"
+    last = ""
+    while running(d):
+        time.sleep(10)
+        rc, out, _ = adb(["devices"], port=FORGE_PORT, timeout=8)
+        if rc != 0 or f"{serial}\tdevice" not in (out or ""):
+            line = next((l for l in (out or "").splitlines() if l.startswith(serial)), "not listed")
+            if line != last:
+                print(f"[arm display guard] {d['id']}: adb says {line}; connecting again", flush=True)
+                last = line
+            _reconnect(serial)
+            continue
+        t = time.time()
+        rc, out, err = adb(["shell", "service call SurfaceFlinger 1035 i32 0"], serial=serial, port=FORGE_PORT, timeout=40)
+        state = f"rc {rc} in {time.time() - t:.0f}s: {(out or err or '').strip()[:60]}"
+        if state != last:
+            print(f"[arm display guard] {d['id']}: {state}", flush=True)
+            last = state
+
+
 def _boot(d: dict, set_phase: Callable[[str, str], None], on_ready: Optional[Callable[[dict], None]]) -> None:
     mon = _monitor(d)
     t0 = time.time()
+    threading.Thread(target=_display_guard, args=(d,), name="arm-display-guard", daemon=True).start()
     for _ in range(120):
         if os.path.exists(mon):
             break
         time.sleep(0.5)
-    time.sleep(12)   # the boot menu appears after about 10 seconds and counts down for 10 more
+    # The boot menu appears after about 10 seconds (later when the machine is busy) and counts down for 10 more; a
+    # harmless key every few seconds stops the countdown as soon as the menu is there, so the choice below is never
+    # too early or too late (a fresh device sat in the menu for half an hour on 2026-10-17).
+    for _ in range(6):
+        time.sleep(3)
+        monitor(d, ["sendkey up"], wait=0.3)
+    time.sleep(2)
     # The LineageOS menu: the fourth line is "Advanced options"; in it, the last line boots the GSI from the third disk.
+    # The choice is sent twice: once the kernel is booting, extra keys only reach its console.
     monitor(d, ["sendkey down", "sendkey down", "sendkey down", "sendkey ret"], wait=0.8)
-    time.sleep(3)
+    time.sleep(4)
+    monitor(d, ["sendkey end", "sendkey ret"], wait=0.8)
+    time.sleep(6)
     monitor(d, ["sendkey end", "sendkey ret"], wait=0.8)
     serial = f"127.0.0.1:{d['port']}"
     while time.time() - t0 < BOOT_MIN * 60:
@@ -287,7 +367,7 @@ def _boot(d: dict, set_phase: Callable[[str, str], None], on_ready: Optional[Cal
             return
         mins = int((time.time() - t0) / 60)
         set_phase("booting", f"ARM emulation: the maker's Android is starting ({mins} min so far; the first screen takes 15 to 30)")
-        adb(["connect", serial], port=FORGE_PORT, timeout=8)
+        _connect_once(serial)
         rc, out, _ = adb(["shell", "getprop sys.boot_completed"], serial=serial, port=FORGE_PORT, timeout=8)
         if rc == 0 and (out or "").strip() == "1":
             set_phase("ready", f"Ready after {mins} minutes (emulated ARM; expect a slow screen)")
@@ -298,7 +378,7 @@ def _boot(d: dict, set_phase: Callable[[str, str], None], on_ready: Optional[Cal
     # Slow images take longer; the device keeps running and is checked every half minute until it stops.
     while running(d):
         set_phase("booting", f"ARM emulation: still starting after {int((time.time() - t0) / 60)} minutes; it keeps running, and Screen shows the emulated display")
-        adb(["connect", serial], port=FORGE_PORT, timeout=8)
+        _connect_once(serial)
         rc, out, _ = adb(["shell", "getprop sys.boot_completed"], serial=serial, port=FORGE_PORT, timeout=8)
         if rc == 0 and (out or "").strip() == "1":
             set_phase("ready", f"Ready after {int((time.time() - t0) / 60)} minutes (emulated ARM; expect a slow screen)")

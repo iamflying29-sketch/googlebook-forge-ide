@@ -87,8 +87,12 @@
           d.running ? el('button', { class: 'btn ghost sm', text: 'Stop', disabled: busy, onclick: () => vdAction('/api/vd/stop', d) })
             : el('button', { class: 'btn sm', text: 'Start', disabled: busy, title: 'Starts the device in the Linux VM; it becomes the target device when it is ready', onclick: () => vdAction('/api/vd/start', d) }),
           live ? el('button', { class: 'btn ghost sm', text: 'Screen', onclick: () => openScreen(live) }) : null,
-          live && !same(live, dev.target) ? el('button', { class: 'btn ghost sm', text: 'Use', onclick: () => useDevice(live) }) : null)));
+          live && !same(live, dev.target) ? el('button', { class: 'btn ghost sm', text: 'Use', onclick: () => useDevice(live) }) : null,
+          !d.running && d.upgrades && d.upgrades.length ? el('button', { class: 'btn ghost sm', text: 'Upgrade to ' + d.upgrades[d.upgrades.length - 1].label,
+            title: 'Moves this device to the newer installed version of its family and keeps its apps and data; Android migrates them on the next start, as a phone does after a system upgrade',
+            onclick: async () => { const r = await post('/api/vd/move', { id: d.id, version: d.upgrades[d.upgrades.length - 1].version }); toast(r.message, r.ok ? 'ok' : 'error', 8000); render(); } }) : null)));
     }
+    box.append(updatesBlock(v));
     // create
     const ver = el('select', { title: 'Android version' }, ...v.versions.map((x) => el('option', { value: x.version, text: x.label + (x.installed ? '' : ' (download first)') })));
     const typ = el('select', { title: 'Device type and screen' }, ...Object.keys(v.types).map((k) => el('option', { value: k, text: (dev.profiles[v.types[k]] || {}).label || k })));
@@ -134,6 +138,41 @@
       } })), persHint, dl);
     return section('Virtual devices', box, el('div', { class: 'hint', text: 'Real Android running in the Linux VM, without hardware virtualization. One device needs its memory limit (2.5 to 3 GB) plus 2.3 GB free on the Googlebook, so stop it, or unload the Llama model, when memory is short. Screen profiles, dark theme and text size change live in the device window. Watches are watch-sized, round screens of phone Android, because Wear OS itself cannot run here. Versions marked (ARM, emulated) are the makers\' own Android under ARM emulation: real but slow, 15 to 30 minutes to the first screen.' }));
   }
+  // Updates and upgrades of the images (forge/updates.py): what the daily check found, buttons to install, the mode.
+  function updatesBlock(v) {
+    const u = v.updates || {};
+    const box = el('div', { class: 'dev-row' });
+    const when = u.checked ? new Date(u.checked * 1000).toLocaleString() : 'never';
+    const head = el('div', { class: 'dev-name' }, el('b', { text: 'Updates and upgrades' }),
+      el('span', { class: 'dev-badge dim', text: u.checking ? 'checking' : (u.applying ? 'installing ' + u.applying : (u.available ? u.available + ' available' : 'current')) }));
+    box.append(head, el('div', { class: 'dev-facts', text: 'Last check: ' + when + (u.error ? '. ' + u.error : '') + '. Every image comes from its project\'s own release feed: a newer build of the same version is an update, and the same family for a newer Android is an upgrade.' }));
+    for (const e of u.errors || []) box.append(el('div', { class: 'warn-box', text: 'The check could not reach ' + e }));
+    for (const it of u.items || []) {
+      if (!it.update && !it.upgrade && !it.error && !it.upgrade_blocked) continue;
+      const row = el('div', { class: 'dev-facts' }, el('b', { text: it.label + ': ' }));
+      if (it.error) row.append(el('span', { text: 'check failed: ' + it.error }));
+      if (it.update) row.append(el('span', { text: 'update available, ' + it.update.label + ' (' + it.update.size + '). ' }),
+        el('button', { class: 'btn sm', text: 'Update', disabled: !!u.applying, onclick: async () => { const r = await post('/api/vd/updates/apply', { version: it.version, kind: 'update' }); toast(r.message, r.ok ? 'ok' : 'error', 8000); render(); } }));
+      if (it.upgrade) row.append(el('span', { text: (it.update ? ' ' : '') + 'upgrade available: ' + it.upgrade.label + ' (' + it.upgrade.size + ')' + (it.upgrade.installed ? ', installed; devices can move to it with their Upgrade button. ' : '. ') }),
+        it.upgrade.installed ? null : el('button', { class: 'btn sm', text: 'Upgrade', disabled: !!u.applying, onclick: async () => { const r = await post('/api/vd/updates/apply', { version: it.version, kind: 'upgrade' }); toast(r.message, r.ok ? 'ok' : 'error', 8000); render(); } }));
+      if (it.upgrade_blocked) row.append(el('span', { class: 'muted', text: ' ' + it.upgrade_blocked }));
+      box.append(row);
+    }
+    const mode = el('select', { title: 'What the daily run does by itself' },
+      el('option', { value: 'check', text: 'Daily: check and show what is available' }),
+      el('option', { value: 'install', text: 'Daily: check, download and install updates and upgrades' }),
+      el('option', { value: 'install-move', text: 'Daily: install, and move stopped devices to the newest version' }),
+      el('option', { value: 'off', text: 'Never check by itself' }));
+    mode.value = (F.settings && F.settings.vd_updates) || 'check';
+    mode.onchange = async () => { await post('/api/settings', { vd_updates: mode.value }); if (F.settings) F.settings.vd_updates = mode.value; toast('Saved.', 'ok'); };
+    box.append(actions(
+      el('button', { class: 'btn ghost sm', text: 'Check now', disabled: !!u.checking, onclick: async () => { const r = await post('/api/vd/updates/check', {}); toast(r.message, r.ok ? 'ok' : 'error', 6000); setTimeout(render, 4000); } }),
+      el('button', { class: 'btn sm', text: 'Update and upgrade everything', disabled: !!u.applying || !u.available, title: 'Installs every available update and upgrade, one after another; devices then move with their Upgrade button, or by themselves in the third daily mode',
+        onclick: async () => { const r = await post('/api/vd/updates/apply_all', {}); toast(r.message, r.ok ? 'ok' : 'error', 8000); render(); } }),
+      mode));
+    for (const l of u.log || []) box.append(el('div', { class: 'muted small', text: new Date(l.time * 1000).toLocaleString() + ' ' + l.message }));
+    return box;
+  }
   async function vdAction(path, d) {
     const r = await post(path, { id: d.id });
     toast(r.message, r.ok ? 'ok' : 'error', 7000);
@@ -142,7 +181,7 @@
   function keepPolling() {
     clearTimeout(poller);
     const v = dev && dev.virtual;
-    const active = v && (v.devices.some((d) => ['starting', 'booting', 'stopping'].includes(d.phase)) || v.versions.some((x) => x.job && x.job.running));
+    const active = v && ((v.updates && (v.updates.checking || v.updates.applying)) || v.devices.some((d) => ['starting', 'booting', 'stopping'].includes(d.phase)) || v.versions.some((x) => x.job && x.job.running));
     if (active && $('.sidebar .view.active[data-view="android"]')) poller = setTimeout(render, 2500);
   }
 

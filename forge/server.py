@@ -66,6 +66,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "completion_delay_ms": 1200,
     "repo_map_chars": 3000,
     "prewarm": True,
+    "vd_updates": "check",   # virtual device images: "check" daily, "install" also installs, "install-move" also moves devices, "off"
     "font_size": 13,
     "theme": "forge-dark",
     "workspace": os.path.expanduser("~/projects"),
@@ -176,6 +177,11 @@ class State:
         self.last_mem_event: Optional[dict] = None
         self.last_shrink = 0.0
         threading.Thread(target=self._housekeeping, name="housekeeping", daemon=True).start()
+        try:
+            from . import updates
+            updates.start_auto(lambda: self.settings, lambda: self.small_memory_block("an image update", 1200, 3300))
+        except Exception as e:  # noqa: BLE001
+            print(f"[updates] not started: {e}", flush=True)
         threading.Thread(target=self._memory_watchdog, name="memory-watchdog", daemon=True).start()
 
     def shrink_vm_memory(self) -> dict:
@@ -1876,6 +1882,19 @@ class Handler(BaseHTTPRequestHandler):
             return vdevice.stop(str(b.get("id", "")))
         if path == "/api/vd/download":
             return vdevice.download(str(b.get("version", "")), lambda: st.small_memory_block("a download", 1200, 3300))
+        if path.startswith("/api/vd/updates/") or path == "/api/vd/move":
+            from . import updates
+            gate = lambda: st.small_memory_block("an image update", 1200, 3300)
+            if path == "/api/vd/updates/check":
+                r = {"ok": True, "message": "Checking every image source; the results appear here in a minute or two."}
+                threading.Thread(target=updates.check_all, args=(gate,), name="vd-updates-check", daemon=True).start()
+                return r
+            if path == "/api/vd/updates/apply":
+                return updates.apply(str(b.get("version", "")), str(b.get("kind", "update")), gate)
+            if path == "/api/vd/updates/apply_all":
+                return updates.apply_all(gate)
+            if path == "/api/vd/move":
+                return updates.move(str(b.get("id", "")), str(b.get("version", "")))
         raise ValueError("unknown device action")
 
     def _ws_logcat(self, q: Dict[str, list]) -> None:

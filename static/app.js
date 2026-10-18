@@ -933,6 +933,7 @@
     { key: 'prewarm', label: 'Pre-warm model on new chat', type: 'bool', hint: 'Processes the system prompt in the background so the first reply is fast.' },
     { group: 'Images' },
     { key: 'vision', label: 'Vision for screenshots', type: 'select', options: ['auto', 'gpu', 'cpu', 'ocr'], hint: 'auto: Qwen3-VL on the Intel GPU (4B when memory allows, otherwise 2B), then the CPU model, then text recognition only. ocr: text recognition only.' },
+    { key: 'vd_updates', label: 'Virtual device images: updates and upgrades', type: 'select', options: ['check', 'install', 'install-move', 'off'], hint: 'What Forge does daily for every emulator image: check shows what is available in the Android view; install also downloads and installs updates and upgrades (one at a time, never while that device runs); install-move also moves stopped devices to the newest installed version of their family; off never checks. Check now and Update and upgrade everything are in the Android view.' },
     { key: 'vision_cpu_model', label: 'CPU vision model (Ollama)', type: 'text', hint: 'Used when the GPU is not available, only when memory allows.' },
     { group: 'Editor' },
     { key: 'lsp', label: 'Language servers (code intelligence)', type: 'bool', hint: 'Suggestions, hover information, go to definition, find references, rename and live errors for Python, JavaScript, TypeScript, shell, JSON, CSS, HTML and C or C++. Each language server starts only when you open a file of that language and only when memory allows.' },

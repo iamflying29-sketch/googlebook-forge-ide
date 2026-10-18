@@ -32,12 +32,19 @@ DL=$ARM_DIR/dl; mkdir -p "$DL" "$BASE_DIR" "$(dirname "$GSI_IMG")"
 fetch() {
   timeout "$3" curl -fL --retry 40 --retry-all-errors --retry-delay 15 -C - -sS -o "$1.part" "$2" && mv -f "$1.part" "$1"
 }
-if [ -z "$(find "$BASE_DIR" -name efi_vars.fd 2>/dev/null)" ]; then
+# label <file> <context>: files added to the image from here carry no SELinux label at all, and Android's processes may
+# not read unlabeled files (netd could not open a stand-in library without this, found 2026-10-17).
+label() { command -v setfattr >/dev/null 2>&1 || sudo -n apt-get install -y -q attr >/dev/null; sudo -n setfattr -h -n security.selinux -v "$2" "$1"; }
+# The .source files name the zip each unpacked copy came from, so an update (a newer zip chosen through Forge's
+# update check) unpacks again; the replaced copy is kept next to the new one, nothing is deleted.
+if [ -z "$(find "$BASE_DIR" -name efi_vars.fd 2>/dev/null)" ] || { [ -f "$BASE_DIR/.source" ] && [ "$(cat "$BASE_DIR/.source")" != "$BASE_ZIP" ]; }; then
   [ -s "$DL/$BASE_ZIP" ] || { echo "Downloading the ARM virtual machine (1 GB)"; fetch "$DL/$BASE_ZIP" "$BASE_URL" 7200; }
   echo "Unpacking the virtual machine"
   (cd "$BASE_DIR" && timeout 900 nice -n 10 unzip -o -q "$DL/$BASE_ZIP")
 fi
-if [ ! -s "$GSI_IMG" ]; then
+echo "$BASE_ZIP" > "$BASE_DIR/.source"
+if [ -s "$GSI_IMG" ] && [ ! -f "$GSI_IMG.source" ]; then echo "$GSI_ZIP" > "$GSI_IMG.source"; fi
+if [ ! -s "$GSI_IMG" ] || [ "$(cat "$GSI_IMG.source" 2>/dev/null)" != "$GSI_ZIP" ]; then
   [ -s "$DL/$GSI_ZIP" ] || { echo "Downloading the maker's system image: $GSI_ZIP"; fetch "$DL/$GSI_ZIP" "$GSI_URL" 14400; }
   echo "Unpacking the system image"
   T=$(dirname "$GSI_IMG")/unpack; mkdir -p "$T"
@@ -45,16 +52,36 @@ if [ ! -s "$GSI_IMG" ]; then
   IMG=$(find "$T" -name '*.img' -size +500M | head -n 1)
   [ -n "$IMG" ] || { echo "No system image inside $GSI_ZIP"; exit 1; }
   file -b "$IMG" | grep -q 'ext4\|ext2' || { echo "The image is not ext4: $(file -b "$IMG" | cut -c1-80)"; exit 1; }
+  if [ -s "$GSI_IMG" ]; then
+    KEEP="$GSI_IMG.replaced-$(date -u +%Y%m%d%H%M)"; echo "Keeping the replaced system image as $(basename "$KEEP")"; mv "$GSI_IMG" "$KEEP"
+    echo "replaced $(date -u)" > "$GSI_IMG.prepared"
+  fi
   mv "$IMG" "$GSI_IMG"
+  echo "$GSI_ZIP" > "$GSI_IMG.source"
 fi
-if [ ! -f "$GSI_IMG.prepared" ]; then
+# The marker names the preparation version; an image prepared by an older Forge is prepared again (nothing is downloaded twice).
+if ! grep -qs '^v13 ' "$GSI_IMG.prepared"; then
   # adb: the key file Android's adbd trusts, inside the image (ro.adb.secure=0 is set as well when the image has it 1)
   M=/mnt/forge-arm-gsi; sudo -n mkdir -p "$M" && sudo -n mount -o loop,rw "$GSI_IMG" "$M"
-  sudo -n mkdir -p "$M/product/etc/security" && sudo -n install -o 0 -g 0 -m 0644 "$HOME/.android/adbkey.pub" "$M/product/etc/security/adb_keys"
+  P=$M/product; [ -L "$P" ] && P=$M/system/product   # in some ports /product is a link to /system/product
+  sudo -n mkdir -p "$P/etc/security" && sudo -n install -o 0 -g 0 -m 0644 "$HOME/.android/adbkey.pub" "$P/etc/security/adb_keys"
+  label "$P/etc/security/adb_keys" u:object_r:adb_keys_file:s0
   sudo -n sed -i 's/^ro\.adb\.secure=1$/ro.adb.secure=0/' "$M/system/build.prop" 2>/dev/null || true
   # Android's watchdog, "not responding" and binder timeouts all scale with this multiplier (the way Google's own
-  # emulator sets it), and the emulated CPU runs at about a third of real speed.
-  sudo -n sed -i '/^ro\.hw_timeout_multiplier=/d' "$M/system/build.prop" && echo 'ro.hw_timeout_multiplier=10' | sudo -n tee -a "$M/system/build.prop" >/dev/null
+  # emulator sets it). The emulated CPU runs at about a third of real speed, and the makers' system servers start
+  # hundreds of services: OxygenOS's main thread needed more than the 10 minutes a multiplier of 10 allows, so the
+  # watchdog killed it (found 2026-10-17); 30 gives it half an hour.
+  sudo -n sed -i '/^ro\.hw_timeout_multiplier=/d' "$M/system/build.prop" && echo 'ro.hw_timeout_multiplier=30' | sudo -n tee -a "$M/system/build.prop" >/dev/null
+  # On its first boot Android verifies the bytecode of every preinstalled app that has no compiled code with it (ART's
+  # "first-boot" dexopt), which the emulated CPU does at a few dozen bytecodes per second: OxygenOS spent an hour in
+  # it (2026-10-17). "extract" skips that work; classes are verified when they are first loaded instead.
+  sudo -n sed -i '/^pm\.dexopt\.\(first-boot\|boot-after-ota\|boot-after-mainline-update\)=/d' "$M/system/build.prop"
+  printf 'pm.dexopt.first-boot=extract\npm.dexopt.boot-after-ota=extract\npm.dexopt.boot-after-mainline-update=extract\n' | sudo -n tee -a "$M/system/build.prop" >/dev/null
+  # OxygenOS's media service is a wrapper that runs the 64-bit media server only when this property is set (the
+  # maker's vendor partition sets it); without it the wrapper looks for a 32-bit media server the port does not
+  # have, exits, and its restarts keep the software codec service from ever registering, which later aborts the
+  # system server (found 2026-10-17). Harmless for the other makers.
+  sudo -n sed -i '/^ro\.mediaserver\.64b\.enable=/d' "$M/system/build.prop" && echo 'ro.mediaserver.64b.enable=1' | sudo -n tee -a "$M/system/build.prop" >/dev/null
   # adb on the forwarded port from early in the boot, and Android's log on the emulated serial port (the device's
   # serial.txt), so a boot that stops can be read. The su domain exists in these debug-style ports.
   sudo -n tee "$M/system/etc/init/forge-debug.rc" >/dev/null <<'RC'
@@ -62,13 +89,25 @@ if [ ! -f "$GSI_IMG.prepared" ]; then
 on early-boot
     setprop service.adb.tcp.port 5555
 
-on post-fs-data
-    start forgelog
-
 # Android's own adbd is stopped by the USB rules a moment after it starts (there is no USB adb configuration on the
-# emulated machine), so Forge runs its own copy of adbd, which nothing stops, once the boot is complete.
+# emulated machine), so Forge runs its own copy of adbd, which nothing stops, from the moment /data is mounted, so a
+# boot that gets stuck can still be examined over adb.
+# The forwarded adb port reaches the emulated machine only once its Ethernet interface has an address, which Android's
+# Ethernet service gives it late in the boot (at the very end on ColorOS), so Forge sets the address QEMU's network
+# always hands out, right away (found 2026-10-17).
+on post-fs-data
+    exec u:r:su:s0 root root -- /system/bin/ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
+    start forgelog
+    start forgeadbd
+    start forgeadbwatch
+
 on property:sys.boot_completed=1
     start forgeadbd
+
+# Some ports (OxygenOS) keep Android's own adbd running next to Forge's; two adbd listening on the same port leave
+# the host's adb "offline" (found 2026-10-17), so Android's own copy is stopped whenever it comes up.
+on property:init.svc.adbd=running
+    stop adbd
 
 service forgeadbd /apex/com.android.adbd/bin/adbd --root_seclabel=u:r:su:s0
     class core
@@ -82,11 +121,109 @@ service forgelog /system/bin/logcat -b all -v threadtime -f /dev/ttyAMA0
     group root log
     seclabel u:r:su:s0
     disabled
+
+# When Android's Ethernet service takes the interface over it clears the address Forge set, the host's adb connection
+# aborts, and adbd then accepts every later connection without ever serving one (HyperOS 3, 2026-10-18); this
+# watchdog restarts Forge's adbd when a connection on its port keeps unread data.
+service forgeadbwatch /system/bin/sh /system/bin/forge-adbwatch.sh
+    class core
+    user root
+    seclabel u:r:su:s0
+    disabled
 RC
   sudo -n chmod 0644 "$M/system/etc/init/forge-debug.rc"; sudo -n chown 0:0 "$M/system/etc/init/forge-debug.rc"
-  # Samsung's key store insists on a hardware feature (rollback resistance) the virtual machine's software KeyMint
-  # does not have, and panics instead of coping, which stops the boot (found 2026-10-16). Android 16's standard
-  # keystore2 from the LineageOS 23.2 virtual machine takes its place; Samsung's copy is kept as keystore2.samsung.
+  label "$M/system/etc/init/forge-debug.rc" u:object_r:system_file:s0
+  sudo -n tee "$M/system/bin/forge-adbwatch.sh" >/dev/null <<'SH'
+#!/system/bin/sh
+# Added by Forge IDE for the emulated ARM device: starts Forge's adbd again when it has stopped serving connections.
+# When Android's Ethernet service takes the interface over it clears the address Forge set, the host's connection
+# aborts, and adbd then accepts every later connection without ever serving one (its reading threads still drain the
+# sockets, so unread data is no sign; HyperOS 3, 2026-10-18). Two signs are used: the interface's IPv4 address changed
+# (checked every 5 s), or at least three connections on adb's port (15B3 is 5555 in hex) sit established (state 01) or
+# half closed (08) on two checks 20 s apart, where a serving adbd holds one.
+last=""; bad=0; tick=0
+while :; do
+    sleep 5
+    set -- $(ip -4 -o addr show dev eth0 2>/dev/null); addr=$4
+    if [ -n "$last" ] && [ "$addr" != "$last" ]; then
+        log -t forgeadbwatch "address $last became ${addr:-none}; starting adbd again"
+        setprop ctl.restart forgeadbd; bad=0
+    fi
+    last=$addr
+    tick=$((tick + 1)); [ "$tick" -ge 4 ] || continue; tick=0
+    n=0
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "$f" ] || continue
+        while read sl local rem st rest; do
+            case "$local" in *:15B3) ;; *) continue ;; esac
+            case "$st" in 01|08) n=$((n + 1)) ;; esac
+        done < "$f"
+    done
+    if [ "$n" -ge 3 ]; then bad=$((bad + 1)); else bad=0; fi
+    if [ "$bad" -ge 2 ]; then
+        log -t forgeadbwatch "$n connections wait on adbd; starting it again"
+        setprop ctl.restart forgeadbd; bad=0
+    fi
+done
+SH
+  sudo -n chmod 0755 "$M/system/bin/forge-adbwatch.sh"; sudo -n chown 0:2000 "$M/system/bin/forge-adbwatch.sh"
+  label "$M/system/bin/forge-adbwatch.sh" u:object_r:system_file:s0
+  # SELinux: these ports compile their policy at boot (the virtual machine's vendor partition has no precompiled policy
+  # for them) from the system's CIL files, so Forge's rules are appended to every system policy file and test-compiled
+  # first. Most ports are "user" builds whose policy keeps init from starting anything in the su domain, which stops
+  # Forge's log service and adb root; and the maker's system reads its own vendor properties (OxygenOS's zygote reads
+  # ro.vendor.oplus.market.name at every start and dies without it, found 2026-10-17), which the virtual machine's
+  # vendor partition labels vendor_default_prop, a label the system is not allowed to read. OxygenOS's init uses the
+  # "_debug" policy files from system_ext instead of /system/etc/selinux/plat_sepolicy.cil, hence every file.
+  # In some ports /system/system_ext and /system/product are links to /system_ext and /product (absolute links that
+  # point nowhere on the host), in others the opposite; use whichever is the real folder.
+  XD=$M/system/system_ext; [ -L "$XD" ] && XD=$M/system_ext
+  PD=$M/system/product; [ -L "$PD" ] && PD=$M/product
+  SE=$M/system/etc/selinux; SX=$XD/etc/selinux; SPR=$PD/etc/selinux
+  CILS=$(ls "$SE/plat_sepolicy.cil" "$SX"/plat_sepolicy_debug.cil "$SX"/system_ext_sepolicy*.cil "$SPR"/product_sepolicy*.cil 2>/dev/null | grep -v '\.before-forge$' || true)
+  ADDED=""
+  for CIL in $CILS; do
+    command -v secilc >/dev/null 2>&1 || sudo -n apt-get install -y -q secilc >/dev/null
+    if ! sudo -n grep -q 'Added by Forge IDE' "$CIL"; then
+      sudo -n cp -p "$CIL" "$CIL.before-forge"
+      sudo -n tee -a "$CIL" >/dev/null <<'CIL'
+;; Added by Forge IDE for the emulated ARM device: Forge's log service and adb root shells run in the su domain, and
+;; the maker's system reads vendor properties that the virtual machine's vendor partition labels as default ones.
+(allow init su (process (transition rlimitinh siginh noatsecure)))
+(typepermissive su)
+(allow domain vendor_default_prop (file (read getattr open map)))
+CIL
+      ADDED="$ADDED $CIL"
+    fi
+    if ! sudo -n grep -q 'Forge IDE rules, second set' "$CIL"; then
+      sudo -n test -f "$CIL.before-forge" || sudo -n cp -p "$CIL" "$CIL.before-forge"
+      sudo -n tee -a "$CIL" >/dev/null <<'CIL'
+;; Forge IDE rules, second set (2026-10-18): a user build's policy lets no adbd become root, so Forge's root adbd died at
+;; once, and the maker's system server and camera service write vendor properties the virtual machine's vendor partition
+;; does not declare; HyperOS 3's system server died on such a write at every start until the device rebooted to recovery.
+(allow adbd su (process (dyntransition)))
+(allow system_server vendor_default_prop (property_service (set)))
+(allow cameraserver vendor_default_prop (property_service (set)))
+CIL
+      ADDED="$ADDED $CIL"
+    fi
+  done
+  if [ -n "$ADDED" ]; then
+    ok=1
+    for SET in "" "_debug"; do
+      P=$SE/plat_sepolicy.cil; [ "$SET" = "_debug" ] && [ -f "$SX/plat_sepolicy_debug.cil" ] && P=$SX/plat_sepolicy_debug.cil
+      FILES="$P"; for F in "$SX/system_ext_sepolicy$SET.cil" "$SPR/product_sepolicy$SET.cil"; do [ -f "$F" ] && FILES="$FILES $F"; done
+      # The test copies leave out policy capabilities the host's compiler may not know yet (a newer Android's policy).
+      T=$(mktemp -d); TF=""; for F in $FILES; do sed '/^(policycap /d' "$F" > "$T/$(basename "$F")"; TF="$T/$(basename "$F") $TF"; done
+      timeout 300 secilc -m -M true -G -N -c 30 $TF -o /dev/null -f /dev/null || ok=0
+    done
+    if [ "$ok" = 1 ]; then
+      echo "Added Forge's SELinux rules to the policy ($(echo $ADDED | wc -w) files)"
+    else
+      for CIL in $ADDED; do sudo -n cp -p "$CIL.before-forge" "$CIL"; done
+      echo "The SELinux policy with Forge's rules does not compile; the policy was left as it was."; sudo -n umount "$M"; exit 1
+    fi
+  fi
   if sudo -n readelf -d "$M/system/bin/keystore2" 2>/dev/null | grep -q libsamsung_keystore_utils; then
     PARTS=$ARM_DIR/parts; mkdir -p "$PARTS"
     if [ ! -s "$PARTS/keystore2-android16" ]; then
@@ -139,9 +276,32 @@ XML
     fi
     sudo -n chmod 0644 "$M/system/etc/init/forge-sehhealth.rc" "$M/system/etc/vintf/manifest/vendor.samsung.hardware.health-forge.xml"
     sudo -n chown 0:0 "$M/system/etc/init/forge-sehhealth.rc" "$M/system/etc/vintf/manifest/vendor.samsung.hardware.health-forge.xml"
+    label "$M/system/etc/init/forge-sehhealth.rc" u:object_r:system_file:s0
+    label "$M/system/etc/vintf/manifest/vendor.samsung.hardware.health-forge.xml" u:object_r:system_file:s0
+    label "$M/system/bin/forge-sehhealth" u:object_r:system_file:s0
+    label "$M/system/bin/keystore2" u:object_r:keystore_exec:s0
     echo "Added the stand-in for Samsung's health service"
   fi
+  # OnePlus, OPPO and Realme (the Oplus group): netd loads OnePlus's network extension, which opens a feature library
+  # the GSI port leaves out (/system_ext/lib64/oplusex/com.oplus.NetworkAssistSys/liboplusNetd.so) and crashes when it
+  # is missing, which restarts netd and zygote every ten seconds for ever (found 2026-10-17). A stand-in that does
+  # nothing (vd/oplusnetd-stub.c) takes its place.
+  XD=$M/system/system_ext; [ -L "$XD" ] && XD=$M/system_ext
+  OPX=$XD/lib64/oplusex/com.oplus.NetworkAssistSys
+  if [ -d "$OPX" ] && [ ! -s "$OPX/liboplusNetd.so" ]; then
+    PARTS=$ARM_DIR/parts; mkdir -p "$PARTS"
+    NDKCC=$(ls "${ANDROID_HOME:-$HOME/tools/android-sdk}"/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android3[0-9]-clang 2>/dev/null | sort -V | tail -n 1)
+    [ -n "$NDKCC" ] || { echo "The Android NDK is needed (install-extras.sh android)."; sudo -n umount "$M"; exit 1; }
+    "$NDKCC" -O2 -Wall -shared -fPIC -fvisibility=hidden -Wl,-soname,liboplusNetd.so -o "$PARTS/liboplusNetd-stub.so" "$(dirname "$(readlink -f "$0")")/../vd/oplusnetd-stub.c"
+    sudo -n install -o 0 -g 0 -m 0644 "$PARTS/liboplusNetd-stub.so" "$OPX/liboplusNetd.so"
+    label "$OPX/liboplusNetd.so" u:object_r:system_lib_file:s0
+    echo "Added the stand-in for OnePlus's network feature library"
+  fi
+  # The system server's legacy permission write dies at every boot after the first on an emulated CPU (OxygenOS,
+  # ColorOS; found 2026-10-17); vd/patch-permission-write.sh makes that one write survive. It takes a few minutes.
+  PW=$ARM_DIR/parts/permission-write-$V; mkdir -p "$PW"
+  "$(dirname "$(readlink -f "$0")")/../vd/patch-permission-write.sh" "$M" "$PW" || [ $? -eq 2 ]
   sudo -n umount "$M"
-  date -u > "$GSI_IMG.prepared"
+  echo "v13 $(date -u)" > "$GSI_IMG.prepared"
 fi
 echo "$V is ready."

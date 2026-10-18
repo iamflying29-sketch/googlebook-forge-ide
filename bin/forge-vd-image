@@ -66,8 +66,20 @@ case "$VARIANT" in
     SDK=36; BASE=$HOME/.forge-ide/vd/pixel16; IMG=$BASE/img-20261015
     DESC="Android 16 with Google Play x86_64 system image from Google's SDK repository with Redroid 16's vendor partition" ;;
   *)
-    echo "Usage: forge-vd-image 17 | 17-google | tv16-google | wear6 | googletv16 | pixel16 | auto15 | xr14 | desktop14   (Android 11 to 16 are downloaded with podman pull)"; exit 2 ;;
+    # A version added by an update or upgrade (forge/updates.py): the recipe comes in the environment.
+    case "${KIND:-}" in
+      waydroid) SYS=${SYS_FILE:?}; VEN=${VEN_FILE:?}; SYS_SHA=${SYS_SUM:?}; VEN_SHA=${VEN_SUM:?}; ARCH=${ARCH_OVERRIDE:?}; SDK=${SDK_OVERRIDE:?}
+                BASE=${BASE_OVERRIDE:?}; DL=$BASE/dl; IMG=$BASE/img; KEEP_ETC=${KEEP_ETC_OVERRIDE:-0}; DESC=${DESC_OVERRIDE:-"LineageOS from WayDroid-ATV"} ;;
+      google)   GOOGLE_PKG=${GOOGLE_PKG_OVERRIDE:?}; VENDOR_IMAGE=${VENDOR_IMAGE_OVERRIDE:?}; SDK=${SDK_OVERRIDE:?}; BASE=${BASE_OVERRIDE:?}; IMG=$BASE/img
+                DESC=${DESC_OVERRIDE:-"Google's system image with Redroid's vendor partition"} ;;
+      *) echo "Usage: forge-vd-image 17 | 17-google | tv16-google | wear6 | googletv16 | pixel16 | auto15 | xr14 | desktop14   (Android 11 to 16 are downloaded with podman pull)"; exit 2 ;;
+    esac ;;
 esac
+# Updates of a built-in version (forge/updates.py) name newer files, sums, packages or folders in the environment.
+SYS=${SYS_FILE:-${SYS:-}}; VEN=${VEN_FILE:-${VEN:-}}; SYS_SHA=${SYS_SUM:-${SYS_SHA:-}}; VEN_SHA=${VEN_SUM:-${VEN_SHA:-}}; SUM_ALGO=${SUM_ALGO:-sha256}
+GOOGLE_PKG=${GOOGLE_PKG_OVERRIDE:-${GOOGLE_PKG:-}}; VENDOR_IMAGE=${VENDOR_IMAGE_OVERRIDE:-${VENDOR_IMAGE:-}}; SDK=${SDK_OVERRIDE:-$SDK}
+[ -n "${IMG:-}" ] && IMG=$IMG${IMG_SUFFIX:-}
+[ -n "${DESC_OVERRIDE:-}" ] && DESC=$DESC_OVERRIDE
 TAG=localhost/forge-android:$VARIANT
 STAGE=$BASE/stage; MNT=/mnt/forge-$VARIANT
 CONF=$HOME/.forge-ide/vd/containers.conf
@@ -137,13 +149,13 @@ mkdir -p "$DL" "$IMG" "$STAGE/etc"
 
 fetch() {   # file folder sha256
   local f=$1 dir=$2 sum=$3
-  if [ -f "$DL/$f" ] && echo "$sum  $DL/$f" | sha256sum -c --status -; then echo "Already downloaded and verified: $f"; return; fi
+  if [ -f "$DL/$f" ] && echo "$sum  $DL/$f" | ${SUM_ALGO}sum -c --status -; then echo "Already downloaded and verified: $f"; return; fi
   echo "Downloading $f"
   for try in 1 2 3; do
     timeout 3600 curl -fL --retry 3 --retry-delay 5 -C - -sS -o "$DL/$f" "$SF/$dir/$ARCH/$f/download" && break
     echo "Retrying ($try)"; sleep 5
   done
-  echo "$sum  $DL/$f" | sha256sum -c - || { echo "The checksum does not match, so the file is not used."; exit 1; }
+  echo "$sum  $DL/$f" | ${SUM_ALGO}sum -c - || { echo "The checksum does not match, so the file is not used."; exit 1; }
 }
 fetch "$VEN" vendor "$VEN_SHA"
 fetch "$SYS" system "$SYS_SHA"
