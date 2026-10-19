@@ -35,6 +35,7 @@ Every Forge window has its own folder, like a window in Cursor. The folder name 
 
 - **Open folder** (Ctrl O, or click the folder name) switches this window to another folder. **New window** (Ctrl Shift N, or the button next to the folder name) opens another window. The Open folder dialog has a New window button, and every recent folder has a ↗ that opens it in a new window.
 - Each folder keeps its own chats, AI Changes, open files, explorer state, project rules, memories and folder settings. The terminal of a window starts in its folder.
+- A message that failed (the server refused it, or the run stopped with an error) gets a Retry button that sends the same message again with its attachments and mode; a refused message is replaced, a run that failed partway keeps what came back and the new attempt follows below.
 - A chat always works in the folder it was started in. Opening a chat from another folder switches the window to that folder. A message you typed but did not send yet travels along when the window switches folders, and it also comes back after the window reloads; it is cleared when you send it or empty the box.
 - **Several folders in one window**: the folder button with a plus at the top of the Explorer (or "Add folder to this window" in the command palette) adds another folder next to the project, like Cursor's multi-root workspaces. Each folder gets its own section in the Explorer, and quick open, search, replace and the agent's codebase search cover all of them. The ✕ on a folder's section removes it from the window; the folder itself is not touched. The list is saved in the project's `.forge/settings.json`.
 
@@ -295,7 +296,7 @@ The Settings view has two tabs. **User** settings apply to every folder. **Folde
 
 ## 21. The GPU engine
 
-**Start it**: Forge app, Settings, the GPU engine card, Start engine. The first start downloads the model weights once (4.9 GB). The app asks the VM to hand memory back, waits until the free-memory check passes, loads the model and reports "running". A notification with a Stop engine button stays visible.
+**It starts by itself** (since version 1.15, setting "Start the GPU engine by itself", on by default): when the GPU engine is the chosen engine and it is not running, the Forge app starts it when you open Forge, when a message fails without it (the error says so, and the message gets a Retry button), and after the app was closed or updated. The start goes through the app's free-memory check every time, never happens next to another AI model (the vision model or a model loaded in Ollama), and a failed start is not repeated for three minutes. **Start it by hand**: Forge app, Settings, the GPU engine card, Start engine. The first start downloads the model weights once (4.9 GB). The app asks the VM to hand memory back, waits until the free-memory check passes, loads the model and reports "running". A notification with a Stop engine button stays visible.
 
 **Use it**: Use GPU engine for chats on the card, Settings, Engine, gpu, or pick it in a chat's model menu. Switching engines starts a fresh chat context.
 

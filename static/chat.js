@@ -744,6 +744,18 @@
       el('button', { class: 'mini', text: '✎', title: 'Edit (moves it back to the input box)', onclick: () => { const [x] = active.queue.splice(i, 1); promptEl.value = x.text; active.contexts = x.attachments; renderContexts(); renderQueue(); autoGrow(); } }),
       el('button', { class: 'mini', text: '✕', title: 'Remove from the queue', onclick: () => { active.queue.splice(i, 1); renderQueue(); } }))));
   }
+  /** A Retry button under a failed message: sends the same message again. `before` runs first (it may remove the failed attempt). */
+  function retryButton(tab, item, before) {
+    const wrap = el('div', { class: 'retry-row' });
+    wrap.append(el('button', { class: 'btn sm', text: 'Retry', title: 'Send this message again', onclick: () => {
+      if (tab.run) { toast('Wait until this chat has finished, or stop it first.', 'error'); return; }
+      wrap.remove();
+      if (before) before();
+      if (tab === active) { promptEl.value = ''; tab.draft = ''; autoGrow(); }
+      startRun(tab, { text: item.text, attachments: (item.attachments || []).slice(), mode: item.mode });
+    } }));
+    return wrap;
+  }
   async function startRun(tab, item) {
     $('#chat-empty').classList.toggle('hidden', true);
     const userTurn = { role: 'user', text: item.text, attachments: item.attachments, ts: Date.now() };
@@ -760,11 +772,20 @@
     if (tab === active) host.scrollTop = host.scrollHeight;
     let r;
     try { r = await post('/api/chat', { session_id: tab.session.id, message: item.text, mode: item.mode, attachments: item.attachments, model: tab.session.model_choice || '' }); }
-    catch (e) { spinner.textContent = 'Error: ' + e.message; spinner.classList.add('error'); turn.blocks.push({ type: 'status', text: 'Error: ' + e.message, error: true }); saveTranscript(tab); return; }
+    catch (e) {
+      spinner.textContent = 'Error: ' + e.message; spinner.classList.add('error');
+      turn.blocks.push({ type: 'status', text: 'Error: ' + e.message, error: true });
+      // Retry sends the same message again (with its attachments and mode) and replaces this failed attempt.
+      msgEl.append(retryButton(tab, item, () => {
+        for (const t of [userTurn, turn]) { const k = tab.transcript.indexOf(t); if (k >= 0) tab.transcript.splice(k, 1); }
+        userEl.remove(); msgEl.remove();
+      }));
+      saveTranscript(tab); return;
+    }
     userTurn.run_id = r.run_id;
     userEl.replaceWith(renderUser(tab, userTurn));
     const R = tab.run = { id: r.run_id, tab, msgEl, turn, spinner, cur: null, curEl: null, tools: new Map(), filesEl: null, todosEl: null, pending: false,
-      t0: Date.now(), exchanges: new Map(), timeline: null, timelineEl: null };
+      t0: Date.now(), exchanges: new Map(), timeline: null, timelineEl: null, item };
     tab.models = { llama: { state: 'reading', label: '', detail: 'Starting', since: Date.now() } };
     renderStrip();
     renderTabBar(); refreshComposer();
@@ -993,6 +1014,7 @@
         closeCurrent(R);
         R.turn.blocks.push({ type: 'status', text: 'Error: ' + ev.message, error: true });
         R.msgEl.append(el('div', { class: 'status-line error', text: 'Error: ' + ev.message + (ev.detail ? '\n' + ev.detail : '') }));
+        if (R.item) R.msgEl.append(retryButton(R.tab, R.item, null));
         logVerbose('error', ev.message + (ev.detail ? '\n' + ev.detail : ''));
         break;
       case 'end':

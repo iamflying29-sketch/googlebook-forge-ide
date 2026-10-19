@@ -383,6 +383,15 @@ public class EngineService extends Service {
     }
 
     // ------------------------------------------------------------ control from the activity bridge
+    /** The IDE server asked for the engine (it is the chosen engine and not running): start it unless it already
+     *  runs, starts, downloads or is paused for the vision model. The usual free-memory check applies. */
+    public static void startIfIdle(Context ctx) {
+        String st = state;
+        if ("running".equals(st) || "starting".equals(st) || "downloading".equals(st) || "paused".equals(st)) return;
+        log("the IDE asked for the engine; starting it");
+        try { start(ctx); } catch (Exception e) { log("could not start the engine by itself: " + e); }
+    }
+
     public static void start(Context ctx) {
         Intent i = new Intent(ctx, EngineService.class).setAction(ACTION_START);
         ctx.startForegroundService(i);

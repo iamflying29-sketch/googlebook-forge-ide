@@ -58,6 +58,7 @@ public final class VisionControl {
                 JSONObject r = new JSONObject(get(FORGE + "/api/engine/control?" + q, 35000));
                 boolean want = r.optBoolean("want", false);
                 GpuBudget.heartbeat(ctx);
+                if (r.optBoolean("engine_start", false) && !want) EngineService.startIfIdle(ctx);
                 if (want && proc == null && !launching) {
                     launching = true;
                     new Thread(() -> { try { start(ctx, r); } finally { launching = false; } }, "forge-vision-start").start();

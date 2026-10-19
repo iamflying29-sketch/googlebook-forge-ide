@@ -49,6 +49,7 @@ class VisionManager:
         self.cond = threading.Condition()
         self.wanted_until = 0.0
         self.app_seen = 0.0
+        self.engine_poke = False   # set when a chat just failed without the GPU engine, to answer the app's poll at once
         self.app: Dict[str, Any] = {}           # what the Forge app last reported about the GPU vision server
         self.app_report_ts = 0.0                # when the app last reported a vision state change
         self.busy = threading.Lock()            # one look at a time: the GPU and memory are shared
@@ -106,13 +107,14 @@ class VisionManager:
             self.app = dict(report)
         with self.cond:
             running = report.get("vstate") in ("running", "starting", "downloading")
-            if self.want() == running:
+            if self.want() == running and not self.engine_poke:
                 self.cond.wait(timeout=max(0.0, min(wait, 25.0)))
+            self.engine_poke = False
         self.app_seen = time.time()
         st = self.st
         return {"want": self.want(), "idle_stop_s": IDLE_STOP_S, "tiers": self.tiers(), "port": VISION_PORT,
                 "host_ip": st.host_ip(), "api_key": st.settings.get("gpu_engine_key", ""),
-                "file_url": "/api/engine/vision_file?name="}
+                "file_url": "/api/engine/vision_file?name=", "engine_start": st.engine_start_due(report)}
 
     def report(self, data: Dict[str, Any]) -> None:
         self.app = {**self.app, **data}

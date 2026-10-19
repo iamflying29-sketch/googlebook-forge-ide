@@ -731,3 +731,5 @@ pre.nb-out.stream.err { background: rgba(255,107,107,.07); color: #ffb3b3; }
 .lab-card { border: 1px solid var(--border, #333); border-radius: 6px; padding: 8px 10px; margin: 6px 0; }
 .lab-card a { color: var(--accent, #8ab4f8); word-break: break-all; }
 .lab-out { max-height: 180px; overflow: auto; font-size: 11px; white-space: pre-wrap; }
+
+.retry-row { padding: 4px 0 6px; }
