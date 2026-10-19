@@ -907,7 +907,7 @@
     const line = el('div');
     line.innerHTML = '<span class="lt">' + new Date().toLocaleTimeString() + '</span> <span class="lk">' + esc(kind) + '</span> ' + esc(text);
     log.append(line);
-    while (log.children.length > 2000) log.firstChild.remove();
+    while (log.children.length > 500) log.firstChild.remove();   // 500 lines keep the page light; the full log is on the server
     log.scrollTop = log.scrollHeight;
   }
   function handleEvent(R, ev) {

@@ -267,7 +267,12 @@ class State:
                                 cached = int(line.split()[1]) // 1024
                 except OSError:
                     pass
-                if cached > 1500:
+                # The VM's file cache is memory the Googlebook cannot use until the VM gives it back. When the
+                # Googlebook is short (under 3 GB free by the app's report), hand it back from 700 MB of cache on;
+                # otherwise only a large cache is worth the disk re-reads.
+                host = self.vision.app.get("host_mem_mb") if time.time() - self.vision.app_seen < 120 else None
+                tight = isinstance(host, (int, float)) and 0 <= host < 3000
+                if cached > (700 if tight else 1500):
                     self.shrink_vm_memory()
 
     # ------------------------------------------------------------ engines

@@ -34,10 +34,11 @@ TIERS = [
     # screenshot description needs words, not depth (measured 2026-10-19: the 4B answered 156 words in 49 s).
     # 640 image tokens (a 1024 by 640 picture) and a 2048 token context: the encoder's attention memory and time grow
     # with the square of the picture's patches, and a description plus a question never needs more context.
-    {"name": "Qwen3-VL 2B", "model": "Qwen3VL-2B-Instruct-Q4_K_M.gguf", "mmproj": "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
-     "need_mb": 3000, "ctx": 2048, "image_max_tokens": 640},
+    # The 4B model first: the user prefers accuracy (the 2B one invented errors on a terminal screenshot, 2026-10-19).
     {"name": "Qwen3-VL 4B", "model": "Qwen3VL-4B-Instruct-Q4_K_M.gguf", "mmproj": "mmproj-Qwen3VL-4B-Instruct-F16.gguf",
      "need_mb": 3600, "ctx": 2048, "image_max_tokens": 640},
+    {"name": "Qwen3-VL 2B", "model": "Qwen3VL-2B-Instruct-Q4_K_M.gguf", "mmproj": "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
+     "need_mb": 3000, "ctx": 2048, "image_max_tokens": 640},
 ]
 
 

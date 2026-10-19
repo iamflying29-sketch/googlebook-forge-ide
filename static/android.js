@@ -595,7 +595,7 @@
         if (f && !line.toLowerCase().includes(f)) d.classList.add('hidden');
         out.append(d);
       }
-      while (out.childElementCount > 5000) out.firstChild.remove();
+      while (out.childElementCount > 2000) out.firstChild.remove();
       if (near) out.scrollTop = out.scrollHeight;
     };
     ws.onclose = () => { if (lc === ws) { lc = null; $('#logcat-toggle').textContent = 'Start'; } };
