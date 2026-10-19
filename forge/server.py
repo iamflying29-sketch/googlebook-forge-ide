@@ -155,6 +155,7 @@ class State:
                                          self.settings["gpu_engine_key"])
         self.engine_stats: Dict[str, Any] = {}
         self.engine_start_sent = 0.0     # when the app was last told to start the GPU engine by itself
+        self._need_mb, self._need_mb_ts = 0, 0.0   # cached engine_need_mb()
         self.checkpoints = Checkpoints(os.path.join(DATA_DIR, "checkpoints"))
         self.vision = VisionManager(self, DATA_DIR)
         self.attachments = Attachments(os.path.join(DATA_DIR, "attachments"))
@@ -454,6 +455,35 @@ class State:
         print(f"[engine] asking the Forge app to start the GPU engine ({int(host)} MB free on the Googlebook)", flush=True)
         return True
 
+    def engine_need_mb(self) -> int:
+        """What the app's own free-memory check asks for before launching the engine: the weights plus 1200 MB for the
+        KV cache, compute buffers and margin (the same sum EngineService uses). Cached, locating the blob asks Ollama."""
+        now = time.time()
+        if now - self._need_mb_ts > 600:
+            self._need_mb_ts = now
+            try:
+                mf = self.gpu_model_file()
+                if mf and mf.get("size"):
+                    self._need_mb = int(mf["size"]) // (1024 * 1024) + 1200
+            except Exception:  # noqa: BLE001
+                pass
+        return self._need_mb or self.ENGINE_START_NEED_MB
+
+    def engine_memory_note(self) -> str:
+        """One sentence about the Googlebook's free memory against what the GPU engine needs, from the app's latest
+        report. Empty when the app has not reported lately or when there is room (then memory is not the reason)."""
+        try:
+            host = int(self.vision.app.get("host_mem_mb", -1))
+        except (TypeError, ValueError):
+            host = -1
+        if host < 0 or time.time() - self.vision.app_seen > 120:
+            return ""
+        need = self.engine_need_mb()
+        if host >= need:
+            return ""
+        return (f"The Googlebook has {host} MB free and the GPU engine needs about {need} MB, so the Forge app is waiting for "
+                f"memory. Closing other apps on the Googlebook (not the Terminal) makes room, and the engine then starts by itself.")
+
     def ask_engine_start(self) -> None:
         """Wake the app's control poll so it hears about the engine right away (a chat just failed without it)."""
         with self.vision.cond:
@@ -468,8 +498,10 @@ class State:
             if not self.gpu_client.alive() and not paused:
                 if self.settings.get("gpu_autostart", True) and time.time() - self.vision.app_seen < 60:
                     self.ask_engine_start()
-                    return ("The GPU engine is not running. The Forge app is starting it now when the Googlebook has room "
-                            "(about a minute); press Retry on the message then. Or switch the engine to Ollama in Settings.")
+                    note = self.engine_memory_note()
+                    return ("The GPU engine is not running. " + (note + " Press Retry on the message when the status bar says the engine is ready."
+                            if note else "The Forge app is starting it now when the Googlebook has room (about a minute); press Retry on the message then.")
+                            + " Or switch the engine to Ollama in Settings.")
                 return ("The GPU engine is not running. Start it from the Forge app (Engine card in Settings) or switch "
                         "the engine back to Ollama in Settings.")
             return None
@@ -753,7 +785,9 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             gpu = st.gpu_client.health() if st.active_engine() == "gpu" or arg("engine") else {}
             return self._json(200, {"version": __version__, "ollama": alive, "workspace": ws.root, "engine": st.active_engine(),
-                                    "gpu_engine": {"url": st.gpu_client.base_url, "health": gpu},
+                                    "gpu_engine": {"url": st.gpu_client.base_url, "health": gpu, "host_mem_mb": st.vision.app.get("host_mem_mb"),
+                                                   "need_mb": st.engine_need_mb() if st.active_engine() == "gpu" else None,
+                                                   "note": st.engine_memory_note() if st.active_engine() == "gpu" and gpu.get("status") != "ok" else ""},
                                     "workspace_name": os.path.basename(ws.root) or ws.root,
                                     "model": st.resolve_model(st.effective_settings(ws.root).get("model")),
                                     "running": running, "pid": os.getpid(), "default_folder": st.workspace.root,
@@ -1646,8 +1680,10 @@ class Handler(BaseHTTPRequestHandler):
             if not paused:
                 if st.settings.get("gpu_autostart", True) and time.time() - st.vision.app_seen < 60:
                     st.ask_engine_start()
-                    return self._error(503, "The GPU engine is not running. The Forge app is starting it now when the Googlebook "
-                                            "has room (about a minute); press Retry on this message then. Or switch the engine to Ollama in Settings.")
+                    note = st.engine_memory_note()
+                    return self._error(503, "The GPU engine is not running. " + (note + " Press Retry on this message when the status bar says the engine is ready."
+                                            if note else "The Forge app is starting it now when the Googlebook has room (about a minute); press Retry on this message then.")
+                                            + " Or switch the engine to Ollama in Settings.")
                 return self._error(503, "The GPU engine is not running. Start it from the Forge app (Settings, GPU engine "
                                         "card), or switch the engine to Ollama in Settings.")
         if fallback_note:

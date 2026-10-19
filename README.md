@@ -115,9 +115,9 @@ Edit the code, then `forge-ide restart`. For the app, `android/build.sh` and `ad
 ## Troubleshooting
 
 - The app shows the waiting screen: the VM or the server is not up. Open the Terminal app, wait a few seconds, press Retry, or run `forge-ide status`.
-- The GPU engine waits for free memory: it needs about 5.9 GB free on the Googlebook. Close heavy apps. After GPU work the graphics driver can hold memory that Android does not count as free; restarting the Googlebook clears it.
+- The status bar says "GPU engine: waiting for memory" with the numbers: the engine needs about 5.9 GB free on the Googlebook, and Forge starts it by itself as soon as there is room. Close heavy apps (the Terminal app must stay open, it is the VM). After GPU work the graphics driver can hold memory that Android does not count as free; restarting the Googlebook clears it.
 - A screenshot gets only text recognition: the vision model was refused by the free-memory check, or the Forge app is not running. The panel under the image says why.
-- "The GPU engine is not running" in a chat: start it from the engine card, or switch the engine to Ollama in Settings.
+- "The GPU engine is not running" in a chat: the message says why (usually memory) and gets a Retry button; Forge starts the engine by itself when the Googlebook has room, or you start it from the engine card, or switch the engine to Ollama in Settings.
 - The agent loops on a malformed tool call: stop it, add detail to the request, or switch Thinking on.
 
 ## Safety and privacy notes

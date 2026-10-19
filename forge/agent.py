@@ -698,6 +698,29 @@ class Agent:
             parts.append("\n### Project rules for these files (follow them)\n" + rules)
         return "\n".join(parts)
 
+    def _wait_for_engine(self, run: Run, act) -> bool:
+        """Wait up to ten minutes for the GPU engine. After the vision model the app starts the engine again through
+        its own free-memory check and itself waits up to ten minutes for memory, so a five-minute wait here gave up
+        first and blamed the engine. A status line every minute (and the model strip every twenty seconds) says what
+        is being waited for, with the Googlebook's free memory when that is the reason. Cancel stops the wait."""
+        deadline = time.monotonic() + 600
+        last_line = last_act = -1e9
+        while time.monotonic() < deadline:
+            if self.client.alive():
+                return True
+            if run.cancel.is_set():
+                return False
+            now = time.monotonic()
+            note = self.state.engine_memory_note() if self.state is not None else ""
+            if now - last_line >= 60:
+                last_line = now
+                run.emit("status", text="Waiting for Llama's GPU engine to resume…" + (" " + note if note else ""))
+            if note and now - last_act >= 20:
+                last_act = now
+                act("waiting", note)
+            time.sleep(1.0)
+        return False
+
     # ----------------------------------------------------------- streaming one assistant message
     def _stream_assistant(self, run: Run, msgs: List[dict], model: str, native: bool) -> Tuple[str, Optional[dict], Optional[dict]]:
         msg_id = uuid.uuid4().hex[:8]
@@ -712,10 +735,12 @@ class Agent:
         act = lambda state, detail: run.emit("model_activity", model="llama", state=state, label=label, detail=detail)
         if hasattr(self.client, "wait_ready") and not self.client.alive():
             act("waiting", "Waiting for Llama's GPU engine to resume (it pauses while the vision model uses the Intel GPU).")
-            ok = self.client.wait_ready(300, lambda: run.emit("status", text="Waiting for Llama's GPU engine to resume…"), run.cancel)
+            ok = self._wait_for_engine(run, act)
             if not ok:
+                note = self.state.engine_memory_note() if self.state is not None else ""
                 act("failed", "The GPU engine did not come back.")
-                raise OllamaError("The GPU engine did not come back. Start it again from the Forge app (Settings, GPU engine card).")
+                raise OllamaError("The GPU engine did not come back. " + (note + " Press Retry when the status bar says the engine is ready."
+                                  if note else "Start it again from the Forge app (Settings, GPU engine card)."))
             act("resumed", "Llama's GPU engine is running again on the Intel GPU.")
         elif not hasattr(self.client, "wait_ready") and self.state is not None and not self.state.model_loaded(model):
             act("loading", "Loading the model into the VM's memory (this takes a little while the first time).")

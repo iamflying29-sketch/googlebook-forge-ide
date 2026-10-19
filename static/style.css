@@ -218,7 +218,10 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .chat-title { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-head-actions { display: flex; gap: 2px; }
 #btn-verbose { font-weight: 700; } #btn-verbose.on { color: var(--accent); background: var(--accent-soft); }
-.messages { flex: 1; overflow: auto; padding: 10px 12px 20px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; }
+.messages { flex: 1; overflow: auto; padding: 10px 12px 20px; display: flex; flex-direction: column; gap: 10px; }
+.chat-jump { position: sticky; bottom: 6px; align-self: center; margin-top: -34px; padding: 5px 12px; border-radius: 14px; border: 1px solid var(--border-2); background: var(--bg-3); color: var(--fg); font-size: 12px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.45); z-index: 5; }
+.chat-jump:hover { background: var(--bg-2); }
+.chat-jump.hidden { display: none; }
 .chat-empty { margin: auto 0; text-align: center; padding: 20px 10px; }
 .ce-logo { display: flex; justify-content: center; margin-bottom: 10px; } .ce-logo .logo-f { width: 40px; height: 40px; font-size: 20px; border-radius: 10px; }
 .ce-tips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-top: 12px; }

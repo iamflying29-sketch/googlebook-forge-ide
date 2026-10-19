@@ -1057,10 +1057,13 @@
       $('#sb-ollama').className = 'sb-item ' + (s.ollama ? 'ok' : 'bad');
       const loaded = (s.running || []).map((m) => m.name).join(', ');
       if (s.engine === 'gpu') {
-        const h = (s.gpu_engine && s.gpu_engine.health && s.gpu_engine.health.status) || 'down';
-        $('#sb-model').textContent = 'GPU engine: ' + (h === 'ok' ? 'ready' : h);
-      } else $('#sb-model').textContent = s.model + (loaded ? ' (loaded)' : ' (will load on first message)');
-      $('#sb-model').title = loaded ? 'Loaded in memory: ' + loaded : 'Not loaded yet';
+        const g = s.gpu_engine || {}, h = (g.health && g.health.status) || 'down';
+        // Down for lack of memory on the Googlebook: say so with the numbers, the app starts the engine when there is room.
+        const short = h !== 'ok' && g.note && typeof g.host_mem_mb === 'number' && g.host_mem_mb >= 0;
+        $('#sb-model').textContent = short ? 'GPU engine: waiting for memory (' + (g.host_mem_mb / 1024).toFixed(1) + ' GB free on the Googlebook, needs ' + (g.need_mb / 1024).toFixed(1) + ' GB)'
+          : 'GPU engine: ' + (h === 'ok' ? 'ready' : h);
+        $('#sb-model').title = short ? g.note : (h === 'ok' ? 'Llama runs on the Intel GPU through the Forge app' : 'The GPU engine is not running; the Forge app starts it when the Googlebook has room');
+      } else { $('#sb-model').textContent = s.model + (loaded ? ' (loaded)' : ' (will load on first message)'); $('#sb-model').title = loaded ? 'Loaded in memory: ' + loaded : 'Not loaded yet'; }
       if (s.mem && s.mem.total_mb) {
         const avail = s.mem.available_mb, el2 = $('#sb-mem');
         const host = (typeof s.host_mem_mb === 'number' && s.host_mem_mb >= 0) ? s.host_mem_mb : null;

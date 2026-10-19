@@ -9,6 +9,35 @@
   const C = window.ForgeChat = {};
   const promptEl = $('#prompt');
   const host = $('#messages');
+  // ---- keeping the newest text in view ------------------------------------------------------------------------
+  // Each tab remembers whether the reader is at the bottom of the chat ("stick"). While a reply streams in, every
+  // change of the transcript's height scrolls the chat to the bottom as long as the reader stays there; scrolling up
+  // releases the view (so reading an earlier part is never interrupted) and scrolling back down attaches it again.
+  // The scroll itself is instant: the old code scrolled with the smooth animation and tested "near the bottom" while
+  // that animation was still running, so a fast reply outran it and the chat stopped following.
+  const BOTTOM_PX = 120;
+  const nearBottom = () => host.scrollHeight - host.scrollTop - host.clientHeight < BOTTOM_PX;
+  function toBottom() { host.scrollTo({ top: host.scrollHeight, behavior: 'instant' }); }
+  function followBottom(force) {
+    if (!active) return;
+    if (force) active.stick = true;
+    if (active.stick !== false) toBottom();
+    updateJump();
+  }
+  const jump = el('button', { class: 'chat-jump hidden', text: 'Jump to the latest', title: 'Scroll to the newest part of the reply and follow it again', onclick: () => followBottom(true) });
+  host.append(jump);
+  function updateJump() { jump.classList.toggle('hidden', !active || !active.run || active.stick !== false || nearBottom()); }
+  host.addEventListener('scroll', () => { if (active) active.stick = nearBottom(); updateJump(); }, { passive: true });
+  // Anything that makes the transcript taller (streamed text, a card that opens, an image that loads) keeps the
+  // bottom in view when the reader is there; the observer covers every kind of block without a call at each site.
+  const grow = new ResizeObserver(() => { if (active && active.stick !== false && !active.pane.classList.contains('hidden')) toBottom(); });
+  // A box inside a card with its own scroll bar (thought process, timeline, command output) follows its newest line
+  // the same way, until the reader scrolls up inside it.
+  function keepBottom(box) {
+    if (!box) return;
+    if (!box._follow) { box._follow = true; box._stick = true; box.addEventListener('scroll', () => { box._stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40; }, { passive: true }); }
+    if (box._stick) box.scrollTop = box.scrollHeight;
+  }
   const tabs = [];
   let active = null;
   let verbose = false;
@@ -77,7 +106,7 @@
   }
   function toolCard(t) {
     const card = el('div', { class: 'tool ' + (t.state || 'running') });
-    const head = el('div', { class: 'thead', onclick: () => card.classList.toggle('open') },
+    const head = el('div', { class: 'thead', onclick: () => { card.classList.toggle('open'); if (card.classList.contains('open') && t.name === 'run_command' && !res._shown) { res._shown = true; res.scrollTop = res.scrollHeight; } } },
       el('span', { class: 'ticon', text: TOOL_ICONS[t.name] || '⚙' }), el('span', { class: 'tname', text: TOOL_LABELS[t.name] || t.name }),
       el('span', { class: 'targ', text: argSummary(t.name, t.arguments), title: argSummary(t.name, t.arguments) }),
       el('span', { class: 'tstate', text: t.state === 'ok' ? 'done' + (t.seconds != null ? ' · ' + t.seconds + 's' : '') : t.state === 'fail' ? 'failed' : 'running' }));
@@ -334,7 +363,9 @@
       this.contexts = []; this.queue = []; this.scroll = 0; this.attention = false; this.draft = '';
       this.models = null; this.modelsUntil = 0;
       this.pane = el('div', { class: 'tab-pane hidden' });
-      host.append(this.pane);
+      this.stick = true;
+      host.append(this.pane, jump);
+      grow.observe(this.pane);
       this.render();
     }
     render() {
@@ -379,7 +410,7 @@
     autoGrow();
     $('#chat-empty').classList.toggle('hidden', tab.transcript.length > 0);
     renderTabBar(); renderContexts(); renderQueue(); refreshComposer(); loadModelPicker(); renderStrip();
-    host.scrollTop = tab.scroll || host.scrollHeight;
+    if (tab.scroll && tab.stick === false) host.scrollTop = tab.scroll; else followBottom(true);
     saveTabs();
     loadHistory($('#history'));
   }
@@ -781,7 +812,7 @@
     tab.pane.append(msgEl);
     const spinner = el('div', { class: 'status-line', text: 'Thinking…' });
     msgEl.append(spinner);
-    if (tab === active) host.scrollTop = host.scrollHeight;
+    if (tab === active) followBottom(true);
     let r;
     try { r = await post('/api/chat', { session_id: tab.session.id, message: item.text, mode: item.mode, attachments: item.attachments, model: tab.session.model_choice || '' }); }
     catch (e) {
@@ -824,7 +855,7 @@
     if (R.es) R.es.close();
     R.spinner.remove();
     closeCurrent(R);
-    tab.run = null;
+    tab.run = null; updateJump();
     if (tab.models) {
       for (const st of Object.values(tab.models)) if (BUSY.has(st.state) || WAITING.has(st.state) || st.state === 'done') { st.state = 'idle'; st.since = Date.now(); }
       tab.modelsUntil = Date.now() + 8000;
@@ -843,7 +874,7 @@
     if (tab.queue.length) { const next = tab.queue.shift(); if (tab === active) renderQueue(); setTimeout(() => startRun(tab, next), 300); }
   }
   const visible = (R) => R.tab === active;
-  function scrollIfActive(R, force) { if (!visible(R)) return; const near = host.scrollHeight - host.scrollTop - host.clientHeight < 120; if (force || near) host.scrollTop = host.scrollHeight; }
+  function scrollIfActive(R, force) { if (!visible(R)) return; followBottom(force); }
   function flushText(R) {
     if (R.pending) return;
     R.pending = true;
@@ -851,7 +882,7 @@
       R.pending = false;
       if (!R.cur) return;
       if (R.cur.type === 'text') { R.curEl.innerHTML = md(R.cur.text); colorize(R.curEl); R.curEl.classList.add('cursor-blink'); }
-      else if (R.cur.type === 'thinking') R.curEl._body.textContent = R.cur.text;
+      else if (R.cur.type === 'thinking') { R.curEl._body.textContent = R.cur.text; keepBottom(R.curEl._body); }
       scrollIfActive(R);
     });
   }
@@ -900,7 +931,7 @@
         }
         const it = { t: Math.round(now * 10) / 10, model: ev.model, state: ev.state, label: ev.label || '', detail: ev.detail || '' };
         R.timeline.items.push(it);
-        R.timelineEl._list.append(timelineItem(it));
+        R.timelineEl._list.append(timelineItem(it)); keepBottom(R.timelineEl._list);
         R.timelineEl._sum.textContent = timelineSummary(R.timeline, now);
         if (ev.exchange && R.exchanges.has(ev.exchange)) {
           const x = R.exchanges.get(ev.exchange);
@@ -962,7 +993,7 @@
         x.card.classList.remove('running'); x.card.classList.add(ev.ok ? 'ok' : 'fail');
         x.card._res.textContent = ev.result;
         x.card._state.textContent = ev.ok ? 'done' + (ev.seconds != null ? ' · ' + ev.seconds + 's' : '') : 'failed';
-        if (!ev.ok) x.card.classList.add('open');
+        if (!ev.ok) { x.card.classList.add('open'); if (ev.name === 'run_command') { x.card._res._shown = true; x.card._res.scrollTop = x.card._res.scrollHeight; } }
         if (window.ForgeExtras && (ev.name === 'write_file' || ev.name === 'edit_file')) window.ForgeExtras.reportCheck((x.t.arguments || {}).path || '', ev.result.includes('SYNTAX CHECK FAILED') ? ev.result.slice(ev.result.indexOf('SYNTAX CHECK FAILED')) : 'Syntax check: OK');
         if (ev.name === 'write_file' || ev.name === 'edit_file') { F.refreshFile((x.t.arguments || {}).path); F.loadTree(); }
         break;
