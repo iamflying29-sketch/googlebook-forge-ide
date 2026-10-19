@@ -5,7 +5,7 @@ Forge is a Cursor-style AI coding IDE that runs entirely on your Lenovo Googlebo
 ## 1. The pieces
 
 - **Forge IDE server**: a Python program in the Linux Terminal VM. It serves the editor and runs the agent, the tools and the terminal. It starts automatically with the VM.
-- **Forge app**: the windows you open from the taskbar. It also hosts the GPU engine, the vision model and voice input. Forge itself runs inside the Linux Terminal, so when you open the app while the Terminal is closed, the app shows one steady "Forge is not running yet" screen, opens the Terminal for you (its VM boots in about half a minute and starts Forge with it), checks every three seconds without reloading anything, and shows the IDE by itself as soon as Forge answers (app version 1.5; the earlier app reloaded that screen on every check, which looked like an endless loop and swallowed clicks on its buttons).
+- **Forge app** (version 2.0, native): the windows you open from the taskbar are a native Kotlin app, no browser and no WebView anywhere, with the Explorer, file tabs and an editor, a terminal panel, the chat with the agent (streaming replies, thought process, tool cards, approvals, the vision model's cards, Retry, image attachments, voice input), a folder dialog, a settings screen and the GPU engine card. It talks to the Forge server in the Linux VM over its API and keeps one process of about 140 MB per window instead of a browser renderer of 150 to 300 MB. It also hosts the GPU engine, the vision model and voice input. Forge itself runs inside the Linux Terminal, so when you open the app while the Terminal is closed, the app shows one steady waiting screen, opens the Terminal for you (its VM boots in about half a minute and starts Forge with it), checks every three seconds, and shows the IDE by itself as soon as Forge answers. Still to be built natively, in this order: syntax colors and code intelligence in the editor, inline review of the agent's changes, the git panel, the Android and virtual device views, notepads, previews, the debugger and notebooks. Its terminal shows text and takes a line at a time, so programs that draw screens (vim, top) belong in the Terminal app. Shortcuts: Ctrl S saves, Ctrl P finds a file, Ctrl L focuses the chat, Ctrl O opens a folder, Ctrl ` focuses the terminal, Ctrl Shift N opens a new window.
 - **Ollama with forge-coder**: your Llama 3.1 8B model, tuned for code, running on the CPU inside the VM.
 - **Forge GPU engine**: the same Llama 3.1 weights on the Intel graphics, through llama.cpp's Vulkan backend, inside the Forge app.
 - **The vision model**: Qwen3-VL, which looks at screenshots for Llama. It runs on the Intel graphics in the Forge app (the 4B build first, because it describes screens accurately; the 2B build is about 1.6 times faster at writing but invented errors on a terminal screenshot, and it is used only when the 4B build does not fit in memory), or on the CPU in the VM as a fallback. Text recognition (tesseract) reads the words in every image.
@@ -16,7 +16,6 @@ Forge is a Cursor-style AI coding IDE that runs entirely on your Lenovo Googlebo
 
 1. Open the **Terminal** app once after a restart so the Linux VM starts. It can stay in the background.
 2. Click the **Forge** icon. If the VM is still booting you see a waiting screen that retries by itself.
-3. Chrome works too, at http://localhost:8765.
 
 From the Linux Terminal:
 
@@ -122,7 +121,7 @@ Llama 3.1 cannot see images, so Forge pairs it with a vision model. You can watc
 Click the microphone button in the AI panel (or press Ctrl Shift Space) and speak. Click it again when you are done.
 
 - **In the Forge app**, Forge uses Android's own speech recognizer, the same Google speech service the Googlebook uses elsewhere. You see the words appear while you speak, short pauses do not stop it, and it stops by itself after three minutes. The first time, Android asks whether Forge may use the microphone. The microphone also turns off when you minimize or close the Forge window.
-- **In a browser**, Forge records your voice and whisper.cpp turns it into text inside the VM after you click the button again. This needs the voice part of `install-extras.sh`.
+- **Without the app's speech service**, Forge records your voice and whisper.cpp turns it into text inside the VM after you click the button again. This needs the voice part of `install-extras.sh`.
 
 ## 11. Editing
 

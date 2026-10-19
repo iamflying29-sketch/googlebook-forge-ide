@@ -41,6 +41,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="Forge settings"
+            android:theme="@style/ForgeTheme" />
         <!-- The GPU engine: llama.cpp (Vulkan) as a foreground service with a Stop action in its notification. -->
         <service
             android:name=".EngineService"

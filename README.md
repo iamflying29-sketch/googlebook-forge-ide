@@ -36,7 +36,7 @@ I built it because I wanted to work with my local model the way I work in Cursor
 - **Settings in two scopes**: User settings for every folder, and folder overrides saved in `.forge/settings.json`, like `.vscode/settings.json` in Cursor.
 - **Rules for the AI**, **notepads**, a **source control view** with model-written commit messages, **terminal Ctrl K** (plain English to a shell command), and **MCP servers** whose tools the agent may call after my approval.
 - **Integrated terminal** (a real bash shell on a pseudo terminal, several tabs), file explorer with right-click actions, quick open (also for any path on the computer), command palette, search in files, chat history and settings. The layout is always dark and resizable.
-- **The Forge app**: native windows with a launcher icon, one per folder, each labeled with its folder in the taskbar, a steady waiting screen that opens the Linux Terminal for me when Forge is not running and shows the IDE by itself once it answers, a file picker for any kind of file, voice input, and the GPU engine.
+- **The Forge app**: a native Kotlin app (version 2.0), no browser and no WebView: the Explorer, an editor, a terminal panel, the chat with the agent, a folder dialog, settings and the GPU engine card, one window per folder at about 140 MB of memory each, with a steady waiting screen that opens the Terminal app for you when the VM is not running yet. Code intelligence in the editor, inline review, the git panel, the Android views, previews, the debugger and notebooks are next to be built natively.
 
 ## The problem
 
