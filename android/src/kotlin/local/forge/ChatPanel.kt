@@ -94,6 +94,7 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
     private val modePill: TextView
     private val modelPill: TextView
     private val thinkingToggle: TextView
+    private val verboseToggle: TextView
     private val autoToggle: TextView
     private val send: ImageButton
     private val statsText: TextView
@@ -215,7 +216,10 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         val plus = Ui.miniButton(ctx, R.drawable.ic_plus, "New chat in a new tab (Ctrl N)") { newChat(null) }
         val history = Ui.miniButton(ctx, R.drawable.ic_history, "Chat history") { showHistory() }
         val export = Ui.miniButton(ctx, R.drawable.ic_download, "Export this chat as a Markdown file") { exportChat() }
-        val head = Ui.row(ctx, tabScroll, plus, history, export)
+        verboseToggle = pill("V") { toggleSetting("verbose") }
+        verboseToggle.tooltipText = "Verbose mode: show the raw model traffic in the Agent log"
+        val head = Ui.row(ctx, tabScroll, plus, history, export, verboseToggle)
+        verboseToggle.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = dp(4) }
         tabScroll.layoutParams = Ui.lp(0, dp(34), 1f)
         for (b in listOf(plus, history, export)) b.layoutParams = Ui.lp(dp(24), dp(24)).also { it.leftMargin = dp(4) }
         head.setPadding(dp(4), dp(3), dp(6), dp(3))
@@ -413,6 +417,7 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
 
     private fun updateToggles() {
         styleToggle(thinkingToggle, "Thinking", settings.optBoolean("thinking"))
+        styleToggle(verboseToggle, "V", settings.optBoolean("verbose"))
         styleToggle(autoToggle, "Auto-run", settings.optBoolean("auto_approve_commands"))
     }
 

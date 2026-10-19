@@ -16,7 +16,7 @@ import java.net.URLEncoder
  * the pty's raw output and takes raw input; a resize travels as a small JSON text frame. When the connection drops
  * the panel says so inside the terminal and reconnects by itself after a short wait.
  */
-class TerminalPanel(private val ctx: Context, private val host: MainActivity) {
+class TerminalPanel(private val ctx: Context, private val host: MainActivity, private val termId: String = "main") {
     val view: LinearLayout = LinearLayout(ctx)
     private val terminal = TerminalView(ctx)
     private val state: TextView
@@ -90,7 +90,7 @@ class TerminalPanel(private val ctx: Context, private val host: MainActivity) {
         terminal.reset()
         val cols = maxOf(10, terminal.gridCols); val rows = maxOf(3, terminal.gridRows)
         val folder = if (Api.folder.isNotEmpty()) "&folder=" + URLEncoder.encode(Api.folder, "UTF-8") else ""
-        val client = Api.WebSocketClient("/ws/term?id=main&cols=$cols&rows=$rows$folder",
+        val client = Api.WebSocketClient("/ws/term?id=$termId&cols=$cols&rows=$rows$folder",
             { text -> if (gen == generation) onMessage(text) },
             { why -> if (gen == generation) onClosed(why) })
         ws = client
@@ -138,6 +138,14 @@ class TerminalPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     fun focusInput() { terminal.requestFocus() }
+
+    /** Ends this shell on the server (the Kill button of the terminal tabs). */
+    fun kill() {
+        close()
+        Api.async("terminal-kill", { Api.post("/api/terminal/kill", JSONObject().put("id", termId)) }) { _, _ -> }
+        terminal.reset()
+        setState("KILLED")
+    }
 
     fun close() {
         closed = true

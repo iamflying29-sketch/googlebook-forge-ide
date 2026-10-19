@@ -33,7 +33,7 @@ import org.json.JSONObject
  */
 class MainActivity : Activity() {
     companion object {
-        const val VERSION = "3.1"
+        const val VERSION = "3.2"
         private const val TAG = "Forge"
         private const val TERMINAL_PACKAGE = "com.android.virtualization.terminal"
         private const val PROBE_MS = 3000L
@@ -61,7 +61,9 @@ class MainActivity : Activity() {
     private lateinit var waitingText: TextView
     private lateinit var chat: ChatPanel
     private lateinit var editor: EditorPanel
-    private lateinit var terminal: TerminalPanel
+    private lateinit var terminal: TerminalTabs
+    private lateinit var logcat: LogcatPanel
+    private lateinit var debugConsole: DebugConsolePanel
     private val panelViews = ArrayList<View>()
     private var sideView: String? = null
     private var explorerShown = true
@@ -126,11 +128,16 @@ class MainActivity : Activity() {
             onChat = { toggleChat() },
             onNewWindow = { newWindow() },
             onSettings = { openSettings() })
+        // The model pill next to the engine chip, like the old page's model picker: the model's name and size.
+        modelPill = Ui.chip(this, "model", Ui.fg3) { v -> showModelMenu(v) }
+        (topBar.engineChip.parent as LinearLayout).let { p -> p.addView(modelPill, p.indexOfChild(topBar.engineChip), Ui.lp(Ui.wrap, Ui.wrap).also { it.rightMargin = Ui.dp(this, 6) }) }
         ide.addView(topBar.view)
         ide.addView(Ui.divider(this, false))
 
         editor = EditorPanel(this, this)
-        terminal = TerminalPanel(this, this)
+        terminal = TerminalTabs(this, this)
+        logcat = LogcatPanel(this, this)
+        debugConsole = DebugConsolePanel(this, this)
         chat = ChatPanel(this, this)
 
         // The activity bar on the left.
@@ -196,8 +203,13 @@ class MainActivity : Activity() {
         agentLogView = log
         panelViews.add(Ui.scroll(this, log))
         panelViews.add(Chrome.placeholder(this, R.drawable.ic_close, "Problems", "Syntax checks after saves and agent edits will show up here, with a Fix with AI button."))
+        panelViews.add(debugConsole.view)
+        panelViews.add(logcat.view)
         for ((i, v) in panelViews.withIndex()) { content.addView(v, FrameLayout.LayoutParams(Ui.match, Ui.match)); v.visibility = if (i == 0) View.VISIBLE else View.GONE }
-        panelTabs = Chrome.panelTabs(this, listOf("Terminal", "Agent log", "Problems")) { i -> selectPanel(i) }
+        panelTabs = Chrome.panelTabs(this, listOf("Terminal", "Agent log", "Problems", "Debug console", "Logcat")) { i -> selectPanel(i) }
+        panelTabs.actions.addView(Ui.miniButton(this, R.drawable.ic_chat, "Ask the AI about the terminal (Ctrl L)") { if (!chatShown) toggleChat(); chat.focusPrompt() })
+        panelTabs.actions.addView(Ui.miniButton(this, R.drawable.ic_plus, "New terminal") { selectPanel(0); terminal.addTerminal() })
+        panelTabs.actions.addView(Ui.miniButton(this, R.drawable.ic_trash, "Kill this terminal") { selectPanel(0); terminal.killActive() })
         panelTabs.actions.addView(Ui.miniButton(this, R.drawable.ic_close, "Close panel (Ctrl J)") { toggleBottomPanel() })
         col.addView(panelTabs.view)
         col.addView(Ui.divider(this, false))
@@ -376,7 +388,63 @@ class MainActivity : Activity() {
     private fun gb(mb: Int): String = String.format("%.1f", mb / 1024.0)
 
     /** The status bar and the engine chip, from GET /api/status every 20 seconds. */
+    private lateinit var modelPill: LinearLayout
+    private var modelList: List<JSONObject> = emptyList()
+    private var engineName = ""
+    private var gpuModelName = ""
+    private var cpuModelName = ""
+
+    /** The model pill's text: the model that answers right now and its size. */
+    private fun refreshModelPill() {
+        Api.async("models", { Pair(Api.get("/api/models"), Api.get("/api/settings")) }) { r, _ ->
+            if (r == null) return@async
+            val arr = r.first.optJSONArray("models")
+            val list = ArrayList<JSONObject>()
+            if (arr != null) for (i in 0 until arr.length()) list.add(arr.getJSONObject(i))
+            modelList = list
+            val eff = r.second.optJSONObject("effective") ?: JSONObject()
+            engineName = eff.optString("engine", "ollama")
+            gpuModelName = eff.optString("gpu_model", "forge-coder")
+            cpuModelName = r.first.optString("active", eff.optString("model", ""))
+            val name = if (engineName == "gpu") gpuModelName else cpuModelName
+            val size = list.firstOrNull { it.optString("name") == name || it.optString("name") == "$name:latest" }?.optJSONObject("details")?.optString("parameter_size") ?: ""
+            Ui.setChip(modelPill, name + (if (size.isNotEmpty()) " · $size" else "") + (if (engineName == "gpu") "  GPU" else "  CPU"), if (engineName == "gpu") Ui.accent else Ui.blue, Ui.fg)
+        }
+    }
+
+    private fun showModelMenu(anchor: View) {
+        val menu = android.widget.PopupMenu(this, anchor)
+        val gpu = menu.menu.add("Use the GPU engine (Intel graphics)")
+        val cpu = menu.menu.add("Use Ollama in the VM (processor)")
+        val heading = menu.menu.add(if (engineName == "gpu") "Model for the GPU engine:" else "Model for Ollama:")
+        heading.isEnabled = false
+        val items = HashMap<android.view.MenuItem, String>()
+        for (mdl in modelList) {
+            val n = mdl.optString("name")
+            val size = mdl.optJSONObject("details")?.optString("parameter_size") ?: ""
+            val current = n == (if (engineName == "gpu") gpuModelName else cpuModelName) || n == (if (engineName == "gpu") gpuModelName else cpuModelName) + ":latest"
+            items[menu.menu.add((if (current) "✓ " else "    ") + n + (if (size.isNotEmpty()) " · $size" else ""))] = n
+        }
+        menu.setOnMenuItemClickListener { item ->
+            when {
+                item === gpu -> Api.async("engine-select", { Api.post("/api/engine/select", JSONObject().put("engine", "gpu")) }) { r, e -> Ui.toast(this, if (r != null) "The GPU engine answers chats now." else "Not switched: " + (e?.message ?: "")); refreshModelPill(); refreshStatus() }
+                item === cpu -> Api.async("engine-select", { Api.post("/api/engine/select", JSONObject().put("engine", "ollama")) }) { r, e -> Ui.toast(this, if (r != null) "Ollama in the VM answers chats now." else "Not switched: " + (e?.message ?: "")); refreshModelPill(); refreshStatus() }
+                items.containsKey(item) -> {
+                    val n = items[item]!!
+                    val key = if (engineName == "gpu") "gpu_model" else "model"
+                    Api.async("model-set", { Api.post("/api/settings", JSONObject().put(key, n).put("_scope", "user")) }) { r, e ->
+                        Ui.toast(this, if (r != null) (if (key == "gpu_model") "$n runs on the GPU engine from its next start." else "$n answers chats now.") else "Not saved: " + (e?.message ?: ""))
+                        refreshModelPill()
+                    }
+                }
+            }
+            true
+        }
+        menu.show()
+    }
+
     private fun refreshStatus() {
+        refreshModelPill()
         Api.async("status", { Api.get("/api/status") }) { r, e ->
             if (r == null) {
                 statusBar.setOllama(null); statusBar.setEngine(""); statusBar.setMemory("")
@@ -587,5 +655,5 @@ class MainActivity : Activity() {
         Api.main.removeCallbacks(probeTask); Api.main.removeCallbacks(statusTask); Api.main.removeCallbacks(indexTask)
         voice?.stop()
     }
-    override fun onDestroy() { super.onDestroy(); terminal.close(); chat.stop() }
+    override fun onDestroy() { super.onDestroy(); terminal.close(); logcat.close(); chat.stop() }
 }
