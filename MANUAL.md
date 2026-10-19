@@ -35,7 +35,7 @@ Every Forge window has its own folder, like a window in Cursor. The folder name 
 
 - **Open folder** (Ctrl O, or click the folder name) switches this window to another folder. **New window** (Ctrl Shift N, or the button next to the folder name) opens another window. The Open folder dialog has a New window button, and every recent folder has a ↗ that opens it in a new window.
 - Each folder keeps its own chats, AI Changes, open files, explorer state, project rules, memories and folder settings. The terminal of a window starts in its folder.
-- A chat always works in the folder it was started in. Opening a chat from another folder switches the window to that folder.
+- A chat always works in the folder it was started in. Opening a chat from another folder switches the window to that folder. A message you typed but did not send yet travels along when the window switches folders, and it also comes back after the window reloads; it is cleared when you send it or empty the box.
 - **Several folders in one window**: the folder button with a plus at the top of the Explorer (or "Add folder to this window" in the command palette) adds another folder next to the project, like Cursor's multi-root workspaces. Each folder gets its own section in the Explorer, and quick open, search, replace and the agent's codebase search cover all of them. The ✕ on a folder's section removes it from the window; the folder itself is not touched. The list is saved in the project's `.forge/settings.json`.
 
 ## 4. The layout

@@ -71,7 +71,12 @@
     else window.open(url, '_blank');
   };
   /** Switch this window to another folder (reloads the window, like Cursor's Open Folder). */
-  Forge.goToFolder = (folder, chat) => { location.href = folderUrl(folder, chat); };
+  // Switching folders reloads the window, so an unsent chat message travels along and appears in the new folder's
+  // chat box (it used to be lost, found 2026-10-19).
+  Forge.goToFolder = (folder, chat) => {
+    try { const p = document.querySelector('#prompt'); if (p && p.value.trim()) sessionStorage.setItem('forge.carryDraft', p.value); } catch (e) { /* ignore */ }
+    location.href = folderUrl(folder, chat);
+  };
 
   // ------------------------------------------------------------------ layout
   function applyLayout() {

@@ -601,6 +601,8 @@
     if (Date.now() - cache.at < 10000) return;
     try { const [d, s, c] = await Promise.all([get('/api/docs'), get('/api/sessions'), get('/api/commands')]); cache = { at: Date.now(), docs: d.docs || [], chats: s.sessions || [], commands: c.commands || [] }; } catch (e) { /* keep */ }
   }
+  const draftKey = () => 'forge.draft.' + (F.folder || '');
+  promptEl.addEventListener('input', () => { try { if (promptEl.value.trim()) localStorage.setItem(draftKey(), promptEl.value); else localStorage.removeItem(draftKey()); } catch (e) { /* ignore */ } });
   promptEl.addEventListener('input', async () => {
     const v = promptEl.value, pos = promptEl.selectionStart;
     autoGrow();
@@ -727,6 +729,7 @@
       item.attachments.push({ kind: 'editor', path: viewing, line: pos ? pos.lineNumber : null });
     }
     promptEl.value = ''; tab.draft = ''; autoGrow();
+    try { localStorage.removeItem(draftKey()); } catch (e) { /* ignore */ }
     tab.contexts = []; renderContexts(); hideMenu();
     if (tab.run) { tab.queue.push(item); renderQueue(); toast('Queued. It is sent when the current reply finishes.', 'ok', 1500); return; }
     startRun(tab, item);
@@ -1067,6 +1070,12 @@
       if (urlChat) await openChat(urlChat).catch(() => {});
       const want = tabs.find((t) => t.session.id === (urlChat || saved.active));
       if (want) switchTo(want); else if (tabs.length) switchTo(tabs[tabs.length - 1]); else await newChat();
+      // An unsent message comes back: carried over from the folder this window just left, or kept from before a
+      // reload of this folder's window.
+      let carried = '';
+      try { carried = sessionStorage.getItem('forge.carryDraft') || ''; sessionStorage.removeItem('forge.carryDraft'); } catch (e) { /* ignore */ }
+      if (!carried) { try { carried = localStorage.getItem(draftKey()) || ''; } catch (e) { /* ignore */ } }
+      if (carried && !promptEl.value.trim() && active) { promptEl.value = carried; active.draft = carried; autoGrow(); try { localStorage.setItem(draftKey(), carried); } catch (e) { /* ignore */ } }
     })();
     await initDone;
     loadModelPicker();
