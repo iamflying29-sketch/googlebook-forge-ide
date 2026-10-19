@@ -195,6 +195,9 @@ public final class VisionControl {
         report();
     }
 
+    /** The memory guard stopped the vision server: say so, instead of a bare "exited with code". */
+    static void guardStopped(String why) { vstate = "error"; vdetail = why; log("[vision] " + why); report(); }
+
     private static void fail(String why) {
         vstate = "error"; vdetail = why;
         log("ERROR: " + why);
@@ -209,6 +212,7 @@ public final class VisionControl {
                 JSONObject o = new JSONObject();
                 o.put("vstate", vstate); o.put("vtier", vtier); o.put("vdetail", vdetail);
                 o.put("host_mem_mb", EngineService.memAvailableMb());
+                o.put("log", EngineService.logTail(60));   // the IDE keeps it for diagnosis (/api/engine/applog)
                 HttpURLConnection c = (HttpURLConnection) new URL(FORGE + "/api/engine/vision_status").openConnection();
                 c.setRequestMethod("POST"); c.setDoOutput(true); c.setConnectTimeout(3000); c.setReadTimeout(5000);
                 c.setRequestProperty("Content-Type", "application/json");

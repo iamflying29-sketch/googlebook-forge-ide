@@ -77,7 +77,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "gpu_pool_credit": 0,
     # Extra llama-server flags for the vision model's server. Flash attention inside the image encoder is the slow
     # path on Vulkan (llama.cpp issue 17012: minutes instead of seconds on integrated GPUs), so it is off by default.
-    "vision_extra_args": "-fa off --fit off",
+    "vision_extra_args": "-fa off",   # "--fit off" made the vision server fail to load its model (2026-10-19)
     "font_size": 13,
     "theme": "forge-dark",
     "workspace": os.path.expanduser("~/projects"),
@@ -1622,6 +1622,8 @@ class Handler(BaseHTTPRequestHandler):
             st.vision.release()
             return self._json(200, {"ok": True})
         if path == "/api/engine/vision_status":
+            if b.get("log"):
+                st.engine_stats = {**st.engine_stats, "log": str(b.get("log"))}
             st.vision.report({k: b.get(k) for k in ("vstate", "vtier", "vdetail", "host_mem_mb") if k in b})
             return self._json(200, {"ok": True})
         if path == "/api/engine/prepare":
@@ -1641,6 +1643,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/engine/stats":
             st.engine_stats = dict(b)
             return self._json(200, {"ok": True})
+        if path == "/api/engine/applog":
+            # The Forge app's own engine and vision log, as last posted with an engine event (for diagnosis).
+            return self._json(200, {"stats": {k: v for k, v in st.engine_stats.items() if k != "log"},
+                                    "log": str(st.engine_stats.get("log", ""))})
         if path == "/api/terminal/kill":
             st.terminals.kill(str(b.get("id", "")))
             return self._json(200, {"ok": True})

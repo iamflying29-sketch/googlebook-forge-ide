@@ -216,8 +216,16 @@ class VisionManager:
                 if obj.get("done"):
                     break
         except OllamaError as e:
-            emit(f"The GPU vision model failed ({e}).")
-            ev("model_activity", model="vision", state="failed", label=self._label, detail=f"Failed: {e}")
+            # The app knows why its vision server stopped (the memory guard, an exit code); say that, not just that
+            # the stream ended.
+            why = str(e)
+            for _ in range(10):
+                if self.app.get("vstate") == "error" and self.app.get("vdetail"):
+                    why = f"{self.app.get('vdetail')}; {e}"
+                    break
+                time.sleep(0.5)
+            emit(f"The GPU vision model failed ({why}).")
+            ev("model_activity", model="vision", state="failed", label=self._label, detail=f"Failed: {why}")
             self.release()
             return None
         text = "".join(parts).strip()

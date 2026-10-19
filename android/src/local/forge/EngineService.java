@@ -300,7 +300,9 @@ public class EngineService extends Service {
             if (pausing) {
                 // Stopping the engine for the vision model closes its output while this thread reads it; that is the
                 // pause, not an error. (Treating it as an error dropped the foreground service and let Android freeze
-                // the app, 2026-10-19.)
+                // the app, 2026-10-19.) The engine process is gone, so the budget must know it stopped: otherwise the
+                // vision model's check sees "engine running" and gives no credit for the memory the pause just freed.
+                GpuBudget.afterStop(this, "engine");
                 pausing = false;
                 pausedForVision = true;
                 state = "paused";
@@ -337,6 +339,7 @@ public class EngineService extends Service {
                 if (low >= 2) {
                     log("memory guard: stopping the " + who + " (visible free memory " + avail + " MB" + (lowFlag ? ", Android reports low memory" : "") + ")");
                     GpuBudget.guardStopped(ctx);
+                    if (!"engine".equals(who)) VisionControl.guardStopped("stopped by the memory guard: only " + avail + " MB free on the Googlebook" + (lowFlag ? " and Android reports low memory" : ""));
                     if ("engine".equals(who) && instance != null) instance.detail = "Stopped by the memory guard: only " + avail + " MB free on the Googlebook. Close other apps; Forge starts it again when there is room.";
                     p.destroy();
                     try { if (!p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly(); } catch (InterruptedException ignored) { }
