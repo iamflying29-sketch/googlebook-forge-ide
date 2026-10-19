@@ -32,10 +32,12 @@ HOST_MEM_FOR_CPU_VISION_MB = 5000 # the VM borrows from the host: 2.5 GB for the
 TIERS = [
     # The 2B model first: it writes its description about 1.6 times faster than the 4B one for the same look, and a
     # screenshot description needs words, not depth (measured 2026-10-19: the 4B answered 156 words in 49 s).
+    # 640 image tokens (a 1024 by 640 picture) and a 2048 token context: the encoder's attention memory and time grow
+    # with the square of the picture's patches, and a description plus a question never needs more context.
     {"name": "Qwen3-VL 2B", "model": "Qwen3VL-2B-Instruct-Q4_K_M.gguf", "mmproj": "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
-     "need_mb": 3500, "ctx": 4096, "image_max_tokens": 1024},
+     "need_mb": 3000, "ctx": 2048, "image_max_tokens": 640},
     {"name": "Qwen3-VL 4B", "model": "Qwen3VL-4B-Instruct-Q4_K_M.gguf", "mmproj": "mmproj-Qwen3VL-4B-Instruct-F16.gguf",
-     "need_mb": 3600, "ctx": 4096, "image_max_tokens": 1024},
+     "need_mb": 3600, "ctx": 2048, "image_max_tokens": 640},
 ]
 
 
@@ -117,6 +119,7 @@ class VisionManager:
         return {"want": self.want(), "idle_stop_s": IDLE_STOP_S, "tiers": self.tiers(), "port": VISION_PORT,
                 "host_ip": st.host_ip(), "api_key": st.settings.get("gpu_engine_key", ""),
                 "file_url": "/api/engine/vision_file?name=", "engine_start": st.engine_start_due(report),
+                "engine_stop": st.engine_idle_stop_due(report),
                 "pool_credit_percent": int(st.settings.get("gpu_pool_credit", 0) or 0),
                 "vision_extra_args": str(st.settings.get("vision_extra_args", "") or "")}
 
@@ -201,11 +204,11 @@ class VisionManager:
             {"type": "image_url", "image_url": {"url": f"data:{pmime};base64,{b64}"}},
             {"type": "text", "text": question}]}]
         ev("model_activity", model="vision", state="looking", label=self._label,
-           detail="Looking at the image (it turns the picture into up to 1,280 image tokens, then reads the question).")
+           detail="Looking at the image (it turns the picture into up to 640 image tokens, then reads the question).")
         t0 = time.time()
         parts: List[str] = []
         try:
-            for obj in c.chat_stream("vision", messages, options={"temperature": 0.1, "num_predict": 400}):
+            for obj in c.chat_stream("vision", messages, options={"temperature": 0.1, "num_predict": 220}):
                 delta = (obj.get("message") or {}).get("content", "")
                 if delta:
                     if not parts:

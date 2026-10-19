@@ -22,7 +22,7 @@ TYPES = {b"\x89PNG\r\n\x1a\n": ("png", "image/png"), b"\xff\xd8\xff": ("jpg", "i
 
 VISION_PROMPT = ("You are helping a programmer who cannot see this image. Describe it precisely and briefly: which "
                  "application, page or dialog it shows; transcribe any error messages, warnings, code and other important "
-                 "text exactly; and point out anything that looks wrong or unusual. Use at most 200 words.")
+                 "text exactly; and point out anything that looks wrong or unusual. Use at most 120 words; every word costs time.")
 
 
 def sniff(data: bytes) -> Optional[tuple]:
@@ -106,7 +106,7 @@ class ImageStore:
         os.replace(tmp, p)
 
 
-VISION_MAX_SIDE = 1280
+VISION_MAX_SIDE = 1024   # 1024 by 640 for a laptop screenshot: 640 image tokens of 32 by 32 pixels
 
 
 def vision_payload(path: str, mime: str, max_side: int = VISION_MAX_SIDE) -> tuple:

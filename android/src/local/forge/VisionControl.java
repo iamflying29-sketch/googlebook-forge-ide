@@ -59,6 +59,7 @@ public final class VisionControl {
                 boolean want = r.optBoolean("want", false);
                 GpuBudget.heartbeat(ctx);
                 if (r.optBoolean("engine_start", false) && !want) EngineService.startIfIdle(ctx);
+                if (r.optBoolean("engine_stop", false) && !want && proc == null) { log("the IDE says the engine has been idle; unloading it"); EngineService.stop(ctx); }
                 if (want && proc == null && !launching) {
                     launching = true;
                     new Thread(() -> { try { start(ctx, r); } finally { launching = false; } }, "forge-vision-start").start();

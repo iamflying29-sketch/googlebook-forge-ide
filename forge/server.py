@@ -71,10 +71,13 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # Extra llama-server flags for the GPU engine (the app drops them and starts again plainly if the engine refuses them):
     # a 1 GB cap on the server's own prompt cache in RAM, one unified KV cache, and draft-free speculative decoding
     # (ngram-mod guesses the next tokens from text the model has already produced; code and file contents repeat).
-    "gpu_extra_args": "--jinja --fit off --cache-ram 1024 --kv-unified --spec-type ngram-mod --spec-ngram-mod-n-min 16 --spec-ngram-mod-n-max 32",
+    "gpu_extra_args": "--jinja --fit off -ub 256 --cache-ram 1024 --kv-unified --spec-type ngram-mod --spec-ngram-mod-n-min 16 --spec-ngram-mod-n-max 32",
     # Percent of the graphics driver's held memory (freed by Forge's own earlier GPU processes, invisible to Android's
     # free-memory figure) that the app's free-memory check may count. 0 keeps the check on visible free memory only.
     "gpu_pool_credit": 0,
+    # Minutes without a chat after which the Forge app unloads the GPU engine (0 keeps it loaded). The next message
+    # starts it again by itself and waits for it, so an idle laptop does not keep 3 to 4 GB of graphics memory busy.
+    "gpu_idle_unload_min": 30,
     # Extra llama-server flags for the vision model's server. Flash attention inside the image encoder is the slow
     # path on Vulkan (llama.cpp issue 17012: minutes instead of seconds on integrated GPUs), so it is off by default.
     "vision_extra_args": "-fa off",   # "--fit off" made the vision server fail to load its model (2026-10-19)
@@ -166,6 +169,10 @@ class State:
         self.engine_stats: Dict[str, Any] = {}
         self.engine_start_sent = 0.0     # when the app was last told to start the GPU engine by itself
         self._need_mb, self._need_mb_ts, self._need_mb_for = 0, 0.0, ""   # cached engine_need_mb() and its model
+        self.engine_last_use = time.time()   # when a chat last used the GPU engine (the idle unload counts from here)
+        self.engine_idle_stopped = False     # the app unloaded the engine because it was idle; no autostart until asked
+        self.engine_stop_sent = 0.0
+        self.engine_asked_ts = 0.0           # when a chat asked for the engine (a reply then waits for it)
         self.checkpoints = Checkpoints(os.path.join(DATA_DIR, "checkpoints"))
         self.vision = VisionManager(self, DATA_DIR)
         self.attachments = Attachments(os.path.join(DATA_DIR, "attachments"))
@@ -442,6 +449,8 @@ class State:
         free-memory check before loading anything; this never bypasses it."""
         if not self.settings.get("gpu_autostart", True) or self.active_engine() != "gpu":
             return False
+        if self.engine_idle_stopped:
+            return False          # unloaded on purpose; the next chat asks for it (ask_engine_start)
         if time.time() - self.engine_start_sent < 180:
             return False
         if self.engine_stats.get("state") == "paused" or self.vision.want():
@@ -496,10 +505,34 @@ class State:
                 f"memory. Closing other apps on the Googlebook (not the Terminal) makes room, and the engine then starts by itself.")
 
     def ask_engine_start(self) -> None:
-        """Wake the app's control poll so it hears about the engine right away (a chat just failed without it)."""
+        """Wake the app's control poll so it hears about the engine right away (a chat needs it)."""
+        self.engine_idle_stopped = False
+        self.engine_asked_ts = self.engine_last_use = time.time()
+        self.engine_start_sent = 0.0
         with self.vision.cond:
             self.vision.engine_poke = True
             self.vision.cond.notify_all()
+
+    def engine_idle_stop_due(self, report: Dict[str, Any]) -> bool:
+        """Whether the app should unload the GPU engine now: it runs, no chat has used it for the idle time in the
+        settings, nothing is running or waiting for the vision model, and it was not asked in the last ten minutes."""
+        try:
+            idle_min = int(self.settings.get("gpu_idle_unload_min", 30) or 0)
+        except (TypeError, ValueError):
+            idle_min = 30
+        if idle_min <= 0 or self.active_engine() != "gpu" or self.engine_idle_stopped:
+            return False
+        now = time.time()
+        if now - self.engine_last_use < idle_min * 60 or now - self.engine_stop_sent < 600:
+            return False
+        if self.vision.want() or any(not r.done for r in self.runs.values()):
+            return False
+        if not self.gpu_client.alive():
+            return False
+        self.engine_idle_stopped = True
+        self.engine_stop_sent = now
+        print(f"[engine] idle for {idle_min} minutes: asking the Forge app to unload the GPU engine", flush=True)
+        return True
 
     def memory_block_reason(self, model: Optional[str] = None, engine: Optional[str] = None) -> Optional[str]:
         """Refuse to load the model when the VM does not have room for it. Loading a 5 GB model into a VM
@@ -507,12 +540,11 @@ class State:
         if (engine or self.active_engine()) == "gpu":
             paused = self.engine_stats.get("state") == "paused" or self.vision.want()
             if not self.gpu_client.alive() and not paused:
+                if time.time() - self.engine_asked_ts < 600:
+                    return None   # a chat asked for the engine; the reply waits for it and says what it waits for
                 if self.settings.get("gpu_autostart", True) and time.time() - self.vision.app_seen < 60:
                     self.ask_engine_start()
-                    note = self.engine_memory_note()
-                    return ("The GPU engine is not running. " + (note + " Press Retry on the message when the status bar says the engine is ready."
-                            if note else "The Forge app is starting it now when the Googlebook has room (about a minute); press Retry on the message then.")
-                            + " Or switch the engine to Ollama in Settings.")
+                    return None
                 return ("The GPU engine is not running. Start it from the Forge app (Engine card in Settings) or switch "
                         "the engine back to Ollama in Settings.")
             return None
@@ -1711,13 +1743,11 @@ class Handler(BaseHTTPRequestHandler):
             paused = st.engine_stats.get("state") == "paused" or st.vision.want()
             if not paused:
                 if st.settings.get("gpu_autostart", True) and time.time() - st.vision.app_seen < 60:
+                    # The app starts the engine; the reply waits for it (up to ten minutes) and says what it waits for.
                     st.ask_engine_start()
-                    note = st.engine_memory_note()
-                    return self._error(503, "The GPU engine is not running. " + (note + " Press Retry on this message when the status bar says the engine is ready."
-                                            if note else "The Forge app is starting it now when the Googlebook has room (about a minute); press Retry on this message then.")
-                                            + " Or switch the engine to Ollama in Settings.")
-                return self._error(503, "The GPU engine is not running. Start it from the Forge app (Settings, GPU engine "
-                                        "card), or switch the engine to Ollama in Settings.")
+                else:
+                    return self._error(503, "The GPU engine is not running. Start it from the Forge app (Settings, GPU engine "
+                                            "card), or switch the engine to Ollama in Settings.")
         if fallback_note:
             settings = st.effective_settings(ws.root)
             settings["model"] = st.resolve_model(settings.get("model"))
@@ -1752,6 +1782,8 @@ class Handler(BaseHTTPRequestHandler):
         def go() -> None:
             if fallback_note:
                 run.emit("status", text=fallback_note)
+            if engine == "gpu":
+                st.engine_last_use = time.time()
             agent.run_turn(run, text, list(b.get("attachments") or []), mode)
             st.save_session(s)
             threading.Thread(target=lambda: st.hooks.run(ws.root, "stop", {"session": s["id"], "status": run.status}), daemon=True).start()
