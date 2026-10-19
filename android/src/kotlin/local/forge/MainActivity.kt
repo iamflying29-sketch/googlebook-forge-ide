@@ -30,7 +30,7 @@ import org.json.JSONObject
  */
 class MainActivity : Activity() {
     companion object {
-        const val VERSION = "2.0"
+        const val VERSION = "2.2"
         private const val TAG = "Forge"
         private const val TERMINAL_PACKAGE = "com.android.virtualization.terminal"
         private const val PROBE_MS = 3000L
@@ -280,7 +280,7 @@ class MainActivity : Activity() {
 
     private fun startVoice() {
         if (!Voice.available(this)) { Ui.toast(this, "No speech recognition service is installed"); return }
-        val v = voice ?: Voice(this, Voice.Sink { ev -> Api.main.post { onVoice(ev) } }).also { voice = it }
+        val v = voice ?: Voice(this) { ev -> Api.main.post { onVoice(ev) } }.also { voice = it }
         Ui.toast(this, "Listening… speak, then press Mic again to stop")
         v.start("")
         afterMic = null

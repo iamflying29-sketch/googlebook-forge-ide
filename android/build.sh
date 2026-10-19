@@ -13,17 +13,17 @@ B=build/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$B/classes" "$B/gen" assets
 "$BT/aapt2" compile --dir res -o "$B/res.zip"
 "$BT/aapt2" link -o "$B/unsigned.apk" -I "$JAR" --manifest AndroidManifest.xml -A assets \
-    --min-sdk-version 33 --target-sdk-version 35 --version-code 20 --version-name 2.0 \
+    --min-sdk-version 33 --target-sdk-version 35 --version-code 22 --version-name 2.2 \
     --java "$B/gen" "$B/res.zip"
 # 1. The generated R class, so both languages can use the resources.
 javac -Xlint:-options -source 11 -target 11 -cp "$JAR" -d "$B/classes" "$B/gen/local/forge/R.java"
-# 2. Kotlin (the whole user interface). The Java services are given as sources so Kotlin can call them.
+# 2. Kotlin: the whole app (the window, the chat, the editor, the terminal, the settings, the GPU engine service,
+#    the vision model control, the memory budget and voice input).
 "$KOTLIN/bin/kotlinc" -jvm-target 11 -no-reflect -cp "$JAR:$B/classes" -d "$B/classes" \
-    $(find src/kotlin -name '*.kt') src/local/forge/*.java 2>&1 | grep -vE "^warning:|^w: " || true
+    $(find src/kotlin -name '*.kt') 2>&1 | grep -vE "^warning:|^w: " || true
 test -f "$B/classes/local/forge/MainActivity.class" || { echo "Kotlin compilation failed"; exit 1; }
-# 3. The Java services (engine, vision, memory budget, voice), against the Kotlin classes.
-javac -Xlint:-options -source 11 -target 11 -cp "$JAR:$B/classes" -d "$B/classes" src/local/forge/*.java
-# 4. Dex: the app's classes plus the Kotlin standard library.
+test -f "$B/classes/local/forge/EngineService.class" || { echo "Kotlin compilation failed (EngineService)"; exit 1; }
+# 3. Dex: the app's classes plus the Kotlin standard library.
 "$BT/d8" --min-api 33 --lib "$JAR" --output "$B" $(find "$B/classes" -name '*.class') "$KOTLIN/lib/kotlin-stdlib.jar"
 python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1], "a").write(sys.argv[2], "classes.dex")' \
     "$B/unsigned.apk" "$B/classes.dex"

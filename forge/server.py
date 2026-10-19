@@ -1679,6 +1679,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"engine": eng})
         if path == "/api/engine/stats":
             st.engine_stats = dict(b)
+            if b.get("event") == "running":
+                st.engine_last_use = time.time()   # a fresh engine counts as used: the idle unload must not undo a start
             return self._json(200, {"ok": True})
         if path == "/api/engine/applog":
             # The Forge app's own engine and vision log, as last posted with an engine event (for diagnosis).
