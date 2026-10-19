@@ -594,6 +594,8 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     fun activePath(): String = active?.path ?: ""
+    /** The text selected in the active editor, or an empty string. */
+    fun selectionText(): String = active?.editor?.selectionText() ?: ""
     fun focusEditor() { active?.editor?.focus() }
 
     // ---------------------------------------------------------------- Ctrl P: the quick-open palette

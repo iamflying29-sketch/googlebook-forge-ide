@@ -25,6 +25,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
+import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ScrollView
@@ -94,7 +95,8 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
     private val modelPill: TextView
     private val thinkingToggle: TextView
     private val autoToggle: TextView
-    private val send: Button
+    private val send: ImageButton
+    private val statsText: TextView
 
     private val tabs = ArrayList<Tab>()
     private var active: Tab? = null
@@ -210,13 +212,12 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         tabBar.gravity = Gravity.BOTTOM
         tabScroll.addView(tabBar, FrameLayout.LayoutParams(Ui.wrap, Ui.match))
         tabScroll.isHorizontalScrollBarEnabled = false
-        val plus = Ui.button(ctx, "+") { newChat(null) }
-        plus.setPadding(dp(10), dp(4), dp(10), dp(4))
-        val history = Ui.button(ctx, "History") { showHistory() }
-        val head = Ui.row(ctx, tabScroll, plus, history)
+        val plus = Ui.miniButton(ctx, R.drawable.ic_plus, "New chat in a new tab (Ctrl N)") { newChat(null) }
+        val history = Ui.miniButton(ctx, R.drawable.ic_history, "Chat history") { showHistory() }
+        val export = Ui.miniButton(ctx, R.drawable.ic_download, "Export this chat as a Markdown file") { exportChat() }
+        val head = Ui.row(ctx, tabScroll, plus, history, export)
         tabScroll.layoutParams = Ui.lp(0, dp(34), 1f)
-        plus.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = dp(4) }
-        history.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = dp(4) }
+        for (b in listOf(plus, history, export)) b.layoutParams = Ui.lp(dp(24), dp(24)).also { it.leftMargin = dp(4) }
         head.setPadding(dp(4), dp(3), dp(6), dp(3))
         head.setBackgroundColor(Ui.bg)
         view.addView(head, Ui.lp(Ui.match, Ui.wrap))
@@ -256,8 +257,11 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         composer.setPadding(dp(10), dp(6), dp(10), dp(8))
         thinkingToggle = pill("Thinking") { toggleSetting("thinking") }
         autoToggle = pill("Auto-run") { toggleSetting("auto_approve_commands") }
+        val addContext = Ui.button(ctx, R.drawable.ic_at, "Add context", "Attach a file of this folder to the message") { addContextFile() }
+        val addSelection = Ui.button(ctx, R.drawable.ic_plus, "Selection", "Attach the text selected in the editor") { addSelection() }
         val spacerTop = View(ctx)
-        val top = Ui.row(ctx, spacerTop, thinkingToggle, autoToggle)
+        val top = Ui.row(ctx, addContext, addSelection, spacerTop, thinkingToggle, autoToggle)
+        addSelection.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = dp(4) }
         spacerTop.layoutParams = Ui.lp(0, 1, 1f)
         autoToggle.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = dp(6) }
         composer.addView(top, Ui.lp(Ui.match, Ui.wrap).also { it.bottomMargin = dp(6) })
@@ -277,16 +281,25 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         composer.addView(prompt, Ui.lp(Ui.match, Ui.wrap))
         modePill = pill("Agent ▾") { showModeMenu(it) }
         modelPill = pill("Default ▾") { showModelMenu(it) }
-        val image = Ui.button(ctx, "Image") { host.pickImage() }
-        val mic = Ui.button(ctx, "Mic") { host.dictate(prompt) }
-        send = Ui.button(ctx, "Send", primary = true) { sendOrStop() }
+        statsText = Ui.text(ctx, "", 11f, Ui.fg3)
+        val attach = Ui.miniButton(ctx, R.drawable.ic_attach, "Attach a file") { host.pickFile() }
+        val image = Ui.miniButton(ctx, R.drawable.ic_image, "Attach an image or a screenshot") { host.pickImage() }
+        val mic = Ui.miniButton(ctx, R.drawable.ic_microphone, "Dictate") { host.dictate(prompt) }
+        send = ImageButton(ctx)
+        send.setImageDrawable(Ui.icon(ctx, R.drawable.ic_send, Ui.onAccent))
+        send.background = Ui.rounded(Ui.accent, 17)
+        send.scaleType = ImageView.ScaleType.CENTER_INSIDE
+        send.setPadding(dp(8), dp(8), dp(8), dp(8))
+        send.tooltipText = "Send (Enter)"; send.contentDescription = "Send"
+        send.setOnClickListener { sendOrStop() }
         val spacer = View(ctx)
-        val bar = Ui.row(ctx, modePill, modelPill, spacer, image, mic, send)
+        val bar = Ui.row(ctx, modePill, modelPill, spacer, statsText, attach, image, mic, send)
         modelPill.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = dp(6) }
         modelPill.maxWidth = dp(150); modelPill.ellipsize = TextUtils.TruncateAt.MIDDLE
         spacer.layoutParams = Ui.lp(0, 1, 1f)
-        mic.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = dp(4) }
-        send.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = dp(6) }
+        statsText.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.rightMargin = dp(8) }
+        for (b in listOf(attach, image, mic)) b.layoutParams = Ui.lp(dp(28), dp(28)).also { it.leftMargin = dp(2) }
+        send.layoutParams = Ui.lp(dp(34), dp(34)).also { it.leftMargin = dp(8) }
         composer.addView(bar, Ui.lp(Ui.match, Ui.wrap).also { it.topMargin = dp(6) })
         view.addView(composer, Ui.lp(Ui.match, Ui.wrap))
         mode = prefs.getString("mode", "agent") ?: "agent"
@@ -527,6 +540,71 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     /** The list of past chats in this folder; opening one adds a tab. Also used by the window's Chats button. */
+    /** "@ Add context": a file of this folder goes into the message as a file attachment. */
+    private fun addContextFile() {
+        val input = Ui.input(ctx, "Type part of a file name")
+        val list = android.widget.ListView(ctx)
+        val items = ArrayList<String>()
+        val ad = android.widget.ArrayAdapter(ctx, android.R.layout.simple_list_item_1, items)
+        list.adapter = ad
+        val box = Ui.column(ctx, input, list); list.layoutParams = Ui.lp(Ui.match, dp(320))
+        val dialog = android.app.AlertDialog.Builder(ctx).setTitle("Add a file as context").setView(box).setNegativeButton("Close", null).create()
+        fun search(q: String) {
+            Api.async("files", { Api.get("/api/files", mapOf("q" to q)) }) { r, _ ->
+                items.clear()
+                val arr = r?.optJSONArray("files")
+                if (arr != null) for (i in 0 until minOf(arr.length(), 200)) items.add(arr.getString(i))
+                ad.notifyDataSetChanged()
+            }
+        }
+        input.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, n: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, n: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) { search(s.toString()) }
+        })
+        list.setOnItemClickListener { _, _, pos, _ ->
+            val path = items[pos]
+            if (attachments.none { it.optString("kind") == "file" && it.optString("path") == path }) addAttachment(JSONObject().put("kind", "file").put("path", path).put("name", path))
+            dialog.dismiss()
+        }
+        dialog.show(); search(""); input.requestFocus()
+    }
+
+    /** "+ Selection": the editor's selected text goes into the message. */
+    private fun addSelection() {
+        val sel = host.editorSelection()
+        if (sel == null) { Ui.toast(ctx, "Select some text in the editor first."); return }
+        attachments.removeAll { it.optString("kind") == "selection" }
+        addAttachment(sel)
+        prompt.requestFocus()
+    }
+
+    /** Writes the active chat as a Markdown file through the server (it lands in Documents/Forge/Chats). */
+    private fun exportChat() {
+        val t = active ?: return
+        Api.async("export", {
+            val s = Api.get("/api/session", mapOf("id" to t.id))
+            val sb = StringBuilder("# " + s.optString("title", "Chat") + "\n\n")
+            val tr = s.optJSONArray("transcript") ?: JSONArray()
+            for (i in 0 until tr.length()) {
+                val turn = tr.getJSONObject(i)
+                if (turn.optString("role") == "user") { sb.append("## You\n\n").append(turn.optString("text")).append("\n\n"); continue }
+                sb.append("## Forge\n\n")
+                val blocks = turn.optJSONArray("blocks") ?: JSONArray()
+                for (k in 0 until blocks.length()) {
+                    val b = blocks.getJSONObject(k)
+                    when (b.optString("type")) {
+                        "text" -> sb.append(b.optString("text")).append("\n\n")
+                        "thinking" -> sb.append("<details><summary>Thought process</summary>\n\n").append(b.optString("text")).append("\n\n</details>\n\n")
+                        "tool" -> sb.append("**Tool ").append(b.optString("name")).append("**\n\n```\n").append(b.optString("result").take(4000)).append("\n```\n\n")
+                        "status" -> sb.append("_").append(b.optString("text")).append("_\n\n")
+                    }
+                }
+            }
+            Api.post("/api/session/export", JSONObject().put("id", t.id).put("markdown", sb.toString()))
+        }) { r, e -> Ui.toast(ctx, if (r != null) "Exported to " + r.optString("path") else "Export failed: " + (e?.message ?: "")) }
+    }
+
     fun showHistory() {
         Api.async("history", { Api.get("/api/sessions") }) { r, e ->
             val list = r?.optJSONArray("sessions")
@@ -1106,7 +1184,8 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
 
     private fun refreshComposer() {
         val busy = active?.run != null
-        send.text = if (busy) "Stop" else "Send"
+        send.setImageDrawable(Ui.icon(ctx, if (busy) R.drawable.ic_stop else R.drawable.ic_send, Ui.onAccent))
+        send.tooltipText = if (busy) "Stop the reply (Escape)" else "Send (Enter)"
     }
 
     private fun stopActive() { val t = active ?: return; cancelRun(t) }
@@ -1333,7 +1412,14 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
                 // The server sends "end" after its own errors; a lost connection sends nothing more, so finish here.
                 if (ev.optString("message").startsWith("Connection to the Forge server was lost")) finishRun(R)
             }
-            "stats" -> R.turn.put("stats", ev)
+            "stats" -> {
+                R.turn.put("stats", ev)
+                val parts = ArrayList<String>()
+                if (ev.optDouble("gen_tps", 0.0) > 0) parts.add(String.format("%.1f tok/s", ev.optDouble("gen_tps")))
+                if (ev.optInt("context_estimate") > 0) parts.add("~" + ev.optInt("context_estimate") + " ctx")
+                statsText.text = parts.joinToString(" · ")
+            }
+            "verbose" -> host.agentLog(ev.optString("kind"), ev.optString("text"))
             "end" -> {
                 closeCurrent(R)
                 R.turn.optJSONObject("stats")?.let { R.msgEl.addView(statLine(it)) }

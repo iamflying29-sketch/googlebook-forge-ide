@@ -33,7 +33,7 @@ import org.json.JSONObject
  */
 class MainActivity : Activity() {
     companion object {
-        const val VERSION = "3.0"
+        const val VERSION = "3.1"
         private const val TAG = "Forge"
         private const val TERMINAL_PACKAGE = "com.android.virtualization.terminal"
         private const val PROBE_MS = 3000L
@@ -41,6 +41,7 @@ class MainActivity : Activity() {
         private const val INDEX_MS = 30000L
         private const val INDEX_BUSY_MS = 5000L
         private const val PICK_IMAGE = 42
+        private const val PICK_FILE = 44
         private const val REQ_MIC = 43
     }
 
@@ -188,7 +189,12 @@ class MainActivity : Activity() {
         val content = FrameLayout(this)
         panelViews.clear()
         panelViews.add(terminal.view)
-        panelViews.add(Chrome.placeholder(this, R.drawable.ic_notes, "Agent log", "The raw traffic between the agent and the model, and every tool call, will be listed here."))
+        val log = TextView(this)
+        log.typeface = android.graphics.Typeface.MONOSPACE; log.textSize = 11.5f; log.setTextColor(Ui.fg2); log.setTextIsSelectable(true)
+        log.setPadding(Ui.dp(this, 10), Ui.dp(this, 6), Ui.dp(this, 10), Ui.dp(this, 6))
+        log.text = "The raw traffic between the agent and the model, and every tool call, appears here while a reply runs.\n"
+        agentLogView = log
+        panelViews.add(Ui.scroll(this, log))
         panelViews.add(Chrome.placeholder(this, R.drawable.ic_close, "Problems", "Syntax checks after saves and agent edits will show up here, with a Fix with AI button."))
         for ((i, v) in panelViews.withIndex()) { content.addView(v, FrameLayout.LayoutParams(Ui.match, Ui.match)); v.visibility = if (i == 0) View.VISIBLE else View.GONE }
         panelTabs = Chrome.panelTabs(this, listOf("Terminal", "Agent log", "Problems")) { i -> selectPanel(i) }
@@ -464,10 +470,41 @@ class MainActivity : Activity() {
         try { startActivityForResult(Intent.createChooser(i, "Attach an image"), PICK_IMAGE) } catch (e: Exception) { Ui.toast(this, "No image picker available") }
     }
 
+    /** Any file as an attachment (the server reads text files for the model; images go to the vision model). */
+    fun pickFile() {
+        val i = Intent(Intent.ACTION_GET_CONTENT); i.type = "*/*"; i.addCategory(Intent.CATEGORY_OPENABLE)
+        try { startActivityForResult(Intent.createChooser(i, "Attach a file"), PICK_FILE) } catch (e: Exception) { Ui.toast(this, "No file picker available") }
+    }
+
+    /** The editor's selected text as a selection attachment, or null when nothing is selected. */
+    fun editorSelection(): JSONObject? {
+        val text = editor.selectionText()
+        if (text.isBlank()) return null
+        val path = editor.activePath()
+        val ext = path.substringAfterLast('.', "")
+        val lang = mapOf("kt" to "kotlin", "java" to "java", "py" to "python", "js" to "javascript", "ts" to "typescript", "json" to "json", "md" to "markdown",
+            "sh" to "bash", "c" to "c", "cpp" to "cpp", "h" to "c", "html" to "html", "css" to "css", "yml" to "yaml", "yaml" to "yaml", "rs" to "rust", "go" to "go")[ext] ?: ""
+        val lines = text.count { it == '\n' } + 1
+        return JSONObject().put("kind", "selection").put("path", path).put("text", text).put("start", 1).put("end", lines).put("language", lang)
+            .put("name", path.substringAfterLast('/') + " (selection)")
+    }
+
+    private var agentLogView: TextView? = null
+    private var agentLogLines = 0
+    /** The AGENT LOG tab: the raw traffic between the agent and the model, and every tool call. */
+    fun agentLog(kind: String, text: String) {
+        val v = agentLogView ?: return
+        val stamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        v.append("$stamp  $kind  $text\n")
+        agentLogLines++
+        if (agentLogLines > 500) { val t = v.text.toString(); val cut = t.indexOf('\n', t.length / 4); if (cut > 0) { v.text = t.substring(cut + 1); agentLogLines = v.text.count { it == '\n' } } }
+        (v.parent as? android.widget.ScrollView)?.post { (v.parent as android.widget.ScrollView).fullScroll(View.FOCUS_DOWN) }
+    }
+
     @Deprecated("Android's classic result callback is enough here")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != PICK_IMAGE || resultCode != RESULT_OK) return
+        if ((requestCode != PICK_IMAGE && requestCode != PICK_FILE) || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
         val name = uri.lastPathSegment?.substringAfterLast('/') ?: "image.png"
         Api.async("upload", {

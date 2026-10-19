@@ -42,9 +42,9 @@ class TerminalPanel(private val ctx: Context, private val host: MainActivity) {
         state = capsLabel("NOT CONNECTED", gray)
         // The bottom panel's tab strip already says TERMINAL, so the header shows only the connection state.
         head.addView(state, Ui.lp(0, Ui.wrap, 1f))
-        head.addView(smallButton("Clear") { terminal.clear() })
-        head.addView(smallButton("Reconnect") { reconnectDelayS = 3; connect() })
-        head.addView(smallButton("Hide") { host.toggleTerminal() })
+        head.addView(Ui.miniButton(ctx, R.drawable.ic_trash, "Clear the terminal") { terminal.clear() }.also { it.layoutParams = Ui.lp(Ui.dp(ctx, 24), Ui.dp(ctx, 24)).also { p -> p.leftMargin = Ui.dp(ctx, 4) } })
+        head.addView(Ui.miniButton(ctx, R.drawable.ic_refresh, "Reconnect the shell") { reconnectDelayS = 3; connect() }.also { it.layoutParams = Ui.lp(Ui.dp(ctx, 24), Ui.dp(ctx, 24)).also { p -> p.leftMargin = Ui.dp(ctx, 4) } })
+        head.addView(Ui.miniButton(ctx, R.drawable.ic_chevron_down, "Hide the panel (Ctrl J)") { host.toggleTerminal() }.also { it.layoutParams = Ui.lp(Ui.dp(ctx, 24), Ui.dp(ctx, 24)).also { p -> p.leftMargin = Ui.dp(ctx, 4) } })
         view.addView(head, Ui.lp(Ui.match, Ui.dp(ctx, 34)))
         view.addView(Ui.divider(ctx, vertical = false))
 
