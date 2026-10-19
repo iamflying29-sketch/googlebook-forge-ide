@@ -852,6 +852,11 @@
         palItems = r.files.map((f) => ({ label: f, hint: '', file: true, run: () => openFile(f) }));
         if (!q) palItems = [...Forge.tabOrder.slice().reverse().map((f) => ({ label: f, hint: 'open', file: true, run: () => openFile(f) })), ...palItems.filter((p) => !Forge.files.has(p.label))];
       } catch (e) { palItems = []; }
+      // Plain words find commands too (the > prefix is still the full command list), so "settings" or "new chat" work
+      // without knowing the prefix; and an empty folder says so instead of showing nothing.
+      const needle = q.trim().toLowerCase();
+      if (needle) palItems.push(...COMMANDS.filter((c) => c.label.toLowerCase().includes(needle)).slice(0, 12).map((c) => ({ label: c.label, hint: c.hint ? c.hint + ' · command' : 'command', run: c.run })));
+      else if (!palItems.length) palItems.push({ label: 'This folder has no files yet. Type > to see the commands, or a file name once there are files.', hint: '', run: () => openPalette('>') });
     }
     palSel = 0;
     renderPalette();

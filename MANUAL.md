@@ -33,6 +33,7 @@ forge-ide open DIR    makes DIR the folder for new windows
 
 Every Forge window has its own folder, like a window in Cursor. The folder name is shown in the title bar and in the taskbar.
 
+- **The search bar** (Ctrl P) finds files of this folder by name; a plain word also finds commands that match it, > lists every command, : goes to a line, and a path starting with / or ~ opens a file or folder anywhere. In a folder without files it says so.
 - **Open folder** (Ctrl O, or click the folder name) switches this window to another folder. **New window** (Ctrl Shift N, or the button next to the folder name) opens another window. The Open folder dialog has a New window button, and every recent folder has a ↗ that opens it in a new window.
 - Each folder keeps its own chats, AI Changes, open files, explorer state, project rules, memories and folder settings. The terminal of a window starts in its folder.
 - A message that failed (the server refused it, or the run stopped with an error) gets a Retry button that sends the same message again with its attachments and mode; a refused message is replaced, a run that failed partway keeps what came back and the new attempt follows below.

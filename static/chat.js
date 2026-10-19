@@ -339,7 +339,19 @@
     }
     render() {
       this.pane.innerHTML = '';
-      for (const t of this.transcript) this.pane.append(t.role === 'user' ? renderUser(this, t) : renderAssistant(t));
+      for (let k = 0; k < this.transcript.length; k++) {
+        const t = this.transcript[k];
+        if (t.role === 'user') { this.pane.append(renderUser(this, t)); continue; }
+        const m = renderAssistant(t);
+        // A saved attempt that failed before any answer gets a Retry button too (the message it belongs to is just above).
+        const prev = this.transcript[k - 1];
+        const failed = (t.blocks || []).some((b) => b.type === 'status' && b.error) && !(t.blocks || []).some((b) => b.type === 'text' || b.type === 'tool');
+        if (failed && prev && prev.role === 'user' && k === this.transcript.length - 1) {
+          const tab = this, item = { text: prev.text, attachments: prev.attachments || [], mode: t.mode || $('#mode-select').value };
+          m.append(retryButton(tab, item, () => { tab.transcript.splice(k - 1, 2); m.previousSibling && m.previousSibling.remove(); m.remove(); }));
+        }
+        this.pane.append(m);
+      }
     }
   }
   const tabsKey = () => 'forge.tabs.' + F.folder;
