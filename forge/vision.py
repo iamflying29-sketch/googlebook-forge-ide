@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from .images import VISION_PROMPT, ImageStore, run_ocr, sniff
+from .images import VISION_PROMPT, ImageStore, run_ocr, sniff, vision_payload
 from .llamacpp_client import LlamaCppClient
 from .ollama_client import OllamaError
 
@@ -31,9 +31,9 @@ HOST_MEM_FOR_CPU_VISION_MB = 5000 # the VM borrows from the host: 2.5 GB for the
 # that; the crash of 2026-10-14 happened below it). Measured visible drop while reading a screenshot: about 1.1 GB.
 TIERS = [
     {"name": "Qwen3-VL 4B", "model": "Qwen3VL-4B-Instruct-Q4_K_M.gguf", "mmproj": "mmproj-Qwen3VL-4B-Instruct-F16.gguf",
-     "need_mb": 3600, "ctx": 4096, "image_max_tokens": 1280},
+     "need_mb": 3600, "ctx": 4096, "image_max_tokens": 1024},
     {"name": "Qwen3-VL 2B", "model": "Qwen3VL-2B-Instruct-Q4_K_M.gguf", "mmproj": "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
-     "need_mb": 3500, "ctx": 4096, "image_max_tokens": 1280},
+     "need_mb": 3500, "ctx": 4096, "image_max_tokens": 1024},
 ]
 
 
@@ -114,7 +114,9 @@ class VisionManager:
         st = self.st
         return {"want": self.want(), "idle_stop_s": IDLE_STOP_S, "tiers": self.tiers(), "port": VISION_PORT,
                 "host_ip": st.host_ip(), "api_key": st.settings.get("gpu_engine_key", ""),
-                "file_url": "/api/engine/vision_file?name=", "engine_start": st.engine_start_due(report)}
+                "file_url": "/api/engine/vision_file?name=", "engine_start": st.engine_start_due(report),
+                "pool_credit_percent": int(st.settings.get("gpu_pool_credit", 0) or 0),
+                "vision_extra_args": str(st.settings.get("vision_extra_args", "") or "")}
 
     def report(self, data: Dict[str, Any]) -> None:
         self.app = {**self.app, **data}
@@ -191,10 +193,10 @@ class VisionManager:
             return None
         if self.app.get("vtier"):
             self._label = f"{self.app.get('vtier')} (Intel GPU)"
-        with open(path, "rb") as fh:
-            b64 = base64.b64encode(fh.read()).decode()
+        payload, pmime = vision_payload(path, mime)
+        b64 = base64.b64encode(payload).decode()
         messages = [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            {"type": "image_url", "image_url": {"url": f"data:{pmime};base64,{b64}"}},
             {"type": "text", "text": question}]}]
         ev("model_activity", model="vision", state="looking", label=self._label,
            detail="Looking at the image (it turns the picture into up to 1,280 image tokens, then reads the question).")
@@ -256,8 +258,8 @@ class VisionManager:
         self._label = f"{model} (CPU)"
         ev("model_activity", model="vision", state="loading", label=self._label,
            detail="Loading the CPU vision model in the Linux VM (it is unloaded again right after this look).")
-        with open(path, "rb") as fh:
-            b64 = base64.b64encode(fh.read()).decode()
+        payload, _pmime = vision_payload(path, mime)
+        b64 = base64.b64encode(payload).decode()
         t0 = time.time()
         parts: List[str] = []
         try:
@@ -326,16 +328,26 @@ class VisionManager:
                detail="This image was already described earlier, so the saved answer is reused.")
             return {**cached, "cached": True}
         out = dict(cached)
+        ocr_thread = None
         if "ocr" not in out:
+            # Text recognition runs on the VM's CPU while the vision model loads and looks on the Intel GPU; the two
+            # do not share anything, so running them at the same time hides the 10 to 15 seconds of text recognition.
             ev("model_activity", model="ocr", state="working", label="Text recognition (tesseract)",
-               detail="Reading every word in the image.")
+               detail="Reading every word in the image (alongside the vision model).")
             t0 = time.time()
-            out["ocr"] = run_ocr(path)
-            ev("model_activity", model="ocr", state="done", label="Text recognition (tesseract)",
-               detail=(f"Found {len(out['ocr'])} characters of text" if out["ocr"] else "Found no text") + f" in {time.time() - t0:.1f} s.")
+            def _ocr():
+                out["ocr"] = run_ocr(path)
+                ev("model_activity", model="ocr", state="done", label="Text recognition (tesseract)",
+                   detail=(f"Found {len(out['ocr'])} characters of text" if out["ocr"] else "Found no text") + f" in {time.time() - t0:.1f} s.")
+            ocr_thread = threading.Thread(target=_ocr, name="forge-ocr", daemon=True)
+            ocr_thread.start()
         if not out.get("description"):
             desc, source = self.ask(path, mime, VISION_PROMPT, settings, emit, ev)
             out["description"], out["source"] = desc, source
+        if ocr_thread is not None:
+            ocr_thread.join(timeout=90)
+            if "ocr" not in out:
+                out["ocr"] = ""
         self.images.save_analysis(img_id, out)
         return out
 

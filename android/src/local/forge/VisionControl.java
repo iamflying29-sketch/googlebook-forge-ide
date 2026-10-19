@@ -82,9 +82,11 @@ public final class VisionControl {
             }
             JSONObject pick = null;
             String why = null;
+            GpuBudget.poolCreditPercent = cfg.optLong("pool_credit_percent", 0);
             for (int i = 0; i < tiers.length(); i++) {
                 JSONObject t = tiers.getJSONObject(i);
                 why = GpuBudget.check(ctx, t.optLong("need_mb", 3000));
+                log("tier " + t.optString("name") + ": " + (why == null ? "fits" : why) + " (" + GpuBudget.describe(ctx) + ")");
                 if (why == null) { pick = t; break; }
             }
             if (pick == null) {
@@ -111,11 +113,12 @@ public final class VisionControl {
             cmd.add("-c"); cmd.add(String.valueOf(pick.optInt("ctx", 4096)));
             cmd.add("-np"); cmd.add("1");
             cmd.add("-t"); cmd.add("4");
-            cmd.add("-fa"); cmd.add("on");
             cmd.add("-ctk"); cmd.add("q8_0");
             cmd.add("-ctv"); cmd.add("q8_0");
             cmd.add("--image-max-tokens"); cmd.add(String.valueOf(pick.optInt("image_max_tokens", 1024)));
             cmd.add("--no-webui");
+            // Flags from the IDE's "Vision model: extra llama-server flags" setting (flash attention off by default).
+            for (String extra : cfg.optString("vision_extra_args", "-fa off").trim().split("\\s+")) if (!extra.isEmpty()) cmd.add(extra);
             String key = cfg.optString("api_key", "");
             if (!key.isEmpty()) { cmd.add("--api-key"); cmd.add(key); }
             vstate = "starting"; vdetail = "loading " + vtier + " on the Intel GPU";
@@ -131,6 +134,7 @@ public final class VisionControl {
             // The vision server is reclaimed before the main engine (900) and long before the Linux VM (0).
             int pid = pidOf(p);
             try (FileOutputStream adj = new FileOutputStream("/proc/" + pid + "/oom_score_adj")) { adj.write("950".getBytes()); } catch (Exception e) { log("oom_score_adj not set: " + e.getMessage()); }
+            EngineService.memoryGuard(ctx, p, "vision server");
             try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
                 String line;
                 while ((line = r.readLine()) != null) {

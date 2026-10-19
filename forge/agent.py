@@ -18,7 +18,9 @@ from .tools import NEEDS_APPROVAL, TOOL_NAMES, Workspace, is_dangerous_command, 
 
 READ_ONLY_TOOLS = {"read_file", "list_dir", "find_files", "search", "web_fetch", "web_search", "codebase_search", "ask_user",
                    "look_at_image", "todo_write", "docs_search", "remember"}
-TAGS = ("<thinking>", "</thinking>", "<tool_call>", "</tool_call>")
+# The tool call tag is Forge's own name on purpose: Ollama's parsers for Qwen models intercept "<tool_call>" in the
+# model's output, try to read it as Qwen's XML format and drop the reply when that fails (seen 2026-10-19).
+TAGS = ("<thinking>", "</thinking>", "<forge_tool>", "</forge_tool>")
 
 
 # ---------------------------------------------------------------------- stream segmenter
@@ -64,14 +66,14 @@ def segment(text: str) -> Tuple[List[Dict[str, str]], bool]:
                 mode = "thinking"
             elif matched == "</thinking>":
                 mode = "text"
-            elif matched == "<tool_call>":
+            elif matched == "<forge_tool>":
                 if mode == "tool_call":
                     # A second opening tag before the first closed: keep the first call only.
                     i += len(matched)
                     continue
                 mode = "tool_call"
                 segs.append({"type": "tool_call", "text": ""})
-            elif matched == "</tool_call>":
+            elif matched == "</forge_tool>":
                 closed = True
                 mode = "text"
             i += len(matched)
@@ -167,7 +169,7 @@ def _unwrap_block(s: str) -> str:
 
 
 def parse_tool_call(raw: str) -> Tuple[Optional[dict], Optional[str]]:
-    """Parse the text inside <tool_call>...</tool_call>. Returns (call, error)."""
+    """Parse the text inside <forge_tool>...</forge_tool>. Returns (call, error)."""
     body = raw.strip()
     if not body:
         return None, "empty tool call"
@@ -292,6 +294,17 @@ class Run:
 
 
 # ---------------------------------------------------------------------- the agent
+def _visible_text(text: str) -> str:
+    """The reply without its thinking blocks (what the user would see as the answer)."""
+    return re.sub(r"<thinking>.*?(</thinking>|$)", "", text or "", flags=re.S)
+
+
+def _thinking_family(model: str) -> bool:
+    """Model families whose chat template thinks by default and accept Ollama's think switch."""
+    m = (model or "").lower()
+    return any(m.startswith(p) for p in ("qwen3.5", "qwen3:", "qwen3-", "deepseek-r1", "gpt-oss", "magistral", "gemma4", "gemma-4"))
+
+
 class Agent:
     def __init__(self, client: OllamaClient, workspace: Workspace, settings: dict, session: dict):
         self.client = client
@@ -312,7 +325,7 @@ class Agent:
             "top_k": int(s.get("top_k", 40)),
             "repeat_penalty": float(s.get("repeat_penalty", 1.05)),
             "num_predict": int(s.get("num_predict", 3072)),
-            "stop": ["</tool_call>", "<|eot_id|>", "<|start_header_id|>"],
+            "stop": ["</forge_tool>", "<|eot_id|>", "<|start_header_id|>"],
         }
         if s.get("num_thread"):
             opts["num_thread"] = int(s["num_thread"])
@@ -523,6 +536,7 @@ class Agent:
         run.emit("verbose", kind="request", text=f"model={model} mode={mode} tool_mode={'native' if native else 'prompt'} "
                                                 f"messages={len(msgs)} system_chars={len(system)} options={json.dumps(self._options())}")
         iterations = 0
+        nudged = False
         while True:
             if run.cancel.is_set():
                 run.emit("status", text="Stopped by user.")
@@ -544,6 +558,14 @@ class Agent:
                 run.emit("stats", **stats)
             if tool_call is None:
                 msgs.append({"role": "assistant", "content": assistant_text})
+                # Some models (Qwen3.5 among them) end their reply right after the thought process without acting.
+                # One nudge, with the cached prompt, gets the step they decided on; a second empty reply ends the turn.
+                if not nudged and mode != "ask" and not _visible_text(assistant_text).strip():
+                    nudged = True
+                    run.emit("status", text="The model stopped after its thought process; asking it to carry out the step it decided on.")
+                    msgs.append({"role": "user", "content": "Continue with the step you decided on: exactly one tool call, or the final "
+                                                            "answer in Markdown. Do not write another thinking block."})
+                    continue
                 run.emit("turn_done", iterations=iterations)
                 run.finish("done")
                 return
@@ -754,7 +776,9 @@ class Agent:
         chunks = 0
         last_kind = None
         last_progress = time.monotonic()
-        for obj in self.client.chat_stream(model, msgs, options=options, tools=tools, cancel=run.cancel,
+        # Ollama: a model with a built-in thinking mode gets it switched off (Forge keeps its own short thought process).
+        extra = {"think": False} if (not hasattr(self.client, "wait_ready") and _thinking_family(model)) else {}
+        for obj in self.client.chat_stream(model, msgs, options=options, tools=tools, cancel=run.cancel, **extra,
                                            keep_alive=str(self.settings.get("keep_alive", "30m"))):
             last_obj = obj
             if (obj.get("message") or {}).get("content"):
@@ -839,7 +863,7 @@ class Agent:
             tool_call = native_calls[0]
             run.emit("verbose", kind="raw_tool_call", text=json.dumps(tool_call)[:4000])
         elif raw_call is not None:
-            full_final = full + "</tool_call>" if not full.rstrip().endswith("</tool_call>") else full
+            full_final = full + "</forge_tool>" if not full.rstrip().endswith("</forge_tool>") else full
             call, err = parse_tool_call(raw_call)
             run.emit("verbose", kind="raw_tool_call", text=raw_call[:4000])
             if call is None:
@@ -902,7 +926,7 @@ class Agent:
         args = dict(call.get("arguments") or {})
         if name == "__parse_error__":
             return ("ERROR: your tool call could not be parsed (" + str(args.get("error")) + "). Write exactly one "
-                    "<tool_call> block containing a JSON object with \"name\" and \"arguments\", and put long code in "
+                    "<forge_tool> block containing a JSON object with \"name\" and \"arguments\", and put long code in "
                     "<content>, <old_text> or <new_text> blocks.")
         call_id = uuid.uuid4().hex[:8]
         run.emit("tool_call", call_id=call_id, name=name, arguments=self._display_args(args))

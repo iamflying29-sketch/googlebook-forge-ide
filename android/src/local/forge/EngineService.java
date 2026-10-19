@@ -55,6 +55,10 @@ public class EngineService extends Service {
     private Process proc;
     private Thread worker;
     private volatile boolean stopping = false;
+    /** Extra llama-server flags from the IDE's settings were used for the current launch; if the engine exits within
+     *  30 seconds with them, it is started once more without them (a refused flag must never leave the engine dead). */
+    private volatile boolean extraUsed = false, plainRetry = false, relaunching = false;
+    private volatile long launchedAt = 0;
 
     // ------------------------------------------------------------ public status for the bridge
     public static JSONObject status(Context ctx) {
@@ -78,10 +82,15 @@ public class EngineService extends Service {
         return o;
     }
 
-    public static String logTail() {
+    public static String logTail() { return logTail(0); }
+
+    /** The last n log lines (all of them when n is 0). */
+    public static String logTail(int n) {
         synchronized (logLines) {
             StringBuilder sb = new StringBuilder();
-            for (String l : logLines) sb.append(l).append('\n');
+            int skip = n > 0 ? Math.max(0, logLines.size() - n) : 0;
+            int i = 0;
+            for (String l : logLines) { if (i++ >= skip) sb.append(l).append('\n'); }
             return sb.toString();
         }
     }
@@ -184,6 +193,7 @@ public class EngineService extends Service {
             File bin = new File(getApplicationInfo().nativeLibraryDir, "libllama-server.so");
             if (!bin.exists()) throw new Exception("Engine binary missing from this build of the app.");
             long needMb = size / (1024 * 1024) + 1200;   // weights + KV cache + compute buffers + margin
+            GpuBudget.poolCreditPercent = cfg.optLong("pool_credit_percent", 0);
             // The free-memory check (GpuBudget), never bypassed. Ask the VM to hand memory back while waiting.
             String why = GpuBudget.check(this, needMb);
             for (int attempt = 0; why != null && attempt < 120 && !stopping; attempt++) {
@@ -196,7 +206,7 @@ public class EngineService extends Service {
             if (why != null) {
                 throw new Exception("Not enough free memory on the Googlebook for the engine (" + why + "). Close other apps and try again.");
             }
-            log("memory check passed: " + GpuBudget.effectiveMb(this) + " MB usable, " + needMb + " MB needed");
+            log("memory check passed: " + GpuBudget.describe(this) + ", " + needMb + " MB needed");
             state = "starting";
             notifyText("Loading the model on the GPU…");
             int ctx = cfg.optInt("ctx", 8192);
@@ -217,8 +227,15 @@ public class EngineService extends Service {
             cmd.add("-ctk"); cmd.add("q8_0");
             cmd.add("-ctv"); cmd.add("q8_0");
             cmd.add("--no-webui");
-            cmd.add("--no-warmup");
             cmd.add("--metrics");
+            // The prompt cache survives a changed byte in the middle of the prompt (chunks after it are shifted into
+            // place) and the whole cached prompt can be saved to disk before a pause and restored after it.
+            cmd.add("--cache-reuse"); cmd.add("256");
+            File slots = new File(getCacheDir(), "slots");
+            slots.mkdirs();
+            cmd.add("--slot-save-path"); cmd.add(slots.getAbsolutePath());
+            extraUsed = false;
+            if (!plainRetry) for (String extra : cfg.optString("extra_args", "").trim().split("\\s+")) if (!extra.isEmpty()) { cmd.add(extra); extraUsed = true; }
             if (!key.isEmpty()) { cmd.add("--api-key"); cmd.add(key); }
             log("launch: " + String.join(" ", cmd).replace(key, "<key>"));
             ProcessBuilder pb = new ProcessBuilder(cmd);
@@ -227,10 +244,13 @@ public class EngineService extends Service {
             pb.environment().put("TMPDIR", getCacheDir().getAbsolutePath());
             pb.environment().put("LLAMA_CACHE", getCacheDir().getAbsolutePath());
             GpuBudget.beforeStart(this, "engine");
+            relaunching = false;
+            launchedAt = System.currentTimeMillis();
             proc = pb.start();
             // Make the engine the first thing the system reclaims under memory pressure, never the VM.
             int epid = pidOf(proc);
             try (FileOutputStream adj = new FileOutputStream("/proc/" + epid + "/oom_score_adj")) { adj.write("900".getBytes()); log("engine pid " + epid + " marked oom_score_adj 900"); } catch (Exception e) { log("oom_score_adj not set for pid " + epid + ": " + e.getMessage()); }
+            memoryGuard(this, proc, "engine");
             try (BufferedReader r = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
                 String line;
                 while ((line = r.readLine()) != null) {
@@ -249,6 +269,13 @@ public class EngineService extends Service {
                 detail = "Paused while the vision model reads an image";
                 notifyText(detail);
                 postStats("paused");
+            } else if (!stopping && code != 0 && extraUsed && !plainRetry && System.currentTimeMillis() - launchedAt < 30000) {
+                plainRetry = true;
+                relaunching = true;
+                log("the engine exited with code " + code + " within 30 s of a launch with the extra flags; starting it again without them");
+                state = "starting";
+                worker = new Thread(this::run, "forge-engine");
+                worker.start();
             } else if (!stopping) {
                 state = "error";
                 detail = "Engine exited with code " + code + ". See the engine log.";
@@ -264,12 +291,38 @@ public class EngineService extends Service {
             log("ERROR: " + detail);
             notifyText(detail);
         } finally {
-            proc = null;
-            if (!"paused".equals(state)) {
+            if (!relaunching) proc = null;
+            if (!"paused".equals(state) && !relaunching) {
                 stopForeground(STOP_FOREGROUND_DETACH);
                 if (!"error".equals(state)) stopSelf();
             }
         }
+    }
+
+    /** The memory guard: while a Forge GPU process runs, visible free memory is read every two seconds; when it
+     *  falls under GpuBudget.GUARD_FLOOR_MB or Android reports low memory, the process is stopped at once. The Linux
+     *  VM (the Terminal app) must never be the one that Android reclaims. A stop here also withdraws the driver pool
+     *  credit for 15 minutes. */
+    static void memoryGuard(Context ctx, Process p, String who) {
+        Thread t = new Thread(() -> {
+            int low = 0;
+            while (p.isAlive()) {
+                try { Thread.sleep(2000); } catch (InterruptedException e) { return; }
+                long avail = memAvailableMb();
+                boolean lowFlag = GpuBudget.lowMemory(ctx);
+                if ((avail >= 0 && avail < GpuBudget.GUARD_FLOOR_MB) || lowFlag) low++; else low = 0;
+                if (low >= 2) {
+                    log("memory guard: stopping the " + who + " (visible free memory " + avail + " MB" + (lowFlag ? ", Android reports low memory" : "") + ")");
+                    GpuBudget.guardStopped(ctx);
+                    if ("engine".equals(who) && instance != null) instance.detail = "Stopped by the memory guard: only " + avail + " MB free on the Googlebook. Close other apps; Forge starts it again when there is room.";
+                    p.destroy();
+                    try { if (!p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly(); } catch (InterruptedException ignored) { }
+                    return;
+                }
+            }
+        }, "forge-memory-guard-" + who);
+        t.setDaemon(true);
+        t.start();
     }
 
     /** Android's Process has no pid() method; its implementation keeps the pid in a private field. */
@@ -286,7 +339,10 @@ public class EngineService extends Service {
                 HttpURLConnection c = (HttpURLConnection) u.openConnection();
                 c.setRequestMethod("POST"); c.setDoOutput(true); c.setConnectTimeout(3000); c.setReadTimeout(3000);
                 c.setRequestProperty("Content-Type", "application/json");
-                c.getOutputStream().write(("{\"event\":\"" + what + "\",\"state\":\"" + state + "\"}").getBytes());
+                org.json.JSONObject o = new org.json.JSONObject();
+                o.put("event", what); o.put("state", state); o.put("detail", detail); o.put("log", logTail(40));
+                o.put("host_mem_mb", memAvailableMb()); o.put("budget", GpuBudget.describe(this));
+                c.getOutputStream().write(o.toString().getBytes());
                 c.getResponseCode(); c.disconnect();
             } catch (Exception ignored) { }
         }).start();

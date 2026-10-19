@@ -392,7 +392,7 @@ def chat_context(session: dict, max_chars: int = 8000) -> str:
         if role not in ("user", "assistant"):
             continue
         text = re.sub(r"(?s)<thinking>.*?</thinking>", "", m.get("content", ""))
-        text = re.sub(r"(?s)<tool_call>.*?(</tool_call>|$)", "[tool call]", text).strip()
+        text = re.sub(r"(?s)<(?:tool_call|forge_tool)>.*?(</(?:tool_call|forge_tool)>|$)", "[tool call]", text).strip()
         text = text.split("\n\n## Attached context")[0]
         if text:
             parts.append(f"{role.upper()}: {text[:2000]}")

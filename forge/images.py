@@ -106,6 +106,40 @@ class ImageStore:
         os.replace(tmp, p)
 
 
+VISION_MAX_SIDE = 1280
+
+
+def vision_payload(path: str, mime: str, max_side: int = VISION_MAX_SIDE) -> tuple:
+    """The bytes a vision model gets for an image: the picture scaled down so its longer side is at most max_side
+    pixels and saved as JPEG. Qwen3-VL turns every 32 by 32 pixel square into one token, so a 2880 by 1800
+    screenshot would be 5,000 tokens before the model's own cap, and the encoder's time grows with the pixels it
+    has to shrink; at 1280 by 800 it is 1,000 tokens, which still shows every line of text on a laptop screen.
+    Text recognition keeps using the original file. Returns (bytes, mime); the original when it is small already
+    or when Pillow is missing."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return b"", mime
+    size = image_size(raw)
+    if size and max(size) <= max_side and len(raw) <= 600 * 1024:
+        return raw, mime
+    try:
+        from PIL import Image
+        import io
+        with Image.open(io.BytesIO(raw)) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            scale = min(1.0, max_side / float(max(w, h)))
+            if scale < 1.0:
+                im = im.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+            out = io.BytesIO()
+            im.save(out, format="JPEG", quality=88, optimize=True)
+            return out.getvalue(), "image/jpeg"
+    except Exception:  # noqa: BLE001  (an odd format: send it as it is)
+        return raw, mime
+
+
 def run_ocr(path: str, timeout: float = 60.0) -> str:
     if not shutil.which("tesseract"):
         return ""

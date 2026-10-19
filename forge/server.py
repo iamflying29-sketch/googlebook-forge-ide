@@ -68,6 +68,16 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "prewarm": True,
     "vd_updates": "check",   # virtual device images: "check" daily, "install" also installs, "install-move" also moves devices, "off"
     "gpu_autostart": True,   # the Forge app starts the GPU engine by itself when the engine is chosen and not running (memory rules apply)
+    # Extra llama-server flags for the GPU engine (the app drops them and starts again plainly if the engine refuses them):
+    # a 1 GB cap on the server's own prompt cache in RAM, one unified KV cache, and draft-free speculative decoding
+    # (ngram-mod guesses the next tokens from text the model has already produced; code and file contents repeat).
+    "gpu_extra_args": "--jinja --cache-ram 1024 --kv-unified --spec-type ngram-mod --spec-ngram-mod-n-min 16 --spec-ngram-mod-n-max 32",
+    # Percent of the graphics driver's held memory (freed by Forge's own earlier GPU processes, invisible to Android's
+    # free-memory figure) that the app's free-memory check may count. 0 keeps the check on visible free memory only.
+    "gpu_pool_credit": 0,
+    # Extra llama-server flags for the vision model's server. Flash attention inside the image encoder is the slow
+    # path on Vulkan (llama.cpp issue 17012: minutes instead of seconds on integrated GPUs), so it is off by default.
+    "vision_extra_args": "-fa off",
     "font_size": 13,
     "theme": "forge-dark",
     "workspace": os.path.expanduser("~/projects"),
@@ -155,7 +165,7 @@ class State:
                                          self.settings["gpu_engine_key"])
         self.engine_stats: Dict[str, Any] = {}
         self.engine_start_sent = 0.0     # when the app was last told to start the GPU engine by itself
-        self._need_mb, self._need_mb_ts = 0, 0.0   # cached engine_need_mb()
+        self._need_mb, self._need_mb_ts, self._need_mb_for = 0, 0.0, ""   # cached engine_need_mb() and its model
         self.checkpoints = Checkpoints(os.path.join(DATA_DIR, "checkpoints"))
         self.vision = VisionManager(self, DATA_DIR)
         self.attachments = Attachments(os.path.join(DATA_DIR, "attachments"))
@@ -442,7 +452,7 @@ class State:
             host = float(report.get("host_mem_mb", -1))
         except (TypeError, ValueError):
             host = -1
-        if host < self.ENGINE_START_NEED_MB:
+        if host < self.engine_need_mb():
             return False
         if self.gpu_client.alive():
             return False
@@ -459,8 +469,9 @@ class State:
         """What the app's own free-memory check asks for before launching the engine: the weights plus 1200 MB for the
         KV cache, compute buffers and margin (the same sum EngineService uses). Cached, locating the blob asks Ollama."""
         now = time.time()
-        if now - self._need_mb_ts > 600:
-            self._need_mb_ts = now
+        name = str(self.settings.get("gpu_model") or "forge-coder")
+        if now - self._need_mb_ts > 600 or name != self._need_mb_for:
+            self._need_mb_ts, self._need_mb_for = now, name
             try:
                 mf = self.gpu_model_file()
                 if mf and mf.get("size"):
@@ -507,26 +518,39 @@ class State:
             return None
         return self.memory_block_reason_ollama(model)
 
+    def model_need_mb(self, model: Optional[str] = None) -> int:
+        """Free memory a CPU model needs to load: its file size plus 900 MB for the KV cache and buffers (the 4.9 GB
+        Llama 3.1 build comes out at the 5800 MB that was measured; a 3.3 GB Qwen3.5 4B needs about 4200 MB)."""
+        name = self.resolve_model(model) if model else self.resolve_model(self.settings.get("model"))
+        try:
+            for mm in self.ollama.list_models():
+                if mm.get("name") in (name, f"{name}:latest") and mm.get("size"):
+                    return max(2500, int(mm["size"]) // (1024 * 1024) + 900)
+        except Exception:  # noqa: BLE001  (Ollama not answering: assume the big model)
+            pass
+        return MODEL_LOAD_NEED_MB
+
     def memory_block_reason_ollama(self, model: Optional[str] = None) -> Optional[str]:
         if self.model_loaded(model):
             return None
+        need = self.model_need_mb(model)
         m = mem_info()
         # The VM's memory comes from the Googlebook: when the Forge app reports the host's free memory, check it too.
         host = self.vision.app.get("host_mem_mb") if time.time() - self.vision.app_seen < 60 else None
-        if isinstance(host, (int, float)) and 0 <= host < MODEL_LOAD_NEED_MB:
+        if isinstance(host, (int, float)) and 0 <= host < need:
             return (f"Not enough free memory on the Googlebook to load the model in the VM: {int(host)} MB free, about "
-                    f"{MODEL_LOAD_NEED_MB} MB needed. Close other apps or stop the GPU engine, then try again.")
+                    f"{need} MB needed. Close other apps or stop the GPU engine, then try again.")
         try:
             other = [x.get("name") for x in self.ollama.running()]
         except OllamaError:
             other = []
-        if other and m["available_mb"] and m["available_mb"] < MODEL_LOAD_NEED_MB:
+        if other and m["available_mb"] and m["available_mb"] < need:
             return (f"Another model is loaded ({', '.join(other)}), and there is not enough memory for a second one. "
                     f"Unload it with the command palette (Unload the model from memory), or use the same model in "
                     f"this folder's settings, then try again.")
-        if m["available_mb"] and m["available_mb"] < MODEL_LOAD_NEED_MB:
+        if m["available_mb"] and m["available_mb"] < need:
             return (f"Not enough free memory to load the model safely: {m['available_mb']} MB available, about "
-                    f"{MODEL_LOAD_NEED_MB} MB needed. Close other programs in the Linux VM (Waydroid, big builds, other "
+                    f"{need} MB needed. Close other programs in the Linux VM (Waydroid, big builds, other "
                     f"models) and try again. This guard exists because an overfull VM gets killed by GooglebookOS.")
         return None
 
@@ -1057,6 +1081,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"host_ip": st.host_ip(), "port": int(st.settings.get("gpu_engine_port", 8081)),
                                     "api_key": st.settings.get("gpu_engine_key", ""), "ctx": int(st.settings.get("gpu_ctx", 8192)),
                                     "gpu_layers": int(st.settings.get("gpu_layers", 99)),
+                                    "extra_args": str(st.settings.get("gpu_extra_args", "") or ""),
+                                    "pool_credit_percent": int(st.settings.get("gpu_pool_credit", 0) or 0),
                                     "model": None if not mf else {"filename": mf["filename"], "size": mf["size"], "digest": mf["digest"],
                                                                   "download": "/api/engine/model"}})
         if path == "/api/engine/model":

@@ -128,7 +128,10 @@ class LlamaCppClient:
                     tools: Optional[list] = None, keep_alive: str = "", cancel: Optional[threading.Event] = None) -> Iterator[dict]:
         """Stream a chat completion; yields Ollama-shaped chunks: {"message": {"content": ...}, "done": bool, ...}."""
         body = {"model": model or "gpu-model", "messages": [{"role": m["role"], "content": m.get("content", "")} for m in messages],
-                "stream": True, "stream_options": {"include_usage": True}, "cache_prompt": True, "timings_per_token": False}
+                "stream": True, "stream_options": {"include_usage": True}, "cache_prompt": True, "timings_per_token": False,
+                # Models with a built-in thinking mode (Qwen3.5, Gemma 4) would otherwise think at length before every
+                # reply; Forge keeps its own short "thought process" in the prompt instead. Llama 3.1 ignores this.
+                "chat_template_kwargs": {"enable_thinking": False}}
         body.update(self._options_to_body(options))
         conn = self._conn(300.0)
         started = time.monotonic()
