@@ -30,10 +30,12 @@ HOST_MEM_FOR_CPU_VISION_MB = 5000 # the VM borrows from the host: 2.5 GB for the
 # Googlebook's history: after any GPU load at least 2.5 GB must stay free (Llama's engine ran stably for hours above
 # that; the crash of 2026-10-14 happened below it). Measured visible drop while reading a screenshot: about 1.1 GB.
 TIERS = [
-    {"name": "Qwen3-VL 4B", "model": "Qwen3VL-4B-Instruct-Q4_K_M.gguf", "mmproj": "mmproj-Qwen3VL-4B-Instruct-F16.gguf",
-     "need_mb": 3600, "ctx": 4096, "image_max_tokens": 1024},
+    # The 2B model first: it writes its description about 1.6 times faster than the 4B one for the same look, and a
+    # screenshot description needs words, not depth (measured 2026-10-19: the 4B answered 156 words in 49 s).
     {"name": "Qwen3-VL 2B", "model": "Qwen3VL-2B-Instruct-Q4_K_M.gguf", "mmproj": "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
      "need_mb": 3500, "ctx": 4096, "image_max_tokens": 1024},
+    {"name": "Qwen3-VL 4B", "model": "Qwen3VL-4B-Instruct-Q4_K_M.gguf", "mmproj": "mmproj-Qwen3VL-4B-Instruct-F16.gguf",
+     "need_mb": 3600, "ctx": 4096, "image_max_tokens": 1024},
 ]
 
 
@@ -203,7 +205,7 @@ class VisionManager:
         t0 = time.time()
         parts: List[str] = []
         try:
-            for obj in c.chat_stream("vision", messages, options={"temperature": 0.1, "num_predict": 500}):
+            for obj in c.chat_stream("vision", messages, options={"temperature": 0.1, "num_predict": 400}):
                 delta = (obj.get("message") or {}).get("content", "")
                 if delta:
                     if not parts:

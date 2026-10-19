@@ -42,6 +42,11 @@ public class EngineService extends Service {
     private static final String FORGE = "http://localhost:8765";
     public static final String ACTION_START = "local.forge.ENGINE_START";
     public static final String ACTION_STOP = "local.forge.ENGINE_STOP";
+    /** Keeps the app a foreground process (a notification, no engine) while the vision model runs without the engine:
+     *  Android froze the app ten seconds after a pause once (2026-10-19), which stopped the control loop and left the
+     *  engine dead until the window was opened again. */
+    public static final String ACTION_HOLD = "local.forge.HOLD";
+    static volatile boolean holding = false;
 
     private static volatile EngineService instance;
     private static final ArrayDeque<String> logLines = new ArrayDeque<>();
@@ -135,6 +140,12 @@ public class EngineService extends Service {
             stopSelf();
             return START_NOT_STICKY;
         }
+        if (ACTION_HOLD.equals(action)) {
+            String text = intent.getStringExtra("text");
+            startForeground(NOTIF_ID, buildNotification(text == null ? "The vision model is reading an image" : text), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            return START_NOT_STICKY;
+        }
+        holding = false;
         startForeground(NOTIF_ID, buildNotification("Starting…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
         if (worker == null || !worker.isAlive()) {
             stopping = false;
@@ -286,13 +297,25 @@ public class EngineService extends Service {
                 state = "stopped";
             }
         } catch (Exception e) {
-            state = "error";
-            detail = e.getMessage() == null ? e.toString() : e.getMessage();
-            log("ERROR: " + detail);
-            notifyText(detail);
+            if (pausing) {
+                // Stopping the engine for the vision model closes its output while this thread reads it; that is the
+                // pause, not an error. (Treating it as an error dropped the foreground service and let Android freeze
+                // the app, 2026-10-19.)
+                pausing = false;
+                pausedForVision = true;
+                state = "paused";
+                detail = "Paused while the vision model reads an image";
+                notifyText(detail);
+                postStats("paused");
+            } else {
+                state = "error";
+                detail = e.getMessage() == null ? e.toString() : e.getMessage();
+                log("ERROR: " + detail);
+                notifyText(detail);
+            }
         } finally {
             if (!relaunching) proc = null;
-            if (!"paused".equals(state) && !relaunching) {
+            if (!"paused".equals(state) && !relaunching && !holding) {
                 stopForeground(STOP_FOREGROUND_DETACH);
                 if (!"error".equals(state)) stopSelf();
             }
@@ -425,6 +448,34 @@ public class EngineService extends Service {
         try { if (!p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); } catch (InterruptedException ignored) { }
         for (int i = 0; i < 50 && !pausedForVision; i++) { try { Thread.sleep(100); } catch (InterruptedException ignored) { } }
         return true;
+    }
+
+    /** A foreground hold for the vision model when the engine is not running or paused; true when one was taken. */
+    public static boolean holdForeground(Context ctx, String text) {
+        EngineService s = instance;
+        String st = state;
+        if (s != null && (s.proc != null || "paused".equals(st) || "starting".equals(st) || "downloading".equals(st) || "running".equals(st))) return false;
+        holding = true;
+        try {
+            ctx.startForegroundService(new Intent(ctx, EngineService.class).setAction(ACTION_HOLD).putExtra("text", text));
+        } catch (Exception e) {
+            holding = false;
+            log("foreground hold not taken: " + e);
+            return false;
+        }
+        return true;
+    }
+
+    /** Ends the hold; the service goes away unless the engine runs, starts or is paused meanwhile. */
+    public static void releaseHold(Context ctx) {
+        holding = false;
+        EngineService s = instance;
+        if (s == null) return;
+        String st = state;
+        if (s.proc == null && !"paused".equals(st) && !"starting".equals(st) && !"downloading".equals(st) && (s.worker == null || !s.worker.isAlive())) {
+            s.stopForeground(STOP_FOREGROUND_DETACH);
+            s.stopSelf();
+        }
     }
 
     /** Starts the engine again after the vision model is done (through the normal free-memory check). */

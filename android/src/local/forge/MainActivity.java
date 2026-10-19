@@ -239,7 +239,7 @@ public class MainActivity extends Activity {
 
 
         @JavascriptInterface
-        public String appVersion() { return "1.7"; }
+        public String appVersion() { return "1.8"; }
 
         /** Voice input with Android's speech recognizer. Events come back through window.ForgeVoice._native(). */
         @JavascriptInterface

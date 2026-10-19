@@ -71,13 +71,13 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # Extra llama-server flags for the GPU engine (the app drops them and starts again plainly if the engine refuses them):
     # a 1 GB cap on the server's own prompt cache in RAM, one unified KV cache, and draft-free speculative decoding
     # (ngram-mod guesses the next tokens from text the model has already produced; code and file contents repeat).
-    "gpu_extra_args": "--jinja --cache-ram 1024 --kv-unified --spec-type ngram-mod --spec-ngram-mod-n-min 16 --spec-ngram-mod-n-max 32",
+    "gpu_extra_args": "--jinja --fit off --cache-ram 1024 --kv-unified --spec-type ngram-mod --spec-ngram-mod-n-min 16 --spec-ngram-mod-n-max 32",
     # Percent of the graphics driver's held memory (freed by Forge's own earlier GPU processes, invisible to Android's
     # free-memory figure) that the app's free-memory check may count. 0 keeps the check on visible free memory only.
     "gpu_pool_credit": 0,
     # Extra llama-server flags for the vision model's server. Flash attention inside the image encoder is the slow
     # path on Vulkan (llama.cpp issue 17012: minutes instead of seconds on integrated GPUs), so it is off by default.
-    "vision_extra_args": "-fa off",
+    "vision_extra_args": "-fa off --fit off",
     "font_size": 13,
     "theme": "forge-dark",
     "workspace": os.path.expanduser("~/projects"),

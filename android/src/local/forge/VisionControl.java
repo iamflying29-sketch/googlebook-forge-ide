@@ -71,7 +71,12 @@ public final class VisionControl {
         }
     }
 
-    private static void start(Context ctx, JSONObject cfg) {
+    private static void start(Context ctx, JSONObject cfg) { startAttempt(ctx, cfg, 0, false); }
+
+    /** One launch attempt: skipTiers tiers are passed over, plain leaves out the extra flags. A server that exits
+     *  within 30 seconds of its launch is tried once more without the extra flags, then with the next tier. */
+    private static void startAttempt(Context ctx, JSONObject cfg, int skipTiers, boolean plain) {
+        boolean retrying = false, held = false;
         try {
             JSONArray tiers = cfg.optJSONArray("tiers");
             if (tiers == null || tiers.length() == 0) { fail("no vision model files on the IDE server"); return; }
@@ -80,10 +85,13 @@ public final class VisionControl {
                 vstate = "starting"; vdetail = "pausing Llama on the GPU"; report();
                 EngineService.pauseForVision();
             }
+            // Without the engine (or its pause) the app has no foreground service; take one so Android cannot freeze
+            // the app while the vision model works.
+            held = EngineService.holdForeground(ctx, "The vision model is reading an image");
             JSONObject pick = null;
             String why = null;
             GpuBudget.poolCreditPercent = cfg.optLong("pool_credit_percent", 0);
-            for (int i = 0; i < tiers.length(); i++) {
+            for (int i = skipTiers; i < tiers.length(); i++) {
                 JSONObject t = tiers.getJSONObject(i);
                 why = GpuBudget.check(ctx, t.optLong("need_mb", 3000));
                 log("tier " + t.optString("name") + ": " + (why == null ? "fits" : why) + " (" + GpuBudget.describe(ctx) + ")");
@@ -118,7 +126,8 @@ public final class VisionControl {
             cmd.add("--image-max-tokens"); cmd.add(String.valueOf(pick.optInt("image_max_tokens", 1024)));
             cmd.add("--no-webui");
             // Flags from the IDE's "Vision model: extra llama-server flags" setting (flash attention off by default).
-            for (String extra : cfg.optString("vision_extra_args", "-fa off").trim().split("\\s+")) if (!extra.isEmpty()) cmd.add(extra);
+            boolean usedExtras = false;
+            if (!plain) for (String extra : cfg.optString("vision_extra_args", "-fa off").trim().split("\\s+")) if (!extra.isEmpty()) { cmd.add(extra); usedExtras = true; }
             String key = cfg.optString("api_key", "");
             if (!key.isEmpty()) { cmd.add("--api-key"); cmd.add(key); }
             vstate = "starting"; vdetail = "loading " + vtier + " on the Intel GPU";
@@ -129,6 +138,7 @@ public final class VisionControl {
             pb.environment().put("HOME", ctx.getFilesDir().getAbsolutePath());
             pb.environment().put("TMPDIR", ctx.getCacheDir().getAbsolutePath());
             GpuBudget.beforeStart(ctx, "vision");
+            long launchedAt = System.currentTimeMillis();
             Process p = pb.start();
             proc = p;
             // The vision server is reclaimed before the main engine (900) and long before the Linux VM (0).
@@ -147,13 +157,29 @@ public final class VisionControl {
             int code = p.waitFor();
             GpuBudget.afterStop(ctx, "vision");
             if (proc == p) proc = null;
+            boolean early = code != 0 && !"running".equals(vstate) && !"stopped".equals(vstate) && System.currentTimeMillis() - launchedAt < 30000;
+            if (early && usedExtras) {
+                log("the vision server exited with code " + code + " right after a launch with the extra flags; starting it again without them");
+                retrying = true;
+                startAttempt(ctx, cfg, skipTiers, true);
+                return;
+            }
+            if (early && skipTiers + 1 < tiers.length()) {
+                log("the vision server exited with code " + code + " right after its launch; trying the next tier");
+                retrying = true;
+                startAttempt(ctx, cfg, skipTiers + 1, false);
+                return;
+            }
             if (!"stopped".equals(vstate)) { vstate = code == 0 ? "stopped" : "error"; vdetail = "vision server exited with code " + code; report(); }
         } catch (Exception e) {
             // Reading the server's output is interrupted when we stop it on purpose: that is not an error.
             if (!"stopped".equals(vstate)) fail(e.getMessage() == null ? e.toString() : e.getMessage());
             else { GpuBudget.afterStop(ctx, "vision"); proc = null; }
         } finally {
-            EngineService.resumeAfterVision();   // Llama gets the GPU back
+            if (!retrying) {
+                EngineService.resumeAfterVision();   // Llama gets the GPU back
+                if (held) EngineService.releaseHold(ctx);
+            }
         }
     }
 
