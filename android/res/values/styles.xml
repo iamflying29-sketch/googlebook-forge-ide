@@ -1,11 +1,128 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- One dark theme for the whole app: the window, every dialog, every popup menu and every spinner dropdown. -->
 <resources>
     <style name="ForgeTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
-        <item name="android:windowBackground">#0f1117</item>
-        <item name="android:statusBarColor">#141720</item>
-        <item name="android:navigationBarColor">#141720</item>
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:colorBackground">@color/bg</item>
+        <item name="android:colorBackgroundFloating">@color/bg2</item>
+        <item name="android:windowSplashScreenBackground">@color/bg</item>
+        <item name="android:statusBarColor">@color/bg2</item>
+        <item name="android:navigationBarColor">@color/bg2</item>
         <item name="android:windowLightStatusBar">false</item>
-        <item name="android:colorPrimary">#ff8a3d</item>
-        <item name="android:colorAccent">#ff8a3d</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:isLightTheme">false</item>
+        <item name="android:colorPrimary">@color/bg2</item>
+        <item name="android:colorPrimaryDark">@color/bg</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:colorControlNormal">@color/fg2</item>
+        <item name="android:colorControlActivated">@color/accent</item>
+        <item name="android:colorControlHighlight">@color/ripple</item>
+        <item name="android:colorButtonNormal">@color/bg3</item>
+        <item name="android:colorEdgeEffect">@color/accent</item>
+        <item name="android:textColorPrimary">@color/fg</item>
+        <item name="android:textColorSecondary">@color/fg2</item>
+        <item name="android:textColorTertiary">@color/fg3</item>
+        <item name="android:textColorHint">@color/fg3</item>
+        <item name="android:textColorHighlight">@color/accent_selection</item>
+        <item name="android:textColorLink">@color/blue</item>
+        <item name="android:editTextColor">@color/fg</item>
+        <item name="android:textCursorDrawable">@drawable/cursor</item>
+        <item name="android:textSelectHandle">@drawable/select_handle</item>
+        <item name="android:textSelectHandleLeft">@drawable/select_handle</item>
+        <item name="android:textSelectHandleRight">@drawable/select_handle</item>
+        <item name="android:alertDialogTheme">@style/ForgeDialog</item>
+        <item name="android:dialogTheme">@style/ForgeDialog</item>
+        <item name="android:popupMenuStyle">@style/ForgePopupMenu</item>
+        <item name="android:contextPopupMenuStyle">@style/ForgePopupMenu</item>
+        <item name="android:textAppearanceLargePopupMenu">@style/ForgePopupText</item>
+        <item name="android:textAppearanceSmallPopupMenu">@style/ForgePopupText</item>
+        <item name="android:popupBackground">@drawable/popup_bg</item>
+        <item name="android:spinnerStyle">@style/ForgeSpinner</item>
+        <item name="android:spinnerDropDownItemStyle">@style/ForgeSpinnerItem</item>
+        <item name="android:dropDownListViewStyle">@style/ForgeDropDownList</item>
+        <item name="android:listViewStyle">@style/ForgeListView</item>
+        <item name="android:textViewStyle">@style/ForgeTextView</item>
+        <item name="android:scrollbarThumbVertical">@drawable/scrollbar_thumb</item>
+        <item name="android:scrollbarThumbHorizontal">@drawable/scrollbar_thumb</item>
+        <item name="android:scrollbarSize">6dp</item>
+    </style>
+
+    <!-- Dialogs: dark card, light text, accent buttons. -->
+    <style name="ForgeDialog" parent="@android:style/Theme.DeviceDefault.Dialog.Alert">
+        <item name="android:windowBackground">@drawable/dialog_bg</item>
+        <item name="android:colorBackground">@color/bg2</item>
+        <item name="android:colorBackgroundFloating">@color/bg2</item>
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:isLightTheme">false</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:colorControlNormal">@color/fg2</item>
+        <item name="android:colorControlActivated">@color/accent</item>
+        <item name="android:colorControlHighlight">@color/ripple</item>
+        <item name="android:textColorPrimary">@color/fg</item>
+        <item name="android:textColorSecondary">@color/fg2</item>
+        <item name="android:textColorTertiary">@color/fg3</item>
+        <item name="android:textColorHint">@color/fg3</item>
+        <item name="android:textColorHighlight">@color/accent_selection</item>
+        <item name="android:editTextColor">@color/fg</item>
+        <item name="android:textColorAlertDialogListItem">@color/fg</item>
+        <item name="android:textCursorDrawable">@drawable/cursor</item>
+        <item name="android:textSelectHandle">@drawable/select_handle</item>
+        <item name="android:textSelectHandleLeft">@drawable/select_handle</item>
+        <item name="android:textSelectHandleRight">@drawable/select_handle</item>
+        <item name="android:windowTitleStyle">@style/ForgeDialogTitle</item>
+        <item name="android:buttonBarButtonStyle">@style/ForgeDialogButton</item>
+        <item name="android:buttonBarPositiveButtonStyle">@style/ForgeDialogButton</item>
+        <item name="android:buttonBarNegativeButtonStyle">@style/ForgeDialogButton</item>
+        <item name="android:buttonBarNeutralButtonStyle">@style/ForgeDialogButton</item>
+        <item name="android:popupMenuStyle">@style/ForgePopupMenu</item>
+        <item name="android:popupBackground">@drawable/popup_bg</item>
+        <item name="android:spinnerStyle">@style/ForgeSpinner</item>
+        <item name="android:spinnerDropDownItemStyle">@style/ForgeSpinnerItem</item>
+        <item name="android:dropDownListViewStyle">@style/ForgeDropDownList</item>
+        <item name="android:listViewStyle">@style/ForgeListView</item>
+        <item name="android:textViewStyle">@style/ForgeTextView</item>
+    </style>
+    <style name="ForgeDialogTitle" parent="@android:style/TextAppearance.DeviceDefault.DialogWindowTitle">
+        <item name="android:textColor">@color/fg</item>
+        <item name="android:textSize">16sp</item>
+    </style>
+    <style name="ForgeDialogButton" parent="@android:style/Widget.DeviceDefault.Button.Borderless.Colored">
+        <item name="android:textColor">@color/accent</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textSize">13sp</item>
+    </style>
+
+    <!-- Popup menus and spinner dropdowns. -->
+    <style name="ForgePopupMenu" parent="@android:style/Widget.DeviceDefault.PopupMenu">
+        <item name="android:popupBackground">@drawable/popup_bg</item>
+        <item name="android:popupElevation">8dp</item>
+    </style>
+    <style name="ForgePopupText" parent="@android:style/TextAppearance.DeviceDefault.Widget.PopupMenu.Large">
+        <item name="android:textColor">@color/fg</item>
+        <item name="android:textSize">13sp</item>
+    </style>
+    <style name="ForgeSpinner" parent="@android:style/Widget.DeviceDefault.Spinner">
+        <item name="android:popupBackground">@drawable/popup_bg</item>
+        <item name="android:background">@drawable/spinner_bg</item>
+        <item name="android:dropDownWidth">wrap_content</item>
+    </style>
+    <style name="ForgeSpinnerItem" parent="@android:style/Widget.DeviceDefault.DropDownItem.Spinner">
+        <item name="android:textColor">@color/fg</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:background">@drawable/list_item_bg</item>
+    </style>
+    <style name="ForgeDropDownList" parent="@android:style/Widget.DeviceDefault.ListView.DropDown">
+        <item name="android:background">@drawable/popup_bg</item>
+        <item name="android:divider">@null</item>
+        <item name="android:listSelector">@drawable/list_item_bg</item>
+    </style>
+    <style name="ForgeListView" parent="@android:style/Widget.DeviceDefault.ListView">
+        <item name="android:divider">@null</item>
+        <item name="android:listSelector">@drawable/list_item_bg</item>
+        <item name="android:cacheColorHint">@color/bg</item>
+    </style>
+    <style name="ForgeTextView" parent="@android:style/Widget.DeviceDefault.TextView">
+        <item name="android:textColor">@color/fg</item>
     </style>
 </resources>

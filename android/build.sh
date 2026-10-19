@@ -13,7 +13,7 @@ B=build/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$B/classes" "$B/gen" assets
 "$BT/aapt2" compile --dir res -o "$B/res.zip"
 "$BT/aapt2" link -o "$B/unsigned.apk" -I "$JAR" --manifest AndroidManifest.xml -A assets \
-    --min-sdk-version 33 --target-sdk-version 35 --version-code 22 --version-name 2.2 \
+    --min-sdk-version 33 --target-sdk-version 35 --version-code 30 --version-name 3.0 \
     --java "$B/gen" "$B/res.zip"
 # 1. The generated R class, so both languages can use the resources.
 javac -Xlint:-options -source 11 -target 11 -cp "$JAR" -d "$B/classes" "$B/gen/local/forge/R.java"

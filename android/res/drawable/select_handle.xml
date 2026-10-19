@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The text selection handle, a small accent circle. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="22dp" android:height="22dp" android:viewportWidth="22" android:viewportHeight="22">
+    <path android:fillColor="@color/accent" android:pathData="M11,2 L11,2 C11,2 11,2 11,2 C15.97,2 20,6.03 20,11 C20,15.97 15.97,20 11,20 C6.03,20 2,15.97 2,11 C2,7.5 4,4.5 7,3 Z" />
+</vector>

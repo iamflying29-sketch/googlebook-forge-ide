@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sizes of the window chrome. The bars are 34 dp like the web page's title bar and tab strip. -->
+<resources>
+    <dimen name="top_bar_height">34dp</dimen>
+    <dimen name="status_bar_height">34dp</dimen>
+    <dimen name="panel_tabs_height">30dp</dimen>
+    <dimen name="activity_bar_width">44dp</dimen>
+    <dimen name="activity_item_size">36dp</dimen>
+    <dimen name="side_panel_width">260dp</dimen>
+    <dimen name="chat_width">430dp</dimen>
+    <dimen name="bottom_panel_height">240dp</dimen>
+    <dimen name="icon_button_size">28dp</dimen>
+    <dimen name="icon_size">16dp</dimen>
+    <dimen name="splitter_size">4dp</dimen>
+    <dimen name="radius">8dp</dimen>
+    <dimen name="radius_small">6dp</dimen>
+</resources>

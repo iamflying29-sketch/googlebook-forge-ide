@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The dark palette of Forge, the same colors as the web page it replaces. Ui.kt repeats them for code. -->
+<resources>
+    <color name="bg">#0f1117</color>
+    <color name="bg2">#141720</color>
+    <color name="bg3">#1b1f2a</color>
+    <color name="bg4">#222738</color>
+    <color name="panel">#12151d</color>
+    <color name="border">#262b38</color>
+    <color name="border2">#2f3548</color>
+    <color name="fg">#d7dbe7</color>
+    <color name="fg2">#a7adbd</color>
+    <color name="fg3">#6b7489</color>
+    <color name="accent">#ff8a3d</color>
+    <color name="accent2">#ffb07a</color>
+    <color name="accent_soft">#24ff8a3d</color>
+    <color name="accent_selection">#66ff8a3d</color>
+    <color name="green">#4cc38a</color>
+    <color name="red">#ff6b6b</color>
+    <color name="yellow">#ffd166</color>
+    <color name="purple">#c792ea</color>
+    <color name="blue">#82aaff</color>
+    <color name="on_accent">#1a1000</color>
+    <color name="ripple">#33ffffff</color>
+</resources>

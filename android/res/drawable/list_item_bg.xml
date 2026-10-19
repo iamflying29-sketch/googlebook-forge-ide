@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hover, focus and press states of list rows and menu items. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_pressed="true"><shape><solid android:color="@color/accent_soft" /><corners android:radius="5dp" /></shape></item>
+    <item android:state_focused="true"><shape><solid android:color="@color/accent_soft" /><corners android:radius="5dp" /></shape></item>
+    <item android:state_hovered="true"><shape><solid android:color="@color/bg4" /><corners android:radius="5dp" /></shape></item>
+    <item android:state_selected="true"><shape><solid android:color="@color/accent_soft" /><corners android:radius="5dp" /></shape></item>
+    <item><color android:color="@android:color/transparent" /></item>
+</selector>
