@@ -1052,6 +1052,9 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     /** Files the reply changed, as chips, with Review (inline in the editor) and Undo all, like Cursor's change list. */
+    /** The newest reply's changed files, for Ctrl Shift Backspace (undo the reply's changes). */
+    private var lastFilesRow: FilesRow? = null
+
     private inner class FilesRow(var runId: String) {
         val view = Ui.column(ctx)
         private val chips = LinearLayout(ctx)
@@ -1067,7 +1070,9 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
             (undo.layoutParams as LinearLayout.LayoutParams).leftMargin = dp(4)
             view.addView(head, Ui.lp(Ui.match, Ui.wrap))
             view.addView(h, Ui.lp(Ui.match, Ui.wrap).also { it.topMargin = dp(3) })
+            lastFilesRow = this
         }
+        fun undoAllPublic() = undoAll()
         fun add(path: String, kind: String) {
             if (!shown.add(path)) return
             val c = chip(path + "  " + kind, null)
@@ -1716,7 +1721,90 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
 
     fun focusPrompt() { prompt.requestFocus() }
 
+    // ---------------------------------------------------------------- Cursor's chat keys (bound in MainActivity)
+    fun promptHasFocus(): Boolean = prompt.hasFocus() && !mentions.isShowing()
+    fun setModePublic(m: String) { mode = m; prefs.edit().putString("mode", m).apply(); updateModePill() }
+    fun isRunning(): Boolean = active?.run != null
+
+    /** Shift Tab: the next mode (Agent, Ask, Plan, then your custom modes). */
+    fun nextMode() {
+        val all = arrayListOf("agent", "ask", "plan")
+        settings.optJSONArray("custom_modes")?.let { a -> for (i in 0 until a.length()) a.optJSONObject(i)?.optString("name")?.takeIf { it.isNotEmpty() }?.let { all.add(it) } }
+        val i = all.indexOf(mode)
+        mode = all[(i + 1) % all.size]
+        prefs.edit().putString("mode", mode).apply(); updateModePill()
+        host.flashStatus("Mode: " + mode.replaceFirstChar { it.titlecase() })
+    }
+
+    /** Ctrl /: the next model for this chat. */
+    fun nextModel() {
+        val t = active ?: return
+        if (models.isEmpty()) return
+        val i = models.indexOfFirst { it.first == t.modelChoice }
+        val next = models[(i + 1) % models.size]
+        t.modelChoice = next.first; updateModelPill()
+        host.flashStatus("This chat now uses " + next.second + ".")
+    }
+
+    fun modeMenu() = showModeMenu(modePill)
+    fun modelMenu() = showModelMenu(modelPill)
+
+    /** Ctrl [ and Ctrl ]: the previous or next chat tab. */
+    fun stepChat(dir: Int) {
+        val t = active ?: return
+        if (tabs.size < 2) return
+        val i = tabs.indexOf(t)
+        switchTo(tabs[((i + dir) % tabs.size + tabs.size) % tabs.size])
+        prompt.requestFocus()
+    }
+
+    /** Ctrl W in the chat: closes the chat tab. */
+    fun closeChat() { active?.let { closeTab(it) } }
+
+    /** Ctrl Shift Backspace: stops the reply; with nothing running it undoes the last reply's changes. */
+    fun cancelOrReject() {
+        if (active?.run != null) { stopActive(); return }
+        val fr = lastFilesRow
+        if (fr != null) fr.undoAllPublic() else host.flashStatus("There is no reply to stop and no change to undo.")
+    }
+
+    /** Ctrl Shift V in the chat: the clipboard goes in as plain text, never as an attachment. */
+    fun pasteAsText() {
+        val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        val text = cm.primaryClip?.getItemAt(0)?.coerceToText(ctx)?.toString() ?: return
+        val a = prompt.selectionStart.coerceAtLeast(0); val b = prompt.selectionEnd.coerceAtLeast(0)
+        prompt.text.replace(minOf(a, b), maxOf(a, b), text)
+    }
+
+    /** Ctrl V of code copied from the editor: it goes in as a reference to those lines (Cursor's copied code as context). */
+    fun pasteCodeReference(path: String, startLine: Int, endLine: Int, text: String) {
+        addAttachment(JSONObject().put("kind", "text").put("title", path.substringAfterLast('/') + " " + startLine + "-" + endLine)
+            .put("name", path + ":" + startLine + "-" + endLine).put("text", text))
+        host.flashStatus("Added " + path.substringAfterLast('/') + " lines " + startLine + " to " + endLine + " as context.")
+    }
+
+    /** Up in an empty input, and Tab: your earlier messages of this chat, newest first. */
+    private var recallIndex = -1
+    fun recallMessage(dir: Int): Boolean {
+        val t = active ?: return false
+        val mine = ArrayList<String>()
+        for (i in 0 until t.transcript.length()) { val o = t.transcript.optJSONObject(i) ?: continue; if (o.optString("role") == "user") mine.add(o.optString("text")) }
+        if (mine.isEmpty()) return false
+        recallIndex = (if (recallIndex < 0) mine.size else recallIndex) - dir
+        if (recallIndex < 0) recallIndex = mine.size - 1
+        if (recallIndex >= mine.size) recallIndex = 0
+        setPromptText(mine[recallIndex])
+        return true
+    }
+    fun promptEmpty(): Boolean = prompt.text.isNullOrBlank()
+
     fun stop() { for (t in tabs) t.run?.stream?.stop() }
+
+    /** How many chat tabs have a reply running (Reload Window asks before it stops them). */
+    fun busyCount(): Int = tabs.count { it.run != null || it.pending }
+
+    /** Stops every running reply on the server too, so the reloaded window finds the chats finished and saved. */
+    fun stopAllRuns() { for (t in tabs.toList()) if (t.run != null) cancelRun(t) }
 
     // ---------------------------------------------------------------- images
     private fun showImage(url: String) {

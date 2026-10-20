@@ -121,6 +121,7 @@ class SettingsActivity : Activity() {
     private val slowTask = object : Runnable { override fun run() { ticks++; extras?.tick(ticks); if (started) Api.main.postDelayed(this, 5000) } }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        Ui.loadTheme(this)
         super.onCreate(savedInstanceState)
         title = "Forge settings"
         scope = if (getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("scope", "user") == "folder") "folder" else "user"

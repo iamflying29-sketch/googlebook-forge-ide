@@ -221,8 +221,6 @@ def _kind(serial: str, port: int, info: dict, gb: Optional[str]) -> str:
     chars = (info.get("characteristics") or "").lower()
     if port == FORGE_PORT and serial.startswith("127.0.0.1:"):
         return "virtual"
-    if serial.startswith("192.168.240."):
-        return "waydroid"
     if serial == gb or "googlebook" in (info.get("model") or "").lower():
         return "googlebook"
     if info.get("watch") or "watch" in chars:
@@ -246,6 +244,10 @@ def list_devices() -> List[dict]:
     out = []
     for port in (MAIN_PORT, FORGE_PORT):
         for serial, state, extra in _listed(port):
+            # Waydroid (its container network is 192.168.240.x) has nothing to do with Forge: it is never listed,
+            # probed or used as a target.
+            if serial.startswith("192.168.240."):
+                continue
             info = probe(serial, port) if state == "device" else {}
             d = {"serial": serial, "port": port, "state": state, "model": info.get("model") or extra.get("model", "").replace("_", " "),
                  **info, "kind": _kind(serial, port, info, gb)}

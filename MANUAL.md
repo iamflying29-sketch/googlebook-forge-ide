@@ -17,6 +17,12 @@ Forge is a Cursor-style AI coding IDE that runs entirely on your Lenovo Googlebo
 1. Open the **Terminal** app once after a restart so the Linux VM starts. It can stay in the background.
 2. Click the **Forge** icon. If the VM is still booting you see a waiting screen that retries by itself.
 
+**Nothing of Forge runs until you open it.** The Forge server is started by a systemd socket (`forge-ide.socket`): systemd itself listens on port 8765, and the first connection from the Forge app starts the server. The server then starts Ollama and the Forge Android guard, which do not start with the VM.
+
+**Quit Forge** (Ctrl Q, the power button at the right end of the top bar, or Quit Forge in the command palette) stops everything Forge runs. It asks first, and it offers to save unsaved files or to stop a running reply. On the Googlebook it stops the GPU engine, the vision model, the engine notification, every Forge window and finally the app's own process. In the Linux VM it stops the chat replies, the virtual devices, every helper Forge started in its own systemd scope (language servers, debuggers, notebook kernels, builds, device displays, ARM devices) and every shell, then Ollama and the Forge Android guard, and last the server itself. Afterwards only systemd's socket is left, which is part of systemd and not a running program; opening Forge starts everything again.
+
+**Reload the window** (Ctrl R, or Developer: Reload Window in the command palette) builds the window again from scratch in the same folder, with its open files, chat tabs and drafts restored. It asks first when files have unsaved changes or a reply is running. Ctrl R is a two-key shortcut as in Cursor: a second key within a moment runs a chord (section 23) instead.
+
 From the Linux Terminal:
 
 ```
@@ -132,6 +138,12 @@ Click the microphone button in the AI panel (or press Ctrl Shift Space) and spea
 - **AI Tab completions**: with the setting on (or the Tab item in the status bar), the model suggests how the line goes on after a pause in typing, in gray; Tab inserts it, Escape or typing dismisses it. Alt \\ asks for one at any time, even with the setting off. On the GPU engine Forge uses the model's fill-in-the-middle mode, which took 1 to 4 seconds in my tests.
 - **Right-click** in the editor: Add the selection to the chat, Edit with AI, Explain this code, Fix the problems here with AI, Go to the definition, Peek, Find all references, Rename, Quick fix, Format, Cut, Copy, Paste and Select all. Right-click on a tab: close, close others, close to the right, close saved, close all, open to the side, reveal in the Explorer, add to the chat, copy the path. A middle click closes a tab.
 - **Typing helps**: brackets and quotes close by themselves (typing the closing one steps over it, and a selection gets wrapped), Enter between brackets opens an indented block, Backspace between an empty pair removes both, Home goes to the first character of the line, Alt Up and Alt Down move lines, Shift Alt Up and Down copy them, Ctrl Shift K deletes them, Ctrl Enter and Ctrl Shift Enter open a line below or above, Ctrl ] and Ctrl [ indent and outdent, Ctrl / comments, Ctrl D duplicates, Ctrl Z and Ctrl Y undo and redo.
+- **Multiple cursors**, as in Cursor: Ctrl D selects the word at the cursor and then adds its next occurrence, Ctrl F2 selects every occurrence, Alt click adds or removes a cursor, Ctrl Alt Up and Down (or Shift Alt Up and Down) add a cursor above or below, Shift Alt I puts one at the end of every selected line, Shift Alt drag selects a box, and Ctrl U undoes the last cursor step. Typing, Backspace, Delete, Enter, Tab, the arrow keys, Home, End, copy, cut and paste work at every cursor; a paste with as many lines as cursors gives each cursor its own line. Escape goes back to one cursor.
+- **Folding**: the chevrons in the gutter fold and open regions (by indentation, block comments, and headings in Markdown). Ctrl Shift [ and ] fold and open the region at the cursor, and the chords Ctrl K Ctrl L (toggle), Ctrl K Ctrl 0 (fold all), Ctrl K Ctrl J (open all), Ctrl K Ctrl [ and ] (with every region inside), Ctrl K Ctrl 1 to 7 (a level), Ctrl K Ctrl / (block comments) and Ctrl K Ctrl - (all but the one at the cursor) do the rest. A folded region shows "⋯" after its first line; a click opens it. Folding never changes the file.
+- **Word wrap** (Alt Z), **render whitespace**, **expand and shrink the selection** (Shift Alt Right and Left), **jump to the matching bracket** (Ctrl Shift \\), **block comments** (Ctrl Shift A), **add and remove line comments** (Ctrl K Ctrl C and Ctrl K Ctrl U), **trim trailing whitespace** (Ctrl K Ctrl X), **change the language mode** (Ctrl K M), **replace with the next or previous value** (Ctrl Shift . and Ctrl Shift , raise or lower a number and swap true and false), **format the selection** (Ctrl K Ctrl F), and in the command palette: uppercase, lowercase, title, snake, kebab, camel and Pascal case, sort lines (ascending, descending, ignoring case), reverse lines, delete duplicate lines, join lines, transpose characters and convert the indentation.
+- **Copy and cut without a selection** take the whole line, and pasting such a line puts it above the current line, as in Cursor. Ctrl Left and Right move by words, Ctrl Backspace and Ctrl Delete delete words, Ctrl Up and Down scroll by a line and Alt Page Up and Down by a page.
+- **Preview tabs**: a single click in the Explorer opens a file in a preview tab (its name in italics) that the next one replaces; editing the file, a double click on the tab or Ctrl K Enter keeps it. The command palette turns preview tabs off.
+- **Untitled files**: Ctrl N in the editor opens an empty Untitled file; the first save asks for its name. Ctrl Shift S saves any file under a new name.
 - **Find in the file**: Ctrl F (Ctrl H with replace), with match case (Alt C), whole word (Alt W) and regular expressions (Alt R; the replacement may use $1 and named groups). Every match in view is highlighted; Enter and Shift Enter step through them.
 - **Split editor**: Ctrl \\ opens the current file in a second group on the right (or closes it). Each group has its own tabs; when both show the same file, they share its text, its undo history and its unsaved state. Ctrl S saves the file you are in.
 - **Markdown preview**: Ctrl Shift V in a Markdown file shows a live preview next to it; images that point into the project show, images on the internet are named but not loaded.
@@ -338,7 +350,7 @@ The Googlebook has 16 GB for Android, the VM and the models together. If it runs
 - **Virtual devices** each run inside a hard memory cap (2.5 GB for Android 11 to 16, 3 GB for Android 17) and a limit of 8,192 threads (Android with Google's apps needs more than Podman's default of 2,048, and its system process crashed without them; the VM allows about 62,000 in all). The memory shown for a device is Android's own memory; the file cache in its cap is given back whenever something needs it and start only when the Googlebook has the cap plus 2.3 GB free. In practice that means one device at a time next to Forge, and not at the same time as the Llama model. A watchdog for each device returns the VM's file cache to the Googlebook when it falls under 3.8 GB free, and stops the device under 2.9 GB free, when it cannot read the free memory for two minutes, or after three hours without use. Downloads and image builds run inside a memory cap too.
 - **Android shares the VM's kernel.** In a container, Android runs on the VM's own Linux kernel, and Android's startup was written for a phone that Android owns. Left alone, it would change the whole VM. Forge has two layers of protection against that, together called the VM shield.
   - **Protected images.** Forge runs every virtual device from a protected copy of its Android image, which it builds by itself in a few seconds the first time (Podman lists them as `localhost/forge-shield`). In that copy, Android's startup scripts leave out every line that would change the VM: kernel settings for the whole VM (memory overcommit, memory watermarks, a kernel panic when a task hangs, SysRq, performance counters and the console log level), the owners of the kernel's files (Android's "system" user has the same number as your own account, so it could otherwise suspend the VM or install a SafeSetID policy that breaks `sudo`), handlers for ARM programs, kernel trace buffers, swap, and the livelock daemon `llkd`, which can crash the kernel on purpose. Exactly what was left out is listed in `~/.forge-ide/vd/shield/*/removed.txt`. Containers also cannot reboot or replace the kernel, load kernel modules, use hardware ports or change the clock.
-  - **The Forge Android guard** (`forge-android-guard`, a small root service with a 128 MB memory limit). Android's own shutdown signals every process in the VM, remounts its disks read-only and can crash the kernel, so Forge always stops devices from outside, and the guard ends any Android that starts to shut down by itself within milliseconds. The guard holds a kernel wake lock, so Android's suspend service can never put the VM to sleep, and a secret memory handle, which makes the kernel refuse to hibernate. While any Android runs (WayDroid too) and for a minute after, it compares the VM's kernel settings and the owners and modes of the kernel's files with a reference taken while no Android was running, and puts back anything that changed, within about two seconds. Some changes come from Android's programs and not its scripts (its init, for example, always restricts `/proc/cmdline`, which the Terminal's display setup reads when a shell starts), and the guard catches those at the moment Android's init starts. It also clears any SafeSetID policy, switches off Android's handlers for ARM programs and warns you if an SELinux policy was ever loaded.
+  - **The Forge Android guard** (`forge-android-guard`, a small root service with a 128 MB memory limit). It looks after Forge's own virtual devices only (the containers Podman runs for them, found by their control group) and never touches any other container. It runs only while Forge runs: the Forge server starts it, and Quit Forge stops it. Android's own shutdown signals every process in the VM, remounts its disks read-only and can crash the kernel, so Forge always stops devices from outside, and the guard ends any Android that starts to shut down by itself within milliseconds. The guard holds a kernel wake lock, so Android's suspend service can never put the VM to sleep, and a secret memory handle, which makes the kernel refuse to hibernate. While any Android runs (WayDroid too) and for a minute after, it compares the VM's kernel settings and the owners and modes of the kernel's files with a reference taken while no Android was running, and puts back anything that changed, within about two seconds. Some changes come from Android's programs and not its scripts (its init, for example, always restricts `/proc/cmdline`, which the Terminal's display setup reads when a shell starts), and the guard catches those at the moment Android's init starts. It also clears any SafeSetID policy, switches off Android's handlers for ARM programs and warns you if an SELinux policy was ever loaded.
   - **Google's own builds** (Wear OS 6, Google TV 16 and Android 16 with Google Play) start with Redroid's container-ready start program and SELinux library, so Android's SELinux policy is never loaded into the VM's kernel, and they get the same device-mapper lock as Android TV 16 (see Google's own Wear OS, Google TV and Pixel-style Android in section 16).
   - **Device-mapper and disks.** Android's package manager creates device-mapper entries named after its packages, and those live in the VM's shared kernel, where they would stay after the container stops and keep the next Android's packages from mounting. The Redroid and Android 17 images have no device-mapper device to do it with. In Android TV 16, `forge-init` puts a locked placeholder in its place, so Android mounts its packages straight from loop devices, which the kernel releases by itself, and it copies none of the VM's disks into the container. If such entries ever exist, the guard warns about them.
   - The Android view shows "VM shield on" and how many changes the guard put back in the last 15 minutes. Its log is `journalctl -u forge-android-guard`.
@@ -348,51 +360,66 @@ Do not run Waydroid, a second model or a large build at the same time as a model
 
 ## 23. Keyboard shortcuts
 
+Forge uses Cursor's keyboard shortcuts on Linux (Ctrl, not Cmd). **Ctrl K Ctrl S** shows every one of them (more than 200) with a search box and where each one applies. Every shortcut is also a command in the command palette (Ctrl Shift P or F1), with its keys next to it.
+
+**Two-key shortcuts (chords)** start with Ctrl K, as in VS Code, or with Ctrl R, which is where Cursor moved them; both work. In the editor, Ctrl K alone opens the inline edit when no second key follows within a moment, and Ctrl R alone reloads the window. The status bar says when Forge waits for the second key.
+
+**The same key can mean different things in different places**, as in Cursor: in the chat input Ctrl N and Ctrl T start a new chat, Ctrl [ and ] switch chats, Ctrl W closes the chat tab, Ctrl . opens the mode menu and Ctrl / switches the model; in the editor the same keys do the editor's work.
+
 | Keys | Action |
 | --- | --- |
-| Ctrl P (or Ctrl E) | Go to a file; also > commands, : a line, @ a symbol, # a project symbol, / a path anywhere |
-| Ctrl Shift P | Command palette |
-| Ctrl Shift O, Ctrl T | Go to a symbol in the file, in the project |
-| Ctrl Shift N | New window |
-| Ctrl O | Open a folder (or add one to this window) |
-| Ctrl N | New chat in a new tab |
-| Ctrl L | Add the selection to the chat |
-| Ctrl I | Toggle the AI panel |
-| Ctrl K | Edit with AI in the editor; in the terminal, write a command with AI |
-| Ctrl V in the chat | Paste a screenshot or a file |
-| Ctrl Shift Space | Voice input (in the editor: signature help) |
-| Enter | Send (while the agent works: add the message to the queue) |
-| Ctrl Enter | While the agent works: stop the reply and send this message at once |
-| Esc | Stop the agent, close a menu, a popup or the inline edit |
-| Ctrl ` | Focus or hide the terminal; Ctrl Shift ` opens a new one |
-| Ctrl B, Ctrl J | Toggle the Explorer, the bottom panel |
-| Ctrl Shift E, F, G, D | Explorer, Search, Source control, Run and Debug |
-| Ctrl Shift M, U, Y | Problems, Agent log, Debug console |
-| Ctrl S, Ctrl Shift S | Save, save all |
-| Ctrl W, Ctrl Tab | Close the tab, next tab (Ctrl Shift Tab goes back) |
-| Ctrl \\ | Split the editor, or close the split |
-| Ctrl Shift V | Markdown preview |
-| Ctrl Space | Suggestions |
-| F12, Alt F12, Ctrl F12 | Go to definition, peek it, go to the implementation |
-| Shift F12, F2 | Find all references, rename |
-| Ctrl . , Shift Alt F | Quick fix, format the document |
-| Alt \\ | Ask for an AI completion now; Tab inserts it |
-| Ctrl F, Ctrl H, Ctrl G | Find, replace, go to a line |
-| Alt Up, Alt Down | Move lines (with Shift: copy them) |
-| Ctrl Shift K, Ctrl Enter | Delete lines, open a line below (Ctrl Shift Enter: above, or Keep all during a review) |
-| Ctrl Shift Backspace | Undo all changes of a review |
-| F7, Shift F7 | Next and previous change of a review |
-| F5 | Start debugging, or continue |
-| Ctrl F5, Shift F5 | Run without debugging, stop debugging |
-| F9 | Toggle a breakpoint |
-| F10, F11, Shift F11 | Step over, into, out |
+| Ctrl I, Ctrl L, Ctrl Shift L | Toggle the AI panel; add the selection to a new chat (or toggle the AI panel); add the selection to the chat |
+| Ctrl E | Agent layout (the chat takes the window) |
+| Ctrl Shift J, Ctrl , | AI settings, all settings |
+| Ctrl Alt I, Ctrl Shift Alt I, Ctrl Shift Alt L | Open the chat, open it in Agent mode, quick chat |
+| Ctrl Alt . or Ctrl Alt / | Pick the model |
+| In the chat input | Enter sends (queues while the agent works), Ctrl Enter sends now (with changes waiting and an empty input: keeps them all), Shift Tab changes the mode, Ctrl Shift Backspace stops the reply (or undoes its changes), Up and Tab bring back earlier messages, Ctrl V of copied code adds it as a reference to its lines, Ctrl Shift V pastes plain text, Escape goes back to the editor |
+| Ctrl K in the editor | Inline edit; in its box Enter edits, Alt Enter asks a quick question instead, Ctrl Shift K moves between the box and the code, Ctrl Shift Backspace or Escape cancels |
+| Ctrl P, Ctrl Shift P, F1 | Go to a file; all commands |
+| Ctrl T, Ctrl Shift O, Ctrl G | All symbols, symbols of the file, a line |
+| Ctrl Shift N, Ctrl Shift W, Ctrl Q | New window, close the window, quit Forge |
+| Ctrl N, Ctrl O, Ctrl K Ctrl O, Ctrl K F | New Untitled file, open a file, open a folder, close the folder |
+| Ctrl S, Ctrl Shift S, Ctrl K S | Save, save as, save all |
+| Ctrl W, Ctrl K W, Ctrl K Ctrl W, Ctrl K U | Close the editor (the window when none is open), the group, all, the saved ones |
+| Ctrl Shift T, Ctrl K Enter | Reopen the closed editor, keep a preview tab |
+| Ctrl Tab, Ctrl Shift Tab, Ctrl Page Up and Down, Alt 1 to 9 | Recently used editors, next and previous editor, editor by number |
+| Ctrl \\, Ctrl 1, Ctrl 2, Shift Alt 0 | Split the editor, focus a group, side by side or stacked |
+| Ctrl K Ctrl Left and Right, Ctrl K Left and Right, Ctrl Alt Left and Right, Ctrl Shift Page Up and Down | Focus the other group, swap the groups, move the editor to the other group, move it along the tabs |
+| Ctrl Alt -, Ctrl Shift -, Ctrl K Ctrl Q | Go back, go forward, go to the last edit |
+| F8, Shift F8 | Next and previous problem |
+| Ctrl K P, Ctrl K Ctrl Shift C, Ctrl K R, Ctrl K O | Copy the path, copy the relative path, reveal in the Explorer, open in a new window |
+| Ctrl = , Ctrl -, Ctrl 0 | Zoom the window in, out, back to 100 percent |
+| F11, Ctrl K Z | Full screen, Zen mode (Escape twice leaves it) |
+| Ctrl B, Ctrl Alt B, Ctrl J | The side bar, the AI panel, the panel |
+| Ctrl Shift E, F, H, G, D, X | Explorer, search, replace in files, source control, run and debug, extensions (language servers and toolchains) |
+| Ctrl Shift M, U, Y, Ctrl K Ctrl H | Problems, output (agent log), debug console, output |
+| Ctrl ` , Ctrl Shift ` , Ctrl Shift 5, Ctrl Shift C | The terminal, a new terminal, split the terminal, the Terminal app |
+| In the terminal | Ctrl K writes a command with AI (Ctrl Enter in its box runs it at once), Ctrl Shift C and V copy and paste, Ctrl Shift Up and Down scroll a line, Shift Page Up and Down a page, Shift Home and End to the top and bottom, Ctrl Page Up and Down switch shells |
+| Ctrl D, Ctrl F2, Ctrl U, Shift Alt I | Next occurrence, all occurrences, undo a cursor step, cursors at the line ends |
+| Ctrl Alt Up and Down, Shift Alt Up and Down | Add a cursor above or below |
+| Alt Up and Down, Ctrl Shift Alt Up and Down | Move the lines, copy them |
+| Ctrl Shift K, Ctrl Enter, Ctrl Shift Enter | Delete the line, insert a line below, above |
+| Ctrl ] , Ctrl [ | Indent, outdent |
+| Ctrl / , Ctrl Shift A, Ctrl K Ctrl C, Ctrl K Ctrl U | Toggle the line comment, the block comment, add, remove |
+| Ctrl Shift [ and ], Ctrl K chords | Fold and unfold (section 11) |
+| Shift Alt Right and Left, Ctrl Shift \\ | Expand and shrink the selection, matching bracket |
+| Ctrl F, Ctrl H, F3, Shift F3, Ctrl F3 | Find, replace, next and previous match, the selection's next match |
+| Alt Enter in the find bar | Select every match (one cursor each) |
+| Alt Z, Ctrl M | Word wrap, Tab moves the focus |
+| Ctrl Space, Ctrl Shift Space | Suggestions, parameter hints |
+| Ctrl Shift I, Shift Alt F, Ctrl K Ctrl F | Format the document, the selection |
+| F12, Alt F12, Ctrl Shift F10, Ctrl K F12, Ctrl F12 | Definition, peek, peek, definition to the side, implementations |
+| Shift F12, F2, Ctrl . , Ctrl K Ctrl I | References, rename, quick fix, hover |
+| Ctrl K Ctrl X, Ctrl K M, Ctrl Shift . and , | Trim trailing whitespace, language mode, next and previous value |
+| Tab, Ctrl Right, Alt \\ | Accept the AI suggestion, accept its next word, ask for one now |
+| Ctrl K Ctrl T | Color theme: Forge Dark, Forge Midnight, Forge Dimmed and Forge High Contrast |
+| F5, Ctrl F5, Shift F5, Ctrl Shift F5, F9, F10, F11, Shift F11 | Debug: start or continue, run without debugging, stop, restart, breakpoint, step over, into, out |
+| Ctrl Shift B | Run a build task (npm scripts, make, Gradle, Cargo, Go, CMake or a build script, in a new terminal) |
 | Shift Enter in a notebook | Run the cell and go to the next |
-| Ctrl Shift C, Ctrl Shift V in the terminal | Copy the selection, paste (Ctrl C copies when text is selected) |
-| Ctrl R | Refresh the Explorer and the status |
 
 ## 24. Where things are
 
-Code in `~/projects/forge-ide`; data in `~/.forge-ide/` (settings, chats, checkpoints, images, attachments, memories, docs, hooks, commands, the codebase index, notepads, rules and models); folder settings, rules, memories and hooks in `.forge/` inside each folder; the app and this manual in Documents/Forge; exported chats in Documents/Forge/Chats; language servers in `~/.local/lib/forge-lsp`; whisper.cpp in `~/.local/lib/forge-voice`; the embedding server in `~/.local/lib/forge-embed`; the Kotlin, Java and XML language servers, the Kotlin compiler, Gradle, bundletool, forge-gradle and forge-cargo in `~/.local/lib/forge-android`; Rust in `~/.cargo` and `~/.rustup`; the Android SDK in `~/tools/android-sdk`; Gradle's memory settings in `~/.gradle/gradle.properties`; language server caches in `~/.forge-ide/lsp-cache`; the engine build in `~/tools/gpu-build`; Ollama tuning in `/etc/systemd/system/ollama.service.d/forge-tuning.conf`; helper logs in `~/.forge-ide/logs`; virtual devices in `~/.forge-ide/vd` (the device list, notices, the Android 17 downloads in `a17`, and what each protected image leaves out in `shield`), with their images and data in Podman's storage (`/var/lib/containers`); the target device in `~/.forge-ide/adb-target`; `forge-device`, `forge-vd-image` and `forge-vd-watchdog` in `bin/` of the Forge folder; the Forge Android guard in `/usr/local/lib/forge-guard` and `/etc/systemd/system/forge-android-guard.service`, with its status and reference in `/run/forge-android-guard`.
+Code in `~/projects/forge-ide`; data in `~/.forge-ide/` (settings, chats, checkpoints, images, attachments, memories, docs, hooks, commands, the codebase index, notepads, rules and models); folder settings, rules, memories and hooks in `.forge/` inside each folder; the app and this manual in Documents/Forge; exported chats in Documents/Forge/Chats; language servers in `~/.local/lib/forge-lsp`; whisper.cpp in `~/.local/lib/forge-voice`; the embedding server in `~/.local/lib/forge-embed`; the Kotlin, Java and XML language servers, the Kotlin compiler, Gradle, bundletool, forge-gradle and forge-cargo in `~/.local/lib/forge-android`; Rust in `~/.cargo` and `~/.rustup`; the Android SDK in `~/tools/android-sdk`; Gradle's memory settings in `~/.gradle/gradle.properties`; language server caches in `~/.forge-ide/lsp-cache`; the engine build in `~/tools/gpu-build`; Ollama tuning in `/etc/systemd/system/ollama.service.d/forge-tuning.conf`; helper logs in `~/.forge-ide/logs`; virtual devices in `~/.forge-ide/vd` (the device list, notices, the Android 17 downloads in `a17`, and what each protected image leaves out in `shield`), with their images and data in Podman's storage (`/var/lib/containers`); the target device in `~/.forge-ide/adb-target`; `forge-device`, `forge-vd-image` and `forge-vd-watchdog` in `bin/` of the Forge folder; the Forge Android guard in `/usr/local/lib/forge-guard` and `/etc/systemd/system/forge-android-guard.service` (not started at boot; the Forge server starts it), with its status and reference in `/run/forge-android-guard`; the server's socket in `~/.config/systemd/user/forge-ide.socket`.
 
 ## 25. Troubleshooting
 

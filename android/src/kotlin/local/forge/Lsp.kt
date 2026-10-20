@@ -649,6 +649,21 @@ class LspClient(val key: String) {
         }
     }
 
+    /** The edits that format part of the document (Ctrl K Ctrl F). */
+    fun rangeFormatting(path: String, line: Int, col: Int, endLine: Int, endCol: Int, tabSize: Int, insertSpaces: Boolean, cb: (List<Lsp.TextEdit>?, String?) -> Unit) {
+        if (!ready) { cb(null, "The language server is still starting."); return }
+        if (!has("documentRangeFormattingProvider")) { cb(null, "The $key language server cannot format a selection."); return }
+        sync(path)
+        val params = JSONObject().put("textDocument", textDocument(path)).put("range", Lsp.range(line, col, endLine, endCol))
+            .put("options", JSONObject().put("tabSize", tabSize).put("insertSpaces", insertSpaces))
+        request("textDocument/rangeFormatting", params, 20000) { r, err ->
+            if (err != null) { cb(null, err); return@request }
+            val out = ArrayList<Lsp.TextEdit>()
+            (r as? JSONArray)?.let { a -> for (i in 0 until a.length()) Lsp.parseEdit(a.optJSONObject(i))?.let { out.add(it) } }
+            cb(out, null)
+        }
+    }
+
     /** Quick fixes and refactorings for a range, with the diagnostics that touch it (Ctrl . and the light bulb). */
     fun codeActions(path: String, line: Int, col: Int, endLine: Int, endCol: Int, diags: List<Lsp.Diagnostic>, cb: (List<Lsp.CodeAction>, String?) -> Unit) {
         if (!ready) { cb(emptyList(), "The language server is still starting."); return }

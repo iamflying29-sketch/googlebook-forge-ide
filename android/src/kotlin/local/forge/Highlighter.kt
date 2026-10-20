@@ -245,5 +245,6 @@ object Highlighter {
     }
 
     fun lang(id: String): Lang = byId[id] ?: plain
+    fun allIds(): List<String> = byId.keys.sorted()
     fun langFor(path: String): Lang = lang(languageId(path))
 }

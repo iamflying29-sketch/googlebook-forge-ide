@@ -27,6 +27,7 @@ import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.TextView
 import org.json.JSONObject
+import android.widget.EditText
 
 /**
  * The intelligence of one code editor, the native port of the old page's lsp.js providers and of the AI parts of
@@ -863,6 +864,40 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
     }
 
     /** Asks the model for a short continuation at the cursor; the answer shows as ghost text that Tab inserts. */
+    fun requestCompletionPublic() = requestCompletion(null)
+
+    /** The inline edit box's input, while the box is open (Ctrl Shift K moves the focus between it and the code). */
+    private var inlineInput: EditText? = null
+    fun inlineOpen(): Boolean = inlineBar?.isShowing == true
+    fun focusInline() {
+        val pw = inlineBar ?: return
+        pw.isFocusable = true; pw.update()
+        inlineInput?.requestFocus()
+    }
+    fun requestSignaturePublic() = requestSignature()
+
+    /** Ctrl K Ctrl I: the hover of the symbol at the cursor, as if the pointer rested on it. */
+    fun hoverAtCursor() {
+        val r = editor.cursorRect()
+        requestHover(editor.cursorOffset(), r.left, r.bottom)
+    }
+
+    /** Ctrl K Ctrl F: the language server formats only the selected lines. */
+    fun formatSelection() {
+        val client = clientOrSay() ?: return
+        val a = minOf(editor.edit.selectionStart, editor.edit.selectionEnd); val b = maxOf(editor.edit.selectionStart, editor.edit.selectionEnd)
+        if (a == b) { format(); return }
+        val (l1, c1) = editor.lineColOf(a); val (l2, c2) = editor.lineColOf(b)
+        val before = editor.text()
+        client.rangeFormatting(path, l1, c1, l2, c2, editor.lang.tabSize, true) { edits, err ->
+            if (edits == null) { Ui.toast(ctx, err ?: "Not formatted."); return@rangeFormatting }
+            if (editor.text() != before) { Ui.toast(ctx, "The file changed while it was being formatted. Try again."); return@rangeFormatting }
+            if (edits.isEmpty()) { Ui.toast(ctx, "Already formatted."); return@rangeFormatting }
+            applying = true
+            try { editor.applyEdits(edits) } finally { applying = false }
+        }
+    }
+
     fun requestGhost(manual: Boolean) {
         if (detached || generating) return
         if (!manual && (!ForgeSettings.bool("tab_completions", false) || completionPopup != null)) return
@@ -954,12 +989,27 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
         input.setOnEditorActionListener { _, _, _ -> go(); true }
         input.setOnKeyListener { _, code, ev ->
             if (ev.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
-            when (code) {
-                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> { go(); true }
-                KeyEvent.KEYCODE_ESCAPE -> { if (generating) cancelInline() else pw.dismiss(); true }
+            when {
+                // Alt Enter: a quick question about the code instead of an edit; the answer appears in the AI panel.
+                (code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_NUMPAD_ENTER) && ev.isAltPressed -> {
+                    val q = input.text.toString().trim()
+                    if (q.isNotEmpty()) {
+                        val code0 = editor.text().substring(start.coerceIn(0, editor.text().length), end.coerceIn(start, editor.text().length))
+                        val rec = if (code0.isNotEmpty()) JSONObject().put("kind", "text").put("title", path.substringAfterLast('/') + " " + (editor.lineColOf(start).first + 1) + "-" + (editor.lineColOf(end).first + 1)).put("name", path).put("text", code0) else null
+                        pw.dismiss(); host.quickAsk(q, "ask", rec)
+                    }
+                    true
+                }
+                code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_NUMPAD_ENTER -> { go(); true }
+                code == KeyEvent.KEYCODE_ESCAPE -> { if (generating) cancelInline() else pw.dismiss(); true }
+                // Ctrl Shift Backspace cancels, as in Cursor.
+                code == KeyEvent.KEYCODE_DEL && ev.isCtrlPressed && ev.isShiftPressed -> { if (generating) cancelInline() else pw.dismiss(); true }
+                // Ctrl Shift K: the focus goes back to the code while the box stays open (and Ctrl Shift K there returns).
+                code == KeyEvent.KEYCODE_K && ev.isCtrlPressed && ev.isShiftPressed -> { pw.isFocusable = false; pw.update(); editor.focus(); true }
                 else -> false
             }
         }
+        inlineInput = input
         try { pw.showAtLocation(editor.edit, Gravity.NO_GRAVITY, x, y) } catch (ex: Exception) { android.util.Log.w("ForgeSmarts", "inline bar not shown", ex); inlineBar = null; return }
         if (prefill.isNotEmpty()) input.setText(prefill)
         input.requestFocus()

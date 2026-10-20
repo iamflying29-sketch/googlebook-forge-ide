@@ -495,6 +495,11 @@ class TerminalView(ctx: Context) : View(ctx) {
         if (shift && keyCode == KeyEvent.KEYCODE_INSERT) { paste(); return true }
         if (shift && keyCode == KeyEvent.KEYCODE_PAGE_UP) { scrollLines(rows - 1); return true }
         if (shift && keyCode == KeyEvent.KEYCODE_PAGE_DOWN) { scrollLines(-(rows - 1)); return true }
+        // Cursor's terminal keys: Ctrl Shift Up and Down scroll a line, Shift Home and End go to the top and the bottom.
+        if (ctrl && shift && keyCode == KeyEvent.KEYCODE_DPAD_UP) { scrollLines(1); return true }
+        if (ctrl && shift && keyCode == KeyEvent.KEYCODE_DPAD_DOWN) { scrollLines(-1); return true }
+        if (shift && !ctrl && keyCode == KeyEvent.KEYCODE_MOVE_HOME) { scrollLines(term.scrollbackSize); return true }
+        if (shift && !ctrl && keyCode == KeyEvent.KEYCODE_MOVE_END) { scrollToBottom(); return true }
 
         val mod = modifierParam(shift, alt, ctrl)
         val app = term.appCursorKeys

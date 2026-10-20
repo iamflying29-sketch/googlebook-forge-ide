@@ -1,6 +1,9 @@
 #!/usr/bin/python3 -I
-"""Forge Android guard: protects the Linux VM from Android running in a container (Forge's virtual devices, and any
-other Android container such as WayDroid).
+"""Forge Android guard: protects the Linux VM from Android running in Forge's virtual devices.
+
+It looks after Forge's own containers only (the ones podman runs for Forge's virtual devices, found by their
+control group) and never touches any other container. It runs only while Forge runs: the Forge server starts it and
+Quit Forge stops it.
 
 Android in a container shares the VM's kernel, and a privileged container cannot hide the kernel's global controls,
 because Android mounts its own /proc and /sys. This service (run as root by systemd) protects the VM in four ways.
@@ -47,6 +50,9 @@ PATTERN = re.compile(rb"\binit: (Received sys\.powerctl=|Reboot start|InitFatalR
 STARTING = re.compile(rb"\binit: init (first|second) stage started")
 STATUS_DIR = "/run/forge-android-guard"
 WAKE_LOCK = "forge_guard_no_suspend"
+# The containers this guard looks after, by a mark in their control group path (podman runs Forge's devices).
+SCOPE_MARKS = ("libpod-",)
+SCOPE_NAME = "Forge's virtual devices"
 
 # Settings the kernel changes by itself, or that are counters and not settings.
 VOLATILE = re.compile(r"^(kernel/random/|kernel/ns_last_pid$|kernel/tainted$|kernel/perf_event_max_sample_rate$|"
@@ -98,8 +104,19 @@ def write_status(name: str, data: dict) -> None:
 
 
 # ------------------------------------------------------------------ Android processes
-def namespace_inits():
-    """(pid, comm) of every process that is PID 1 of a nested PID namespace (a container's first process)."""
+def in_scope(pid) -> bool:
+    """True when the process belongs to one of this guard's containers."""
+    try:
+        with open(f"/proc/{pid}/cgroup", "rb") as f:
+            text = f.read(4096).decode("utf-8", "replace")
+    except OSError:
+        return False
+    return any(mark in text for mark in SCOPE_MARKS)
+
+
+def namespace_inits(scoped: bool = True):
+    """(pid, comm) of every process that is PID 1 of a nested PID namespace (a container's first process), only this
+    guard's containers unless scoped is False."""
     for name in os.listdir("/proc"):
         if not name.isdigit():
             continue
@@ -111,7 +128,7 @@ def namespace_inits():
                         comm = line.split(None, 1)[1].strip() if len(line.split()) > 1 else b""
                     elif line.startswith(b"NSpid:"):
                         ids = line.split()[1:]
-                        if len(ids) >= 2 and ids[-1] == b"1":
+                        if len(ids) >= 2 and ids[-1] == b"1" and (not scoped or in_scope(name)):
                             yield int(name), comm
                         break
         except OSError:
@@ -133,13 +150,15 @@ def nested_named(names):
                     elif line.startswith(b"NSpid:"):
                         nested = len(line.split()) > 2
                         break
-            if nested and comm in names:
+            if nested and comm in names and in_scope(name):
                 yield int(name)
         except OSError:
             continue
 
 
 def act(message: bytes) -> None:
+    """The kernel log does not say which container wrote a line, so every running container of this guard is ended;
+    containers that are not this guard's are never touched."""
     killed = []
     for pid, comm in namespace_inits():
         if comm != b"init":
@@ -150,6 +169,8 @@ def act(message: bytes) -> None:
         except OSError:
             pass
     text = message.decode("utf-8", "replace").strip()[:300]
+    if not killed:
+        return   # not one of this guard's containers
     log(f"Android began to shut down or to load SELinux ({text}); ended container init {killed}")
     write_status("last.json", {"time": time.time(), "message": text, "killed": killed})
 
@@ -476,6 +497,12 @@ def android_running() -> bool:
     return any(True for _ in namespace_inits())
 
 
+def any_container_android() -> bool:
+    """Any Android container at all, this guard's or not. Only read, so the reference of the VM's settings is taken
+    while no Android anywhere has changed them."""
+    return any(True for _ in namespace_inits(scoped=False))
+
+
 def shield() -> None:
     hold_locks()
     proc_ref = proc_reference()
@@ -508,10 +535,11 @@ def shield() -> None:
                 if now - last_ref >= 300:
                     # Refresh the reference so your own changes are kept, but only if no Android started while it
                     # was being taken (Android changes things within its first second).
-                    hold_locks()
-                    new_ref = capture()
-                    if not android_running():
-                        ref = new_ref
+                    if not any_container_android():
+                        hold_locks()
+                        new_ref = capture()
+                        if not any_container_android():
+                            ref = new_ref
                     last_ref = now
             unlogged = [f for f in fixes if logged.get(f, -1e9) < now - 600]   # the same fix is logged at most every ten minutes
             for fix in unlogged[:15]:

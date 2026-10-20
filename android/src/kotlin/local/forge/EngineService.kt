@@ -225,6 +225,9 @@ class EngineService : Service() {
 
         fun start(ctx: Context) { ctx.startForegroundService(Intent(ctx, EngineService::class.java).setAction(ACTION_START)) }
         fun stop(ctx: Context) { ctx.startService(Intent(ctx, EngineService::class.java).setAction(ACTION_STOP)) }
+
+        /** Quit Forge: the engine process ends now, on this thread, before the app's own process goes away. */
+        fun stopNow(why: String) { instance?.stopEngine(why) }
     }
 
     @Volatile internal var proc: Process? = null
@@ -504,7 +507,7 @@ class EngineService : Service() {
         log("model downloaded: " + dest.name + " $size bytes")
     }
 
-    private fun stopEngine(why: String) {
+    internal fun stopEngine(why: String) {
         stopping = true
         val p = proc
         if (p != null) {

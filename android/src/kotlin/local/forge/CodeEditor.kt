@@ -61,6 +61,8 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
         private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "forge-highlight").also { it.isDaemon = true } }
 
         fun severityColor(severity: Int): Int = when (severity) { 1 -> Ui.red; 2 -> Ui.yellow; 3 -> Ui.blue; else -> Ui.fg3 }
+        /** Ctrl M: the Tab key moves the focus out of the editor instead of typing (for keyboard navigation). */
+        var tabMovesFocus = false
     }
 
     /** The language of the file, set by setContent(); changing it re-colors the visible region. */
@@ -101,6 +103,8 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
     /** Every change as (start, removed length, added text), for the twin editor of a split view; mirrored changes are not reported. */
     var changeHook: ((Int, Int, String) -> Unit)? = null
     private var mirroring = false
+    /** Set once the whole editor exists (the EditText calls back while it is being constructed). */
+    private var editorReady = false
 
     /** A change under review (the inline diff of the agent's edits or of Ctrl K): lines b0 until b1 of the text are new
      *  and [removed] are the lines they replaced, shown in red above them. */
@@ -266,6 +270,7 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
                 val added = s.subSequence(start, start + count).toString()
                 if (!muteHistory) record(Edit(start, pendingRemoved, added, System.currentTimeMillis()))
                 if (!mirroring) changeHook?.invoke(start, before, added)
+                if (editorReady) { shiftCursors(start, before, count); foldsAfterEdit(start, before, count) }
             }
             override fun afterTextChanged(s: Editable) {
                 textVersion++
@@ -320,6 +325,7 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
         dropZones()
         executionLine = -1
         ghost = null; ghostOffset = -1
+        dropFoldsForNewText(); extra.clear(); cursorUndo.clear(); expandStack.clear()
         muteHistory = true
         edit.setText(text)
         muteHistory = false
@@ -335,6 +341,7 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
         dropZones()
         val sel = edit.selectionStart.coerceAtLeast(0)
         val sx = edit.scrollX; val sy = edit.scrollY
+        dropFoldsForNewText(); extra.clear(); cursorUndo.clear(); expandStack.clear()
         muteHistory = true
         edit.setText(text)
         muteHistory = false
@@ -361,10 +368,9 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
     fun goTo(line0: Int, col0: Int) {
         val l = edit.layout
         if (l == null) { post { goTo(line0, col0) }; return }
-        val line = line0.coerceIn(0, l.lineCount - 1)
-        val off = (l.getLineStart(line) + col0.coerceAtLeast(0)).coerceAtMost(l.getLineEnd(line))
+        val off = offsetOf(line0.coerceAtLeast(0), col0)
         edit.setSelection(off)
-        val y = (l.getLineTop(line) - edit.height / 3).coerceIn(0, maxScrollY())
+        val y = (l.getLineTop(l.getLineForOffset(off)) - edit.height / 3).coerceIn(0, maxScrollY())
         edit.scrollTo(0, y)
         edit.requestFocus()
     }
@@ -383,7 +389,7 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
     fun askGoToLine() {
         val input = Ui.input(context, "Line number", mono = true)
         input.inputType = InputType.TYPE_CLASS_NUMBER
-        val lines = edit.layout?.lineCount ?: 1
+        val lines = lineCount()
         val dialog = AlertDialog.Builder(context).setTitle("Go to line (1 to $lines)").setView(input)
             .setPositiveButton("Go") { _, _ -> input.text.toString().trim().toIntOrNull()?.let { goToLine(it) } }
             .setNegativeButton("Cancel", null).create()
@@ -449,7 +455,8 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
         return Rect(x, top, x + 1, bottom)
     }
 
-    fun lineCount(): Int = edit.layout?.lineCount ?: (edit.text.count { it == '\n' } + 1)
+    /** The number of lines of the text itself (wrapped lines count once). */
+    fun lineCount(): Int = logicalStarts().size
 
     // ------------------------------------------------------------------ decorations
     /** The diagnostics of this file: wavy underlines in the text and marks in the gutter. */
@@ -470,13 +477,48 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
 
     fun diagnosticsOnLine(line0: Int): List<Lsp.Diagnostic> = diagnostics.filter { line0 >= it.line && line0 <= it.endLine }
 
+    /** F8 and Shift F8: the cursor goes to the next or previous problem of this file; false when there is none. */
+    fun gotoDiagnostic(dir: Int): Boolean {
+        if (diagnostics.isEmpty()) return false
+        val here = cursorOffset()
+        val offs = diagnostics.map { offsetOf(it.line, it.col) }.distinct().sorted()
+        val target = if (dir > 0) offs.firstOrNull { it > here } else offs.lastOrNull { it < here }
+        if (target == null) return false
+        val (l, c) = lineColOf(target)
+        goTo(l, c)
+        val d = diagnostics.firstOrNull { offsetOf(it.line, it.col) == target }
+        if (d != null) Ui.toast(context, d.message.take(200))
+        return true
+    }
+
+    /** Ctrl Shift . and Ctrl Shift , : the number at the cursor goes up or down by one, true and false swap, and so on. */
+    fun inPlaceReplace(dir: Int) {
+        val t = edit.text
+        val c = cursorOffset()
+        // A number (with a sign and decimals) around the cursor.
+        var a = c; var b = c
+        while (a > 0 && (t[a - 1].isDigit() || t[a - 1] == '.')) a--
+        while (b < t.length && (t[b].isDigit() || t[b] == '.')) b++
+        if (a > 0 && t[a - 1] == '-' ) a--
+        val num = t.subSequence(a, b).toString()
+        if (num.isNotEmpty() && num != "-" && num != ".") {
+            val out = if (num.contains('.')) { val dec = num.substringAfter('.').length; String.format(java.util.Locale.ROOT, "%." + dec + "f", num.toDouble() + dir * Math.pow(10.0, -dec.toDouble())) }
+                else (num.toLongOrNull()?.plus(dir))?.toString() ?: return
+            replaceText(a, b, out, a, a + out.length); return
+        }
+        val w = wordRangeAt(c); if (w.isEmpty()) return
+        val word = t.subSequence(w.first, w.last + 1).toString()
+        val cycles = listOf(listOf("true", "false"), listOf("True", "False"), listOf("TRUE", "FALSE"), listOf("yes", "no"), listOf("on", "off"), listOf("public", "protected", "private"), listOf("let", "const", "var"))
+        for (cy in cycles) { val i = cy.indexOf(word); if (i >= 0) { val out = cy[((i + dir) % cy.size + cy.size) % cy.size]; replaceText(w.first, w.last + 1, out, w.first, w.first + out.length); return } }
+    }
+
     /** Highlights the 1-based line the debugger is paused on and scrolls to it; null clears the highlight. */
     fun showExecutionLine(line: Int?) {
         executionLine = if (line == null || line < 1) -1 else line - 1
         if (executionLine >= 0) {
             val l = edit.layout
             if (l != null) {
-                val ln = executionLine.coerceAtMost(l.lineCount - 1)
+                val ln = layoutLineOf(executionLine)
                 val top = l.getLineTop(ln); val bottom = l.getLineBottom(ln)
                 val visibleTop = edit.scrollY; val visibleBottom = edit.scrollY + edit.height
                 if (top < visibleTop || bottom > visibleBottom) edit.scrollTo(edit.scrollX, (top - edit.height / 3).coerceIn(0, maxScrollY()))
@@ -520,6 +562,7 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
      */
     fun setReview(hunks: List<ReviewHunk>, label: String) {
         review = hunks
+        setWordWrap(wrapWanted)
         if (hunks.isEmpty()) reviewIndex = -1 else if (reviewIndex >= hunks.size) reviewIndex = hunks.size - 1
         applyZones()
         if (hunks.isEmpty()) { reviewBar.visibility = View.GONE; if (!edit.isCursorVisible) edit.isCursorVisible = true }
@@ -667,6 +710,24 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
     fun clearGhost() { if (ghost != null) { ghost = null; ghostOffset = -1; edit.invalidate() } }
     fun hasGhost(): Boolean = ghost != null
 
+    /** Ctrl Right while a suggestion shows: only its next word goes in (Cursor's "accept next word"). */
+    fun acceptGhostWord(): Boolean {
+        val g = ghost ?: return false
+        val at = ghostOffset
+        if (at != cursorOffset()) return false
+        var i = 0
+        while (i < g.length && g[i].isWhitespace() && g[i] != '\n') i++
+        if (i < g.length && g[i] == '\n') i++ else {
+            if (i < g.length && isWordChar(g[i])) { while (i < g.length && isWordChar(g[i])) i++ } else if (i < g.length) i++
+        }
+        val word = g.substring(0, i)
+        val rest = g.substring(i)
+        ghost = null; ghostOffset = -1
+        replaceText(at, at, word)
+        if (rest.isNotEmpty()) showGhost(rest)
+        return true
+    }
+
     fun acceptGhost(): Boolean {
         val g = ghost ?: return false
         val at = ghostOffset
@@ -742,6 +803,7 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
     // ------------------------------------------------------------------ keys
     private fun handleKey(code: Int, ev: KeyEvent): Boolean {
         if (keyHook?.invoke(code, ev) == true) return true
+        if (handleMultiKey(code, ev)) return true
         val shift = ev.isShiftPressed
         if (review.isNotEmpty()) {
             if (ev.isCtrlPressed && shift && (code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_NUMPAD_ENTER)) { onReviewAll?.invoke(true); return true }
@@ -752,36 +814,65 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
             when (code) {
                 KeyEvent.KEYCODE_Z -> { if (shift) redo() else undo(); return true }
                 KeyEvent.KEYCODE_Y -> { redo(); return true }
-                KeyEvent.KEYCODE_D -> { duplicateLine(); return true }
+                // Ctrl D adds the next occurrence as a cursor, as in VS Code and Cursor.
+                KeyEvent.KEYCODE_D -> if (!shift) { addNextOccurrence(); return true }
+                KeyEvent.KEYCODE_U -> if (!shift) { undoCursorOperation(); return true }
                 KeyEvent.KEYCODE_SLASH -> { toggleComment(); return true }
-                KeyEvent.KEYCODE_F -> { showFind(); return true }
-                KeyEvent.KEYCODE_H -> { showReplace(); return true }
-                KeyEvent.KEYCODE_G -> { askGoToLine(); return true }
+                KeyEvent.KEYCODE_F -> if (!shift) { showFind(); return true }
+                KeyEvent.KEYCODE_H -> if (!shift) { showReplace(); return true }
+                KeyEvent.KEYCODE_G -> if (!shift) { askGoToLine(); return true }
+                KeyEvent.KEYCODE_A -> if (shift) { toggleBlockComment(); return true }
                 KeyEvent.KEYCODE_K -> if (shift) { deleteLines(); return true }
+                KeyEvent.KEYCODE_C -> if (!shift && copyLineIfEmpty(cut = false)) return true
+                KeyEvent.KEYCODE_X -> if (!shift && copyLineIfEmpty(cut = true)) return true
+                KeyEvent.KEYCODE_V -> if (!shift && pasteLineIfCopied()) return true
                 KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> { insertLine(below = !shift); return true }
-                KeyEvent.KEYCODE_RIGHT_BRACKET -> { indent(force = true); return true }
-                KeyEvent.KEYCODE_LEFT_BRACKET -> { outdent(); return true }
+                KeyEvent.KEYCODE_RIGHT_BRACKET -> { if (shift) unfoldAtCursor() else indent(force = true); return true }
+                KeyEvent.KEYCODE_LEFT_BRACKET -> { if (shift) foldAtCursor() else outdent(); return true }
+                KeyEvent.KEYCODE_BACKSLASH -> if (shift) { jumpToBracket(); return true }
+                KeyEvent.KEYCODE_F2 -> { selectAllOccurrences(); return true }
+                KeyEvent.KEYCODE_F3 -> { findSelectionNext(!shift); return true }
+                KeyEvent.KEYCODE_DEL -> { deleteWord(back = true); return true }
+                KeyEvent.KEYCODE_FORWARD_DEL -> { deleteWord(back = false); return true }
+                KeyEvent.KEYCODE_DPAD_LEFT -> { cursorWordLeft(shift); return true }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> { if (!shift && ghost != null && acceptGhostWord()) return true; cursorWordRight(shift); return true }
+                KeyEvent.KEYCODE_DPAD_UP -> if (!shift) { scrollLines(-1); return true }
+                KeyEvent.KEYCODE_DPAD_DOWN -> if (!shift) { scrollLines(1); return true }
+                KeyEvent.KEYCODE_MOVE_HOME -> { cursorDocument(end = false, extend = shift); return true }
+                KeyEvent.KEYCODE_MOVE_END -> { cursorDocument(end = true, extend = shift); return true }
             }
             return false
         }
         if (ev.isAltPressed) {
+            val ctrl = ev.isCtrlPressed
             when (code) {
-                KeyEvent.KEYCODE_DPAD_UP -> { if (shift) copyLines(up = true) else moveLines(up = true); return true }
-                KeyEvent.KEYCODE_DPAD_DOWN -> { if (shift) copyLines(up = false) else moveLines(up = false); return true }
+                // Alt Up and Down move lines; Ctrl Shift Alt (Linux) copies them; Shift Alt (Linux) and Ctrl Alt
+                // (Windows) add a cursor above or below.
+                KeyEvent.KEYCODE_DPAD_UP -> { if (ctrl && shift) copyLines(up = true) else if (shift || ctrl) addCursorVertical(-1) else moveLines(up = true); return true }
+                KeyEvent.KEYCODE_DPAD_DOWN -> { if (ctrl && shift) copyLines(up = false) else if (shift || ctrl) addCursorVertical(1) else moveLines(up = false); return true }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> if (shift && !ctrl) { expandSelection(); return true }
+                KeyEvent.KEYCODE_DPAD_LEFT -> if (shift && !ctrl) { shrinkSelection(); return true }
+                KeyEvent.KEYCODE_I -> if (shift && !ctrl) { cursorsAtLineEnds(); return true }
+                KeyEvent.KEYCODE_Z -> if (!shift && !ctrl) { toggleWordWrap(); return true }
+                KeyEvent.KEYCODE_PAGE_UP -> if (!ctrl) { scrollPage(-1); return true }
+                KeyEvent.KEYCODE_PAGE_DOWN -> if (!ctrl) { scrollPage(1); return true }
             }
             return false
         }
         if (ev.isMetaPressed) return false
         if (ev.unicodeChar != 0 && autoPair(ev.unicodeChar.toChar())) return true
         when (code) {
+            KeyEvent.KEYCODE_F3 -> { findNextMatch(!shift); return true }
             KeyEvent.KEYCODE_MOVE_HOME -> { smartHome(shift); return true }
             KeyEvent.KEYCODE_DEL -> if (deletePair()) return true
             KeyEvent.KEYCODE_TAB -> {
+                if (tabMovesFocus) { edit.focusSearch(if (ev.isShiftPressed) View.FOCUS_BACKWARD else View.FOCUS_FORWARD)?.requestFocus(); return true }
                 if (!ev.isShiftPressed && ghost != null) { if (acceptGhost()) return true }
                 if (ev.isShiftPressed) outdent() else indent(); return true
             }
             KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> { if (ev.isShiftPressed) return false; newlineWithIndent(); return true }
             KeyEvent.KEYCODE_ESCAPE -> {
+                if (extra.isNotEmpty()) { clearExtraCursors(); return true }
                 if (ghost != null) { clearGhost(); return true }
                 if (findBar.visibility == View.VISIBLE) { hideFind(); return true }
             }
@@ -1190,12 +1281,952 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
         if (nearTop || nearBottom) scheduleHighlight(0)
     }
 
-    override fun onAttachedToWindow() { super.onAttachedToWindow(); scheduleHighlight(0) }
+    override fun onAttachedToWindow() { super.onAttachedToWindow(); editorReady = true; scheduleHighlight(0) }
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
         Api.main.removeCallbacks(highlightTask); Api.main.removeCallbacks(scrollTask)
         edit.cancelHover()
     }
+
+    // ------------------------------------------------------------------ logical lines (word wrap) and folding helpers
+    /** Start offsets of the logical lines (the text's own lines), cached until the text changes. */
+    private var starts = IntArray(1)
+    private var startsVersion = -1
+
+    private fun logicalStarts(): IntArray {
+        if (startsVersion == textVersion) return starts
+        val t = edit.text
+        var n = 1
+        for (i in 0 until t.length) if (t[i] == '\n') n++
+        val a = IntArray(n)
+        var k = 1
+        for (i in 0 until t.length) if (t[i] == '\n') { a[k++] = i + 1 }
+        starts = a; startsVersion = textVersion
+        return a
+    }
+
+    /** The logical (0-based) line that holds an offset. */
+    fun logicalLineAt(offset: Int): Int {
+        val a = logicalStarts()
+        var lo = 0; var hi = a.size - 1
+        while (lo < hi) { val mid = (lo + hi + 1) / 2; if (a[mid] <= offset) lo = mid else hi = mid - 1 }
+        return lo
+    }
+
+    /** The first layout line of a logical line (the same number unless words wrap). */
+    fun layoutLineOf(logical: Int): Int {
+        val l = edit.layout ?: return logical
+        if (!wordWrap) return logical.coerceIn(0, l.lineCount - 1)
+        val a = logicalStarts()
+        return l.getLineForOffset(a[logical.coerceIn(0, a.size - 1)])
+    }
+
+    /** The logical line a layout line belongs to. */
+    fun logicalOfLayout(line: Int): Int {
+        val l = edit.layout ?: return line
+        if (!wordWrap) return line
+        return logicalLineAt(l.getLineStart(line.coerceIn(0, l.lineCount - 1)))
+    }
+
+    /** True when a layout line begins a logical line (a wrapped continuation shows no line number). */
+    fun startsLogicalLine(line: Int): Boolean {
+        val l = edit.layout ?: return true
+        if (!wordWrap) return true
+        val s = l.getLineStart(line)
+        return s == 0 || edit.text[s - 1] == '\n'
+    }
+
+    // ------------------------------------------------------------------ word wrap (Alt Z)
+    /** Long lines wrap at the window's edge instead of scrolling sideways. While a change is under review the text does
+     *  not wrap (the review's zones are measured per line), and it wraps again afterwards. */
+    var wordWrap = false
+        private set
+    private var wrapWanted = false
+
+    fun setWordWrap(on: Boolean) {
+        wrapWanted = on
+        val effective = on && review.isEmpty()
+        if (effective == wordWrap) return
+        wordWrap = effective
+        val sel = edit.selectionEnd
+        edit.setHorizontallyScrolling(!effective)
+        if (effective) edit.scrollTo(0, edit.scrollY)
+        post { edit.bringPointIntoView(sel.coerceIn(0, edit.text.length)); gutter.onLinesChanged(); minimap.invalidate() }
+    }
+
+    fun toggleWordWrap() = setWordWrap(!wrapWanted)
+
+    // ------------------------------------------------------------------ render whitespace
+    var renderWhitespace = false
+        set(v) { field = v; edit.invalidate() }
+
+    // ------------------------------------------------------------------ multiple cursors (Ctrl D, Alt click, Ctrl Alt arrows)
+    /** One selection: [anchor] stays where it began and [head] is the caret. */
+    class Sel(var anchor: Int, var head: Int) {
+        val start: Int get() = minOf(anchor, head)
+        val end: Int get() = maxOf(anchor, head)
+    }
+
+    /** The extra selections; the primary one is the EditText's own selection. */
+    private val extra = ArrayList<Sel>()
+    /** Earlier sets of cursors, for Ctrl U (undo the last cursor operation). The last entry of each is the primary. */
+    private val cursorUndo = ArrayList<List<Sel>>()
+    /** True while this class rewrites the text for every cursor, so the text watcher does not shift them again. */
+    private var caretOps = false
+    /** Text copied from several cursors, one piece per cursor, so a paste with as many cursors gives each its own. */
+    private var multiClip: List<String>? = null
+    /** Text copied by Ctrl C or Ctrl X with no selection (a whole line), which Ctrl V puts above the current line. */
+    private var lineClip: String? = null
+
+    fun cursorCount(): Int = extra.size + 1
+    fun hasMultipleCursors(): Boolean = extra.isNotEmpty()
+
+    private fun primarySel(): Sel = Sel(edit.selectionStart.coerceAtLeast(0), edit.selectionEnd.coerceAtLeast(0))
+    private fun allSels(): List<Sel> = (extra.map { Sel(it.anchor, it.head) } + primarySel()).sortedBy { it.start }
+
+    private fun snapshotCursors() {
+        cursorUndo.add(extra.map { Sel(it.anchor, it.head) } + primarySel())
+        if (cursorUndo.size > 60) cursorUndo.removeAt(0)
+    }
+
+    fun clearExtraCursors() {
+        if (extra.isEmpty()) return
+        extra.clear(); cursorUndo.clear()
+        edit.invalidate()
+    }
+
+    /** Sets every cursor at once: overlapping selections merge, and the one whose caret is nearest [primaryHead]
+     *  becomes the EditText's own selection. */
+    private fun setCursors(sels: List<Sel>, primaryHead: Int) {
+        val n = edit.text.length
+        val clean = sels.map { Sel(it.anchor.coerceIn(0, n), it.head.coerceIn(0, n)) }.sortedBy { it.start }
+        val merged = ArrayList<Sel>()
+        for (s in clean) {
+            val last = merged.lastOrNull()
+            if (last != null && (s.start < last.end || s.start == last.start)) {
+                val a = minOf(last.start, s.start); val b = maxOf(last.end, s.end)
+                if (last.head >= last.anchor) { last.anchor = a; last.head = b } else { last.anchor = b; last.head = a }
+                continue
+            }
+            merged.add(s)
+        }
+        if (merged.isEmpty()) return
+        val p = merged.minByOrNull { Math.abs(it.head - primaryHead) } ?: merged.last()
+        extra.clear()
+        for (s in merged) if (s !== p) extra.add(s)
+        caretOps = true
+        try { edit.setSelection(p.anchor, p.head) } finally { caretOps = false }
+        edit.bringPointIntoView(p.head)
+        edit.invalidate(); gutter.invalidate()
+    }
+
+    /** Moves the extra cursors along with a change made somewhere else (typing at the primary cursor, an undo). */
+    private fun shiftCursors(start: Int, before: Int, count: Int) {
+        if (extra.isEmpty() || caretOps) return
+        fun move(p: Int): Int = when {
+            p >= start + before -> p + count - before
+            p > start -> start + count
+            else -> p
+        }
+        for (s in extra) { s.anchor = move(s.anchor); s.head = move(s.head) }
+    }
+
+    /** One replacement per cursor: [start] until [end] becomes [text]; afterwards the selection is [anchorAfter] to
+     *  [headAfter], both counted from [start]. */
+    private class Change(val start: Int, val end: Int, val text: String, val anchorAfter: Int, val headAfter: Int)
+
+    /** Applies one change per cursor as a single undo step (one replacement of the region they span). */
+    private fun editAll(f: (Sel) -> Change?) {
+        val prim = primarySel()
+        val sels = allSels()
+        val planned = ArrayList<Pair<Sel, Change?>>()
+        for (s in sels) planned.add(s to f(s))
+        val changes = planned.mapNotNull { (s, c) -> if (c == null) null else s to c }.sortedBy { it.second.start }
+        if (changes.isEmpty()) return
+        val kept = ArrayList<Pair<Sel, Change>>()
+        var lastEnd = -1
+        for (p in changes) { if (p.second.start < lastEnd) continue; kept.add(p); lastEnd = p.second.end }
+        val t = edit.text
+        val regionStart = kept.first().second.start
+        val regionEnd = kept.last().second.end
+        val sb = StringBuilder()
+        var pos = regionStart
+        var delta = 0
+        val out = ArrayList<Sel>()
+        var primHead = prim.head
+        val changedSels = HashSet<Sel>()
+        for ((s, c) in kept) {
+            sb.append(t, pos, c.start)
+            val newStart = c.start + delta
+            sb.append(c.text)
+            out.add(Sel(newStart + c.anchorAfter, newStart + c.headAfter))
+            if (s.anchor == prim.anchor && s.head == prim.head) primHead = newStart + c.headAfter
+            delta += c.text.length - (c.end - c.start)
+            pos = c.end
+            changedSels.add(s)
+        }
+        // Cursors without a change of their own move with the changes before them.
+        for ((s, _) in planned) {
+            if (s in changedSels) continue
+            var d = 0
+            for ((_, c) in kept) if (c.end <= s.start) d += c.text.length - (c.end - c.start)
+            out.add(Sel(s.anchor + d, s.head + d))
+            if (s.anchor == prim.anchor && s.head == prim.head) primHead = s.head + d
+        }
+        caretOps = true
+        try { replaceText(regionStart, regionEnd, sb.toString()) } finally { caretOps = false }
+        setCursors(out, primHead)
+    }
+
+    private fun clipboard(): android.content.ClipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+
+    private fun clipText(): String = try { clipboard().primaryClip?.getItemAt(0)?.coerceToText(context)?.toString() ?: "" } catch (e: Exception) { "" }
+
+    private fun setClip(text: String) { try { clipboard().setPrimaryClip(android.content.ClipData.newPlainText("Forge", text)) } catch (e: Exception) { } }
+
+    private fun lineIndentAt(pos: Int): String {
+        val t = edit.text
+        val ls = lineStartOf(pos)
+        var i = ls
+        while (i < t.length && (t[i] == ' ' || t[i] == '\t')) i++
+        return t.subSequence(ls, i).toString()
+    }
+
+    private fun wordLeft(pos: Int): Int {
+        val t = edit.text
+        var i = pos
+        while (i > 0 && t[i - 1].isWhitespace() && t[i - 1] != '\n') i--
+        if (i > 0 && t[i - 1] == '\n' && i == pos) return i - 1
+        if (i > 0 && isWordChar(t[i - 1])) { while (i > 0 && isWordChar(t[i - 1])) i-- }
+        else if (i > 0 && !t[i - 1].isWhitespace()) { while (i > 0 && !isWordChar(t[i - 1]) && !t[i - 1].isWhitespace()) i-- }
+        return i
+    }
+
+    private fun wordRight(pos: Int): Int {
+        val t = edit.text
+        var i = pos
+        if (i < t.length && t[i] == '\n') return i + 1
+        while (i < t.length && t[i].isWhitespace() && t[i] != '\n') i++
+        if (i < t.length && isWordChar(t[i])) { while (i < t.length && isWordChar(t[i])) i++ }
+        else if (i < t.length && t[i] != '\n') { while (i < t.length && !isWordChar(t[i]) && !t[i].isWhitespace()) i++ }
+        return i
+    }
+
+    /** The caret one layout line up or down at the same horizontal position. */
+    private fun verticalOffset(pos: Int, dir: Int): Int {
+        val l = edit.layout ?: return pos
+        var line = l.getLineForOffset(pos)
+        val x = l.getPrimaryHorizontal(pos)
+        var target = line + dir
+        while (target in 0 until l.lineCount && isHiddenLine(target)) target += dir
+        if (target < 0) return 0
+        if (target >= l.lineCount) return edit.text.length
+        line = target
+        return l.getOffsetForHorizontal(line, x)
+    }
+
+    /** Keys while there are several cursors: typing, deleting, moving, copying and pasting apply to all of them. */
+    private fun handleMultiKey(code: Int, ev: KeyEvent): Boolean {
+        if (extra.isEmpty()) return false
+        val ctrl = ev.isCtrlPressed; val alt = ev.isAltPressed; val shift = ev.isShiftPressed
+        when (code) {
+            KeyEvent.KEYCODE_ESCAPE -> { clearExtraCursors(); return true }
+            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_MOVE_HOME, KeyEvent.KEYCODE_MOVE_END -> if (!alt) { moveAll(code, shift, ctrl); return true }
+            KeyEvent.KEYCODE_DEL -> if (!alt) { deleteAll(back = true, word = ctrl); return true }
+            KeyEvent.KEYCODE_FORWARD_DEL -> if (!alt) { deleteAll(back = false, word = ctrl); return true }
+            KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> if (!ctrl && !alt) {
+                editAll { s -> val ins = "\n" + lineIndentAt(s.start); Change(s.start, s.end, ins, ins.length, ins.length) }; return true
+            }
+            KeyEvent.KEYCODE_TAB -> if (!ctrl && !alt) {
+                if (shift) editAll { s ->
+                    val ls = lineStartOf(s.head); var n = 0
+                    while (n < lang.tabSize && ls + n < edit.text.length && edit.text[ls + n] == ' ') n++
+                    if (n == 0) null else Change(ls, ls + n, "", s.anchor - ls - n, s.head - ls - n)
+                } else editAll { s -> val pad = " ".repeat(lang.tabSize - ((s.start - lineStartOf(s.start)) % lang.tabSize)); Change(s.start, s.end, pad, pad.length, pad.length) }
+                return true
+            }
+        }
+        if (ctrl && !alt) when (code) {
+            KeyEvent.KEYCODE_C -> { copyAll(cut = false); return true }
+            KeyEvent.KEYCODE_X -> { copyAll(cut = true); return true }
+            KeyEvent.KEYCODE_V -> { pasteAll(); return true }
+            KeyEvent.KEYCODE_A -> { clearExtraCursors(); return false }
+            KeyEvent.KEYCODE_Z, KeyEvent.KEYCODE_Y -> { clearExtraCursors(); return false }
+        }
+        if (!ctrl && !alt && !ev.isMetaPressed && ev.unicodeChar != 0) {
+            val ch = ev.unicodeChar.toChar().toString()
+            editAll { s -> Change(s.start, s.end, ch, 1, 1) }
+            return true
+        }
+        return false
+    }
+
+    private fun moveAll(code: Int, extend: Boolean, word: Boolean) {
+        val t = edit.text
+        val prim = primarySel()
+        val out = ArrayList<Sel>()
+        var primHead = prim.head
+        for (s in allSels()) {
+            val h = when (code) {
+                KeyEvent.KEYCODE_DPAD_LEFT -> if (!extend && s.start != s.end && !word) s.start else if (word) wordLeft(s.head) else (s.head - 1).coerceAtLeast(0)
+                KeyEvent.KEYCODE_DPAD_RIGHT -> if (!extend && s.start != s.end && !word) s.end else if (word) wordRight(s.head) else (s.head + 1).coerceAtMost(t.length)
+                KeyEvent.KEYCODE_DPAD_UP -> verticalOffset(s.head, -1)
+                KeyEvent.KEYCODE_DPAD_DOWN -> verticalOffset(s.head, 1)
+                KeyEvent.KEYCODE_MOVE_HOME -> { val ls = lineStartOf(s.head); var f = ls; while (f < t.length && (t[f] == ' ' || t[f] == '\t')) f++; if (s.head == f) ls else f }
+                else -> lineEndOf(s.head)
+            }
+            val ns = Sel(if (extend) s.anchor else h, h)
+            if (s.anchor == prim.anchor && s.head == prim.head) primHead = h
+            out.add(ns)
+        }
+        setCursors(out, primHead)
+    }
+
+    private fun deleteAll(back: Boolean, word: Boolean) {
+        editAll { s ->
+            if (s.start != s.end) Change(s.start, s.end, "", 0, 0)
+            else if (back) { if (s.head == 0) null else { val from = if (word) wordLeft(s.head) else s.head - 1; Change(from, s.head, "", 0, 0) } }
+            else { if (s.head >= edit.text.length) null else { val to = if (word) wordRight(s.head) else s.head + 1; Change(s.head, to, "", 0, 0) } }
+        }
+    }
+
+    private fun copyAll(cut: Boolean) {
+        val t = edit.text
+        val pieces = ArrayList<String>()
+        for (s in allSels()) {
+            pieces.add(if (s.start != s.end) t.subSequence(s.start, s.end).toString() else t.subSequence(lineStartOf(s.head), lineEndOf(s.head)).toString())
+        }
+        multiClip = pieces
+        val joined = pieces.joinToString("\n")
+        setClip(joined)
+        lineClip = null
+        if (cut) editAll { s ->
+            if (s.start != s.end) Change(s.start, s.end, "", 0, 0)
+            else { val ls = lineStartOf(s.head); val le = lineEndOf(s.head); Change(ls, if (le < edit.text.length) le + 1 else le, "", 0, 0) }
+        }
+    }
+
+    private fun pasteAll() {
+        val clip = clipText()
+        val pieces = multiClip?.takeIf { it.joinToString("\n") == clip && it.size == cursorCount() }
+            ?: clip.split('\n').takeIf { it.size == cursorCount() && cursorCount() > 1 }
+        var i = 0
+        editAll { s -> val text = pieces?.getOrNull(i++) ?: clip; Change(s.start, s.end, text, text.length, text.length) }
+    }
+
+    /** Ctrl D: selects the word at the cursor, then adds the next occurrence of the selection as another cursor. */
+    fun addNextOccurrence() {
+        val t = edit.text
+        val p = primarySel()
+        if (p.start == p.end) {
+            val r = wordRangeAt(p.head)
+            if (r.isEmpty()) return
+            snapshotCursors()
+            edit.setSelection(r.first, r.last + 1)
+            return
+        }
+        val needle = t.subSequence(p.start, p.end).toString()
+        val sels = allSels()
+        val from = sels.maxOf { it.end }
+        var at = TextUtils.indexOf(t, needle, from)
+        if (at < 0) at = TextUtils.indexOf(t, needle, 0)
+        if (at < 0) return
+        if (sels.any { it.start == at && it.end == at + needle.length }) { Ui.toast(context, "Every occurrence is already selected."); return }
+        snapshotCursors()
+        extra.add(p)
+        caretOps = true
+        try { edit.setSelection(at, at + needle.length) } finally { caretOps = false }
+        edit.bringPointIntoView(at + needle.length)
+        edit.invalidate()
+    }
+
+    /** Ctrl K Ctrl D: the last added selection moves to the next occurrence instead of adding one. */
+    fun moveLastSelectionToNextOccurrence() {
+        val p = primarySel()
+        if (p.start == p.end) { addNextOccurrence(); return }
+        val t = edit.text
+        val needle = t.subSequence(p.start, p.end).toString()
+        var at = TextUtils.indexOf(t, needle, p.end)
+        if (at < 0) at = TextUtils.indexOf(t, needle, 0)
+        if (at < 0 || at == p.start) return
+        snapshotCursors()
+        caretOps = true
+        try { edit.setSelection(at, at + needle.length) } finally { caretOps = false }
+        edit.bringPointIntoView(at + needle.length)
+        edit.invalidate()
+    }
+
+    /** Ctrl F2 and Ctrl Shift L in VS Code: every occurrence of the selection, or of the word at the cursor. */
+    fun selectAllOccurrences() {
+        val t = edit.text
+        val p = primarySel()
+        val whole: Boolean
+        val needle: String
+        if (p.start == p.end) {
+            val r = wordRangeAt(p.head); if (r.isEmpty()) return
+            needle = t.subSequence(r.first, r.last + 1).toString(); whole = true
+        } else { needle = t.subSequence(p.start, p.end).toString(); whole = false }
+        if (needle.isEmpty()) return
+        val out = ArrayList<Sel>()
+        var i = TextUtils.indexOf(t, needle, 0)
+        while (i >= 0 && out.size < 5000) {
+            val okLeft = !whole || i == 0 || !isWordChar(t[i - 1])
+            val okRight = !whole || i + needle.length >= t.length || !isWordChar(t[i + needle.length])
+            if (okLeft && okRight) out.add(Sel(i, i + needle.length))
+            i = TextUtils.indexOf(t, needle, i + needle.length)
+        }
+        if (out.isEmpty()) return
+        snapshotCursors()
+        setCursors(out, p.head)
+    }
+
+    /** Alt Enter in the find bar: every find match becomes a selection. */
+    fun selectAllFindMatches() {
+        if (findMatches.isEmpty()) refreshFindMatchesEverywhere()
+        if (findMatches.isEmpty()) return
+        snapshotCursors()
+        setCursors(findMatches.map { Sel(it.first, it.last + 1) }, cursorOffset())
+        hideFind()
+    }
+
+    /** Find matches in the whole file (the find bar itself only marks the visible part). */
+    private fun refreshFindMatchesEverywhere() {
+        val pat = findPattern() ?: return
+        findMatches.clear()
+        val m = pat.matcher(edit.text)
+        while (m.find() && findMatches.size < 5000) { if (m.end() > m.start()) findMatches.add(m.start() until m.end()) }
+    }
+
+    /** Ctrl Alt Up and Down (Shift Alt Up and Down on Linux): another cursor on the line above or below. */
+    fun addCursorVertical(dir: Int) {
+        val p = primarySel()
+        val sels = allSels()
+        val base = if (dir < 0) sels.minByOrNull { it.head }!! else sels.maxByOrNull { it.head }!!
+        val target = verticalOffset(base.head, dir)
+        if (target == base.head) return
+        snapshotCursors()
+        val out = ArrayList(sels)
+        out.add(Sel(target, target))
+        setCursors(out, target)
+        if (p.head == target) return
+    }
+
+    /** Shift Alt I: a cursor at the end of every line the selection touches. */
+    fun cursorsAtLineEnds() {
+        val p = primarySel()
+        if (p.start == p.end) return
+        val a = logicalLineAt(p.start); val b = logicalLineAt(if (p.end > p.start && edit.text[p.end - 1] == '\n') p.end - 1 else p.end)
+        val st = logicalStarts()
+        val out = ArrayList<Sel>()
+        for (ln in a..b) { val e = lineEndOf(st[ln]); out.add(Sel(e, e)) }
+        snapshotCursors()
+        setCursors(out, out.last().head)
+    }
+
+    /** Alt click: a cursor more where the pointer is, or one less when there is one already. */
+    fun toggleCursorAt(offset: Int) {
+        val hit = extra.firstOrNull { it.head == offset && it.start == it.end }
+        snapshotCursors()
+        if (hit != null) { extra.remove(hit); edit.invalidate(); return }
+        if (extra.isEmpty() && primarySel().head == offset) return
+        extra.add(primarySel())
+        caretOps = true
+        try { edit.setSelection(offset) } finally { caretOps = false }
+        edit.invalidate()
+    }
+
+    /** Shift Alt drag: a box selection, one selection per line between the two points, at the same columns. */
+    fun columnSelect(fromOffset: Int, toOffset: Int) {
+        val st = logicalStarts()
+        val la = logicalLineAt(fromOffset); val lb = logicalLineAt(toOffset)
+        val ca = fromOffset - st[la]; val cb = toOffset - st[lb]
+        val out = ArrayList<Sel>()
+        for (ln in minOf(la, lb)..maxOf(la, lb)) {
+            val s = st[ln]; val len = lineEndOf(s) - s
+            if (ca > len && cb > len && ln != la && ln != lb) continue
+            out.add(Sel(s + minOf(ca, len), s + minOf(cb, len)))
+        }
+        if (out.isEmpty()) return
+        setCursors(out, out.last().head)
+    }
+
+    /** Ctrl U: back to the cursors before the last cursor operation. */
+    fun undoCursorOperation() {
+        val last = cursorUndo.removeLastOrNull() ?: return
+        val prim = last.last()
+        extra.clear(); extra.addAll(last.dropLast(1))
+        caretOps = true
+        try { edit.setSelection(prim.anchor.coerceIn(0, edit.text.length), prim.head.coerceIn(0, edit.text.length)) } finally { caretOps = false }
+        edit.invalidate()
+    }
+
+    // ------------------------------------------------------------------ copy, cut and paste of whole lines
+    /** Ctrl C with no selection copies the whole line, as in VS Code. Returns false when a selection is there. */
+    fun copyLineIfEmpty(cut: Boolean): Boolean {
+        val s = selStart(); val e = selEnd()
+        if (s != e) { lineClip = null; return false }
+        val ls = lineStartOf(s); val le = lineEndOf(s)
+        val line = edit.text.subSequence(ls, le).toString() + "\n"
+        setClip(line); lineClip = line; multiClip = null
+        if (cut) { if (le < edit.text.length) replaceText(ls, le + 1, "", ls, ls) else if (ls > 0) replaceText(ls - 1, le, "", lineStartOf(ls - 1), lineStartOf(ls - 1)) else replaceText(0, le, "", 0, 0) }
+        return true
+    }
+
+    /** Ctrl V of a whole copied line puts it above the current line, as in VS Code. Returns false otherwise. */
+    fun pasteLineIfCopied(): Boolean {
+        val lc = lineClip ?: return false
+        if (clipText() != lc || selStart() != selEnd()) return false
+        val c = selStart(); val ls = lineStartOf(c)
+        replaceText(ls, ls, lc, c + lc.length, c + lc.length)
+        return true
+    }
+
+    // ------------------------------------------------------------------ moving and scrolling
+    fun cursorWordLeft(extend: Boolean) { val h = wordLeft(edit.selectionEnd.coerceAtLeast(0)); if (extend) edit.setSelection(edit.selectionStart, h) else edit.setSelection(h) }
+    fun cursorWordRight(extend: Boolean) { val h = wordRight(edit.selectionEnd.coerceAtLeast(0)); if (extend) edit.setSelection(edit.selectionStart, h) else edit.setSelection(h) }
+    fun deleteWord(back: Boolean) {
+        val s = selStart(); val e = selEnd()
+        if (s != e) { replaceText(s, e, ""); return }
+        if (back) { if (s > 0) replaceText(wordLeft(s), s, "") } else if (s < edit.text.length) replaceText(s, wordRight(s), "")
+    }
+    fun cursorDocument(end: Boolean, extend: Boolean) {
+        val target = if (end) edit.text.length else 0
+        if (extend) edit.setSelection(edit.selectionStart, target) else edit.setSelection(target)
+        edit.bringPointIntoView(target)
+    }
+    /** Ctrl Up and Down scroll by a line, Alt Page Up and Down by a page, and the cursor stays where it is. */
+    fun scrollLines(n: Int) {
+        edit.scrollTo(edit.scrollX, (edit.scrollY + n * edit.lineHeight).coerceIn(0, maxScrollY()))
+    }
+    fun scrollPage(dir: Int) { scrollLines(dir * (edit.height / edit.lineHeight.coerceAtLeast(1) - 1).coerceAtLeast(1)) }
+
+    /** Ctrl Shift \: the cursor jumps to the bracket that matches the one at (or around) it. */
+    fun jumpToBracket() {
+        updateBracket()
+        val c = cursorOffset()
+        if (bracketA >= 0 && bracketB >= 0) { edit.setSelection(if (c == bracketA || c == bracketA + 1) bracketB else bracketA); return }
+        // Not at a bracket: go to the closing bracket of the innermost pair around the cursor.
+        val t = edit.text
+        var depth = 0; var i = c - 1
+        val limit = maxOf(0, c - 50000)
+        while (i >= limit) {
+            val ch = t[i]
+            if (ch in ")]}") depth++ else if (ch in "([{") { if (depth == 0) { edit.setSelection(i); updateBracket(); if (bracketB >= 0) edit.setSelection(bracketB); return }; depth-- }
+            i--
+        }
+    }
+
+    // ------------------------------------------------------------------ expand and shrink selection (Shift Alt Right and Left)
+    private val expandStack = ArrayList<Pair<Int, Int>>()
+
+    fun expandSelection() {
+        val t = edit.text
+        val s = selStart(); val e = selEnd()
+        val candidates = ArrayList<Pair<Int, Int>>()
+        val w = wordRangeAt(s)
+        if (!w.isEmpty()) candidates.add(w.first to w.last + 1)
+        // The string around the selection, its contents first.
+        val ls = lineStartOf(s); val le = lineEndOf(e)
+        for (q in charArrayOf('"', '\'', '`')) {
+            var a = s - 1
+            while (a >= ls && t[a] != q) a--
+            var b = e
+            while (b < le && t[b] != q) b++
+            if (a >= ls && b < le) { candidates.add(a + 1 to b); candidates.add(a to b + 1) }
+        }
+        // Brackets around the selection: the contents, then the brackets with them.
+        var depth = 0; var i = s - 1
+        val limit = maxOf(0, s - 50000)
+        while (i >= limit) {
+            val ch = t[i]
+            if (ch in ")]}") depth++ else if (ch in "([{") {
+                if (depth == 0) {
+                    val close = when (ch) { '(' -> ')'; '[' -> ']'; else -> '}' }
+                    var d = 0; var j = i
+                    val lim = minOf(t.length, i + 200000)
+                    while (j < lim) { val x = t[j]; if (x == ch) d++ else if (x == close) { d--; if (d == 0) break }; j++ }
+                    if (j < lim && j >= e) { candidates.add(i + 1 to j); candidates.add(i to j + 1) }
+                } else depth--
+            }
+            i--
+        }
+        candidates.add(ls to le)
+        candidates.add(lineStartOf(s) to (if (le < t.length) le + 1 else le))
+        candidates.add(0 to t.length)
+        val next = candidates.filter { (a, b) -> a <= s && b >= e && (a < s || b > e) }.minByOrNull { it.second - it.first } ?: return
+        expandStack.add(s to e)
+        edit.setSelection(next.first, next.second)
+    }
+
+    fun shrinkSelection() {
+        val prev = expandStack.removeLastOrNull() ?: run { val c = cursorOffset(); edit.setSelection(c); return }
+        edit.setSelection(prev.first, prev.second)
+    }
+
+    // ------------------------------------------------------------------ comments
+    /** Ctrl K Ctrl C (add = true) and Ctrl K Ctrl U (add = false): line comments without toggling. */
+    fun setLineComment(add: Boolean) {
+        val lc = lang.lineComment ?: run { if (add) toggleBlockComment(); return }
+        mapSelectedLines { lines ->
+            if (add) {
+                val nonBlank = lines.filter { it.isNotBlank() }
+                val minIndent = nonBlank.minOfOrNull { l -> l.length - l.trimStart().length } ?: 0
+                lines.map { l -> if (l.isBlank()) l else l.substring(0, minIndent) + lc + " " + l.substring(minIndent) }
+            } else lines.map { l ->
+                val i = l.indexOf(lc)
+                if (i < 0 || l.substring(0, i).isNotBlank()) l else { val after = i + lc.length; l.substring(0, i) + l.substring(if (after < l.length && l[after] == ' ') after + 1 else after) }
+            }
+        }
+    }
+
+    /** Ctrl Shift A: a block comment around the selection, or removes the one that is there. */
+    fun toggleBlockComment() {
+        val bc = lang.blockComment ?: lang.lineComment?.let { it to "" } ?: return
+        val s = selStart(); val e = selEnd()
+        val a = if (s == e) lineStartOf(s) else s
+        val b = if (s == e) lineEndOf(s) else e
+        val region = edit.text.subSequence(a, b).toString()
+        val trimmed = region.trim()
+        if (bc.second.isNotEmpty() && trimmed.startsWith(bc.first) && trimmed.endsWith(bc.second) && trimmed.length >= bc.first.length + bc.second.length) {
+            val off = region.indexOf(trimmed)
+            val inner = trimmed.substring(bc.first.length, trimmed.length - bc.second.length).removePrefix(" ").removeSuffix(" ")
+            val out = region.substring(0, off) + inner + region.substring(off + trimmed.length)
+            replaceText(a, b, out, a, a + out.length)
+        } else {
+            val out = bc.first + " " + region + (if (bc.second.isEmpty()) "" else " " + bc.second)
+            replaceText(a, b, out, a, a + out.length)
+        }
+    }
+
+    // ------------------------------------------------------------------ transformations and line tools (command palette)
+    /** Replaces the selection (or the word at the cursor) with f of it, and keeps it selected. */
+    fun transformSelection(f: (String) -> String) {
+        var s = selStart(); var e = selEnd()
+        if (s == e) { val w = wordRangeAt(s); if (w.isEmpty()) return; s = w.first; e = w.last + 1 }
+        if (extra.isNotEmpty()) { editAll { sel -> val a = if (sel.start == sel.end) wordRangeAt(sel.head).first else sel.start; val b = if (sel.start == sel.end) wordRangeAt(sel.head).last + 1 else sel.end; if (b <= a) null else { val out = f(edit.text.subSequence(a, b).toString()); Change(a, b, out, 0, out.length) } }; return }
+        val out = f(edit.text.subSequence(s, e).toString())
+        replaceText(s, e, out, s, s + out.length)
+    }
+
+    private fun words(s: String): List<String> =
+        Regex("[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+").findAll(s).map { it.value }.toList()
+
+    fun toUpper() = transformSelection { it.uppercase() }
+    fun toLower() = transformSelection { it.lowercase() }
+    fun toTitle() = transformSelection { s -> s.split(Regex("(?<=\\s)|(?=\\s)")).joinToString("") { w -> w.lowercase().replaceFirstChar { c -> c.titlecase() } } }
+    fun toSnake() = transformSelection { s -> words(s).joinToString("_") { it.lowercase() } }
+    fun toKebab() = transformSelection { s -> words(s).joinToString("-") { it.lowercase() } }
+    fun toCamel() = transformSelection { s -> words(s).mapIndexed { i, w -> if (i == 0) w.lowercase() else w.lowercase().replaceFirstChar { it.titlecase() } }.joinToString("") }
+    fun toPascal() = transformSelection { s -> words(s).joinToString("") { w -> w.lowercase().replaceFirstChar { it.titlecase() } } }
+
+    /** Runs f over the selected lines, or over the whole file when nothing is selected. */
+    private fun mapLinesOrAll(f: (List<String>) -> List<String>) {
+        if (selStart() == selEnd()) {
+            val t = edit.text.toString()
+            val out = f(t.split('\n')).joinToString("\n")
+            if (out != t) replaceText(0, t.length, out, 0, 0)
+        } else mapSelectedLines(f)
+    }
+
+    fun sortLines(descending: Boolean, ignoreCase: Boolean = false) = mapLinesOrAll { lines ->
+        val c = if (ignoreCase) String.CASE_INSENSITIVE_ORDER else naturalOrder<String>()
+        if (descending) lines.sortedWith(c.reversed()) else lines.sortedWith(c)
+    }
+    fun reverseLines() = mapLinesOrAll { it.reversed() }
+    fun deleteDuplicateLines() = mapLinesOrAll { it.distinct() }
+    fun trimTrailingWhitespace() {
+        val t = edit.text.toString()
+        val out = t.split('\n').joinToString("\n") { it.trimEnd(' ', '\t') }
+        if (out != t) { val c = cursorOffset().coerceAtMost(out.length); replaceText(0, t.length, out, c, c) }
+    }
+    fun indentationToSpaces() = mapLinesOrAll { lines -> lines.map { l -> val i = l.length - l.trimStart('\t', ' ').length; l.substring(0, i).replace("\t", tabString()) + l.substring(i) } }
+    fun indentationToTabs() = mapLinesOrAll { lines -> lines.map { l -> val i = l.length - l.trimStart('\t', ' ').length; val lead = l.substring(0, i).replace("\t", tabString()); "\t".repeat(lead.length / lang.tabSize) + " ".repeat(lead.length % lang.tabSize) + l.substring(i) } }
+
+    /** Joins the selected lines (or the current line with the next one) into one, with single spaces. */
+    fun joinLines() {
+        val s = selStart(); val e = selEnd()
+        val a = lineStartOf(s)
+        var b = lineEndOf(e)
+        if (s == e || lineStartOf(e) == a) { if (b >= edit.text.length) return; b = lineEndOf(b + 1) }
+        val parts = edit.text.subSequence(a, b).toString().split('\n')
+        val out = parts.first().trimEnd() + parts.drop(1).joinToString("") { val x = it.trim(); if (x.isEmpty()) "" else " $x" }
+        replaceText(a, b, out, a + parts.first().trimEnd().length, a + parts.first().trimEnd().length)
+    }
+
+    fun duplicateSelection() = duplicateLine()
+    fun selectLine() { val s = selStart(); val e = selEnd(); val a = lineStartOf(s); val b = lineEndOf(e); edit.setSelection(a, if (b < edit.text.length) b + 1 else b) }
+    fun copyLinesUp() = copyLines(up = true)
+    fun copyLinesDown() = copyLines(up = false)
+    fun moveLinesUp() = moveLines(up = true)
+    fun moveLinesDown() = moveLines(up = false)
+    fun deleteLine() = deleteLines()
+    fun indentLines() = indent(force = true)
+    fun outdentLines() = outdent()
+    fun toggleLineComment() = toggleComment()
+    fun insertLineBelow() = insertLine(below = true)
+    fun insertLineAbove() = insertLine(below = false)
+    fun transposeLetters() {
+        val c = cursorOffset(); val t = edit.text
+        if (c <= 0 || c >= t.length || selStart() != selEnd()) return
+        replaceText(c - 1, c + 1, "" + t[c] + t[c - 1], c + 1, c + 1)
+    }
+    fun findNextMatch(forward: Boolean) {
+        if (findInput.text.isNullOrEmpty()) { val sel = selectionText(); if (sel.isNotEmpty() && !sel.contains('\n')) findInput.setText(sel) else { showFind(); return } }
+        findNext(forward)
+    }
+    /** Ctrl F3: the selection or the word at the cursor becomes the search, and the next match is selected. */
+    fun findSelectionNext(forward: Boolean) {
+        var sel = selectionText()
+        if (sel.isEmpty()) { val w = wordRangeAt(cursorOffset()); if (!w.isEmpty()) sel = edit.text.subSequence(w.first, w.last + 1).toString() }
+        if (sel.isEmpty() || sel.contains('\n')) return
+        findInput.setText(sel)
+        findNext(forward)
+    }
+
+    // ------------------------------------------------------------------ folding
+    /**
+     * A folded region: its lines keep their text (nothing is removed from the file) but get no height, and their
+     * characters are replaced by nothing when drawn. The header line above stays visible with a "⋯" after it.
+     * The spans move with edits by themselves; an edit inside a folded region unfolds it.
+     */
+    inner class Fold {
+        val height = FoldHeightSpan()
+        val hides = ArrayList<FoldHideSpan>()
+        fun start(): Int = edit.text.getSpanStart(height)
+        fun end(): Int = edit.text.getSpanEnd(height)
+    }
+
+    /** Gives the folded lines no height: the line's own spacing is taken back, so 100 folded lines take no room. */
+    inner class FoldHeightSpan : LineHeightSpan, UpdateLayout {
+        override fun chooseHeight(text: CharSequence, start: Int, end: Int, spanstartv: Int, lineHeight: Int, fm: Paint.FontMetricsInt) {
+            // The line spacing is added after this height except on the last line, so the last line gets exactly 0.
+            val extra = if (end >= text.length) 0 else edit.lineSpacingExtra.toInt()
+            fm.top = 0; fm.ascent = 0
+            fm.descent = -extra; fm.bottom = -extra
+        }
+    }
+
+    /** Draws nothing and takes no width, for the text of one folded line (a replacement span never covers a newline). */
+    class FoldHideSpan : android.text.style.ReplacementSpan() {
+        override fun getSize(paint: Paint, text: CharSequence?, start: Int, end: Int, fm: Paint.FontMetricsInt?): Int = 0
+        override fun draw(canvas: Canvas, text: CharSequence?, start: Int, end: Int, x: Float, top: Int, y: Int, bottom: Int, paint: Paint) {}
+    }
+
+    private val folds = ArrayList<Fold>()
+    /** The caret's previous position, to step over a folded region instead of landing inside it. */
+    private var lastCaret = 0
+
+    fun hasFolds(): Boolean = folds.isNotEmpty()
+
+    /** The indentation width of a line, tabs counted as tab stops; -1 for a blank line. */
+    private fun indentOf(line: String): Int {
+        var w = 0
+        for (ch in line) { if (ch == ' ') w++ else if (ch == '\t') w += lang.tabSize - (w % lang.tabSize) else return w }
+        return -1
+    }
+
+    /** The foldable regions as (header line, last hidden line), by indentation, like VS Code without a language
+     *  folding provider: a line whose following lines are indented deeper starts a region. Markdown folds by headings. */
+    fun foldRegions(): List<Pair<Int, Int>> {
+        val lines = edit.text.toString().split('\n')
+        val out = ArrayList<Pair<Int, Int>>()
+        if (lang.id == "markdown") {
+            val level = lines.map { l -> if (l.startsWith("#")) l.takeWhile { it == '#' }.length else 0 }
+            for (i in lines.indices) {
+                if (level[i] == 0) continue
+                var j = i + 1
+                while (j < lines.size && (level[j] == 0 || level[j] > level[i])) j++
+                var last = j - 1
+                while (last > i && lines[last].isBlank()) last--
+                if (last > i) out.add(i to last)
+            }
+            return out
+        }
+        val ind = IntArray(lines.size) { indentOf(lines[it]) }
+        for (i in lines.indices) {
+            if (ind[i] < 0) continue
+            var j = i + 1
+            while (j < lines.size && ind[j] < 0) j++
+            if (j >= lines.size || ind[j] <= ind[i]) continue
+            var k = j
+            var last = j
+            while (k < lines.size && (ind[k] < 0 || ind[k] > ind[i])) { if (ind[k] >= 0) last = k; k++ }
+            if (last > i) out.add(i to last)
+        }
+        // Block comments of several lines fold too.
+        val bc = lang.blockComment
+        if (bc != null) {
+            var i = 0
+            while (i < lines.size) {
+                val tl = lines[i].trimStart()
+                if (tl.startsWith(bc.first) && tl.indexOf(bc.second, bc.first.length) < 0) {
+                    var j = i + 1
+                    while (j < lines.size && !lines[j].contains(bc.second)) j++
+                    if (j < lines.size && j > i) { out.add(i to j); i = j }
+                }
+                i++
+            }
+        }
+        return out.distinct().sortedBy { it.first }
+    }
+
+    private fun foldAtHeader(header: Int): Fold? = folds.firstOrNull { logicalLineAt(it.start()) == header + 1 }
+
+    /** Folds lines header+1 until last (logical, inclusive). Folds inside it are opened first. */
+    private fun addFold(header: Int, last: Int) {
+        val st = logicalStarts()
+        if (header < 0 || last <= header || last >= st.size) return
+        if (foldAtHeader(header) != null) return
+        val t = edit.text
+        val a = st[header + 1]
+        val lastEnd = lineEndOf(st[last])
+        val b = if (lastEnd < t.length) lastEnd + 1 else lastEnd
+        for (f in folds.filter { it.start() >= a && it.end() <= b }) removeFold(f)
+        val f = Fold()
+        // The caret must not stay inside the region it hides.
+        val c = cursorOffset()
+        if (c in a until b + (if (b == t.length) 1 else 0)) edit.setSelection(lineEndOf(st[header]))
+        for (ln in header + 1..last) {
+            val s = st[ln]; val e = lineEndOf(s)
+            if (e > s) { val h = FoldHideSpan(); t.setSpan(h, s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE); f.hides.add(h) }
+        }
+        t.setSpan(f.height, a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        folds.add(f)
+        afterFoldChange()
+    }
+
+    private fun removeFold(f: Fold) {
+        val t = edit.text
+        t.removeSpan(f.height)
+        for (h in f.hides) t.removeSpan(h)
+        folds.remove(f)
+    }
+
+    private fun afterFoldChange() {
+        edit.requestLayout(); edit.invalidate(); gutter.invalidate(); minimap.invalidate()
+        scheduleHighlight(30)
+    }
+
+    /** The innermost region that holds the cursor's line (or starts on it). */
+    private fun regionAtCursor(regions: List<Pair<Int, Int>> = foldRegions()): Pair<Int, Int>? {
+        val line = logicalLineAt(cursorOffset())
+        return regions.filter { (h, l) -> line in h..l }.minByOrNull { it.second - it.first }
+    }
+
+    /** Ctrl Shift [: folds the innermost open region at the cursor. */
+    fun foldAtCursor() {
+        val regions = foldRegions()
+        val line = logicalLineAt(cursorOffset())
+        val open = regions.filter { (h, l) -> line in h..l && foldAtHeader(h) == null }.minByOrNull { it.second - it.first } ?: return
+        addFold(open.first, open.second)
+    }
+
+    /** Ctrl Shift ]: opens the fold on the cursor's line (or the one that holds it). */
+    fun unfoldAtCursor() {
+        val line = logicalLineAt(cursorOffset())
+        val f = foldAtHeader(line) ?: folds.filter { logicalLineAt(it.start()) - 1 <= line && logicalLineAt((it.end() - 1).coerceAtLeast(0)) >= line }.maxByOrNull { it.start() } ?: return
+        removeFold(f); afterFoldChange()
+    }
+
+    /** Ctrl K Ctrl L: folds or opens the region at the cursor. */
+    fun toggleFold() {
+        val line = logicalLineAt(cursorOffset())
+        val f = foldAtHeader(line)
+        if (f != null) { removeFold(f); afterFoldChange() } else foldAtCursor()
+    }
+
+    /** Ctrl K Ctrl [ and Ctrl K Ctrl ]: the region at the cursor and every region inside it. */
+    fun foldRecursively(fold: Boolean) {
+        val regions = foldRegions()
+        val r = regionAtCursor(regions) ?: return
+        if (!fold) { for (f in folds.filter { logicalLineAt(it.start()) - 1 >= r.first && logicalLineAt(it.start()) - 1 <= r.second }) removeFold(f); afterFoldChange(); return }
+        addFold(r.first, r.second)
+    }
+
+    /** Ctrl K Ctrl 0 folds every region from the outside in; Ctrl K Ctrl J opens all of them. */
+    fun foldAll() {
+        val regions = foldRegions()
+        // Only the outermost regions need a fold: folding one hides everything inside it.
+        var coveredUntil = -1
+        for ((h, l) in regions.sortedWith(compareBy({ it.first }, { -it.second }))) {
+            if (h <= coveredUntil) continue
+            addFold(h, l); coveredUntil = l
+        }
+    }
+
+    fun unfoldAll() { for (f in folds.toList()) removeFold(f); afterFoldChange() }
+
+    /** Ctrl K Ctrl 1 to 7: folds the regions at that depth (1 is the outermost). */
+    fun foldLevel(level: Int) {
+        val regions = foldRegions()
+        fun depth(r: Pair<Int, Int>): Int = regions.count { o -> o != r && o.first <= r.first && o.second >= r.second && (o.first < r.first || o.second > r.second) } + 1
+        unfoldAll()
+        for (r in regions.filter { depth(it) == level }) addFold(r.first, r.second)
+    }
+
+    /** Ctrl K Ctrl /: every block comment of several lines. */
+    fun foldBlockComments() {
+        val bc = lang.blockComment ?: return
+        val lines = edit.text.toString().split('\n')
+        for ((h, l) in foldRegions()) if (lines[h].trimStart().startsWith(bc.first)) addFold(h, l)
+    }
+
+    /** Ctrl K Ctrl - : every region except the ones around the cursor. */
+    fun foldAllExceptCursor() {
+        val line = logicalLineAt(cursorOffset())
+        var coveredUntil = -1
+        for ((h, l) in foldRegions().sortedWith(compareBy({ it.first }, { -it.second }))) {
+            if (line in h..l) continue
+            if (h <= coveredUntil) continue
+            addFold(h, l); coveredUntil = l
+        }
+    }
+
+    /** A gutter click on a header line folds or opens its region. */
+    fun toggleFoldAtLine(line: Int): Boolean {
+        val f = foldAtHeader(line)
+        if (f != null) { removeFold(f); afterFoldChange(); return true }
+        val r = foldRegions().filter { it.first == line }.maxByOrNull { it.second - it.first } ?: return false
+        addFold(r.first, r.second)
+        return true
+    }
+
+    fun isFoldHeader(line: Int): Boolean = foldAtHeader(line) != null
+
+    /** True when a layout line is hidden by a fold. */
+    fun isHiddenLine(layoutLine: Int): Boolean {
+        if (folds.isEmpty()) return false
+        val l = edit.layout ?: return false
+        val s = l.getLineStart(layoutLine)
+        return folds.any { s >= it.start() && s < it.end() }
+    }
+
+    /** An edit that touched a folded region opens it; the caret never rests inside one. */
+    private fun foldsAfterEdit(start: Int, before: Int, count: Int) {
+        if (folds.isEmpty()) return
+        var changed = false
+        for (f in folds.toList()) {
+            val a = f.start(); val b = f.end()
+            if (a < 0 || b < 0 || (start < b && start + count > a) || (start in a until b)) { removeFold(f); changed = true }
+        }
+        if (changed) afterFoldChange()
+    }
+
+    private fun stepOverFolds(pos: Int) {
+        if (folds.isEmpty()) { lastCaret = pos; return }
+        val f = folds.firstOrNull { pos >= it.start() && pos < it.end() }
+        if (f != null) {
+            // Coming from below goes to the end of the header line; from above (or elsewhere) to the line after the fold.
+            val target = if (lastCaret >= f.end()) (f.start() - 1).coerceAtLeast(0) else f.end().coerceAtMost(edit.text.length)
+            lastCaret = target
+            if (edit.selectionStart == edit.selectionEnd) edit.setSelection(target) else edit.setSelection(edit.selectionStart, target)
+            return
+        }
+        lastCaret = pos
+    }
+
+    private fun dropFoldsForNewText() { folds.clear() }
 
     // ------------------------------------------------------------------ the two views
     /** The EditText: draws the current line's background, handles the editor keys, reports scrolling. */
@@ -1242,14 +2273,17 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
                 canvas.drawRect(scrollX.toFloat(), top, (scrollX + width).toFloat(), bottom, linePaint)
                 drawReviewBackgrounds(canvas, l)
                 drawHighlights(canvas, l)
-                if (executionLine in 0 until l.lineCount) {
-                    val et = (l.getLineTop(executionLine) + extendedPaddingTop).toFloat()
-                    val eb = (l.getLineBottom(executionLine) + extendedPaddingTop).toFloat()
+                drawExtraSelections(canvas, l)
+                if (executionLine >= 0) {
+                    val el = layoutLineOf(executionLine)
+                    val et = (l.getLineTop(el) + extendedPaddingTop).toFloat()
+                    val eb = (l.getLineBottom(el) + extendedPaddingTop).toFloat()
                     canvas.drawRect(scrollX.toFloat(), et, (scrollX + width).toFloat(), eb, execPaint)
                 }
             }
             super.onDraw(canvas)
             if (l != null) {
+                drawWhitespace(canvas, l); drawFoldMarkers(canvas, l); drawExtraCarets(canvas, l)
                 drawDiagnostics(canvas, l); drawGhost(canvas, l)
                 if (review.isNotEmpty()) { drawChips(canvas, l); drawOwnCursor(canvas, l) }
             }
@@ -1354,6 +2388,84 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
             canvas.drawRect(x, top, x + Ui.dp(context, 2), bottom, cursorPaint)
         }
 
+        private val extraSelPaint = Paint().also { it.color = selection }
+        private val extraCaretPaint = Paint().also { it.color = Ui.fg }
+        private val foldBox = Paint(Paint.ANTI_ALIAS_FLAG).also { it.color = 0xff2a3040.toInt() }
+        private val foldText = Paint(Paint.ANTI_ALIAS_FLAG).also { it.typeface = Typeface.MONOSPACE; it.color = Ui.fg3 }
+        private val wsPaint = Paint(Paint.ANTI_ALIAS_FLAG).also { it.color = 0x55858fa8 }
+        val foldRects = ArrayList<Pair<RectF, Int>>()
+
+        /** The extra cursors' selections, behind the text. */
+        private fun drawExtraSelections(canvas: Canvas, l: android.text.Layout) {
+            if (extra.isEmpty()) return
+            val padLeft = compoundPaddingLeft.toFloat()
+            val vis = visibleLines(l)
+            for (s in extra) {
+                if (s.start == s.end) continue
+                val la = l.getLineForOffset(s.start); val lb = l.getLineForOffset(s.end)
+                for (ln in maxOf(la, vis.first)..minOf(lb, vis.last)) {
+                    val x1 = if (ln == la) l.getPrimaryHorizontal(s.start) else 0f
+                    val x2 = if (ln == lb) l.getPrimaryHorizontal(s.end) else l.getLineRight(ln) + paint.measureText(" ")
+                    canvas.drawRect(x1 + padLeft, textTop(l, ln), x2 + padLeft, textBottom(l, ln), extraSelPaint)
+                }
+            }
+        }
+
+        /** The extra cursors' carets, over the text. */
+        private fun drawExtraCarets(canvas: Canvas, l: android.text.Layout) {
+            if (extra.isEmpty()) return
+            val padLeft = compoundPaddingLeft.toFloat()
+            val w = Ui.dp(context, 2).toFloat()
+            for (s in extra) {
+                val off = s.head.coerceIn(0, text.length)
+                val ln = l.getLineForOffset(off)
+                val x = l.getPrimaryHorizontal(off) + padLeft
+                canvas.drawRect(x, textTop(l, ln), x + w, (l.getLineBaseline(ln) + extendedPaddingTop + paint.fontMetricsInt.descent).toFloat(), extraCaretPaint)
+            }
+        }
+
+        /** A "⋯" box after each folded header line; a click on it opens the fold. */
+        private fun drawFoldMarkers(canvas: Canvas, l: android.text.Layout) {
+            foldRects.clear()
+            if (folds.isEmpty()) return
+            val padLeft = compoundPaddingLeft.toFloat()
+            val dp = context.resources.displayMetrics.density
+            foldText.textSize = textSize
+            for (f in folds) {
+                val a = f.start()
+                if (a <= 0) continue
+                val headerEnd = a - 1
+                val ln = l.getLineForOffset(headerEnd)
+                val x = l.getPrimaryHorizontal(headerEnd) + padLeft + 6 * dp
+                val label = " ⋯ "
+                val w = foldText.measureText(label)
+                val top = textTop(l, ln) + 2 * dp; val bottom = textBottom(l, ln) - 2 * dp
+                val r = RectF(x, top, x + w, bottom)
+                canvas.drawRoundRect(r, 3 * dp, 3 * dp, foldBox)
+                canvas.drawText(label, x, (l.getLineBaseline(ln) + extendedPaddingTop).toFloat(), foldText)
+                foldRects.add(r to logicalLineAt(headerEnd))
+            }
+        }
+
+        /** Render whitespace: a dot for each space and an arrow for each tab in the visible lines. */
+        private fun drawWhitespace(canvas: Canvas, l: android.text.Layout) {
+            if (!renderWhitespace) return
+            val padLeft = compoundPaddingLeft.toFloat()
+            val vis = visibleLines(l)
+            val r = Ui.dp(context, 1).toFloat()
+            wsPaint.textSize = textSize
+            for (ln in vis.first..minOf(vis.last, l.lineCount - 1)) {
+                if (isHiddenLine(ln)) continue
+                val a = l.getLineStart(ln); val b = l.getLineEnd(ln)
+                val cy = (textTop(l, ln) + textBottom(l, ln)) / 2f
+                for (i in a until b.coerceAtMost(text.length)) {
+                    val ch = text[i]
+                    if (ch == ' ') { val x1 = l.getPrimaryHorizontal(i); val x2 = if (i + 1 <= text.length) l.getPrimaryHorizontal(i + 1) else x1; canvas.drawCircle(padLeft + (x1 + x2) / 2f, cy, r, wsPaint) }
+                    else if (ch == '\t') canvas.drawText("→", padLeft + l.getPrimaryHorizontal(i), (l.getLineBaseline(ln) + extendedPaddingTop).toFloat(), wsPaint)
+                }
+            }
+        }
+
         private fun drawDiagnostics(canvas: Canvas, l: android.text.Layout) {
             if (diagnostics.isEmpty()) return
             val firstVisible = l.getLineForVertical(scrollY)
@@ -1363,13 +2475,17 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
             val step = Ui.dp(context, 2).toFloat().coerceAtLeast(3f)
             val n = text.length
             for (d in diagnostics) {
-                if (d.endLine < firstVisible || d.line > lastVisible) continue
+                // Diagnostics count text lines; the layout lines they cover come from their offsets (words may wrap).
+                val da = offsetOf(d.line, d.col); val db = offsetOf(d.endLine, d.endCol)
+                val la = l.getLineForOffset(da); val lb = l.getLineForOffset(db)
+                if (lb < firstVisible || la > lastVisible) continue
                 wavePaint.color = severityColor(d.severity)
-                for (ln in d.line.coerceAtLeast(firstVisible)..d.endLine.coerceAtMost(lastVisible)) {
+                for (ln in la.coerceAtLeast(firstVisible)..lb.coerceAtMost(lastVisible)) {
                     if (ln >= l.lineCount) break
+                    if (isHiddenLine(ln)) continue
                     val lineStart = l.getLineStart(ln); val lineEnd = l.getLineEnd(ln)
-                    var a = if (ln == d.line) (lineStart + d.col).coerceAtMost(lineEnd) else lineStart
-                    var b = if (ln == d.endLine) (lineStart + d.endCol).coerceAtMost(lineEnd) else lineEnd
+                    var a = if (ln == la) da.coerceIn(lineStart, lineEnd) else lineStart
+                    var b = if (ln == lb) db.coerceIn(lineStart, lineEnd) else lineEnd
                     a = a.coerceIn(0, n); b = b.coerceIn(0, n)
                     if (b <= a) b = (a + 1).coerceAtMost(n)
                     var x1 = l.getPrimaryHorizontal(a) + padLeft
@@ -1412,6 +2528,8 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
 
         override fun onSelectionChanged(selStart: Int, selEnd: Int) {
             super.onSelectionChanged(selStart, selEnd)
+            // The EditText reports a selection while it is being built, before the fold list exists.
+            if (!caretOps && editorReady) stepOverFolds(selEnd)
             if (ghost != null && selEnd != ghostOffset) { ghost = null; ghostOffset = -1 }
             if (layout != null) {
                 updateBracket()
@@ -1440,6 +2558,7 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
         }
 
         private var touching = false
+        private var boxFrom = -1
 
         override fun onFocusChanged(focused: Boolean, direction: Int, previouslyFocusedRect: Rect?) {
             val a = selectionStart; val b = selectionEnd
@@ -1497,6 +2616,25 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
                     MotionEvent.ACTION_CANCEL -> if (chipDown >= 0) { chipDown = -1; return true }
                 }
             }
+            // A click on a fold's "⋯" opens it.
+            if (event.actionMasked == MotionEvent.ACTION_DOWN && foldRects.isNotEmpty()) {
+                val x = event.x + scrollX; val y = event.y + scrollY
+                val hit = foldRects.firstOrNull { it.first.contains(x, y) }
+                if (hit != null) { toggleFoldAtLine(hit.second); return true }
+            }
+            // Alt click adds a cursor; Shift Alt drag selects a box (one selection per line).
+            val altOn = (event.metaState and KeyEvent.META_ALT_ON) != 0
+            val shiftOn = (event.metaState and KeyEvent.META_SHIFT_ON) != 0
+            if (altOn && (event.buttonState and MotionEvent.BUTTON_SECONDARY) == 0) {
+                val off = offsetAt(event.x.toInt(), event.y.toInt())
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> { if (!isFocused) requestFocus(); if (shiftOn) { boxFrom = cursorOffset(); columnSelect(boxFrom, off) } else { boxFrom = -1; toggleCursorAt(off) } }
+                    MotionEvent.ACTION_MOVE -> if (shiftOn && boxFrom >= 0) columnSelect(boxFrom, off)
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> boxFrom = -1
+                }
+                return true
+            }
+            if (event.actionMasked == MotionEvent.ACTION_DOWN && (event.buttonState and MotionEvent.BUTTON_SECONDARY) == 0) clearExtraCursors()
             if (event.actionMasked == MotionEvent.ACTION_DOWN && (event.buttonState and MotionEvent.BUTTON_SECONDARY) != 0 && contextMenuHook != null) {
                 // A right-click inside the selection keeps it (for Copy, Add to chat); elsewhere it moves the cursor there.
                 val off = offsetAt(event.x.toInt(), event.y.toInt())
@@ -1527,11 +2665,23 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
         private val mark = Paint(Paint.ANTI_ALIAS_FLAG)
         private val arrow = Path()
         private val markZone = Ui.dp(c, 14)
+        /** The zone right of the numbers with the fold chevrons. */
+        private val foldZone = Ui.dp(c, 14)
+        private val chevron = Paint(Paint.ANTI_ALIAS_FLAG).also { it.style = Paint.Style.STROKE; it.strokeWidth = Ui.dp(c, 1).toFloat().coerceAtLeast(1.5f); it.color = Ui.fg3 }
         private var digits = 3
         private var downY = -1f
+        private var downX = -1f
+        private var headerCache: Set<Int> = emptySet()
+        private var headerVersion = -1
+
+        /** The lines that start a foldable region, worked out again only when the text has changed. */
+        private fun headers(): Set<Int> {
+            if (headerVersion != textVersion) { headerVersion = textVersion; headerCache = try { foldRegions().map { it.first }.toSet() } catch (e: Exception) { emptySet() } }
+            return headerCache
+        }
 
         fun onLinesChanged() {
-            val lines = edit.layout?.lineCount ?: 1
+            val lines = lineCount()
             val d = lines.toString().length.coerceAtLeast(3)
             if (d != digits) { digits = d; requestLayout() }
             invalidate()
@@ -1539,7 +2689,7 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
 
         override fun onMeasure(widthSpec: Int, heightSpec: Int) {
             paint.textSize = edit.textSize
-            val w = paddingLeft + paddingRight + markZone + (paint.measureText("0") * digits).toInt()
+            val w = paddingLeft + paddingRight + markZone + foldZone + (paint.measureText("0") * digits).toInt()
             setMeasuredDimension(w, MeasureSpec.getSize(heightSpec))
         }
 
@@ -1551,14 +2701,19 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
             val sy = edit.scrollY
             val first = l.getLineForVertical(sy)
             val last = l.getLineForVertical(sy + height)
-            val current = l.getLineForOffset(edit.selectionEnd.coerceIn(0, edit.text.length))
-            val x = (width - paddingRight).toFloat()
+            val currentLayout = l.getLineForOffset(edit.selectionEnd.coerceIn(0, edit.text.length))
+            val current = logicalOfLayout(currentLayout)
+            val x = (width - paddingRight - foldZone).toFloat()
             val breakpoints = if (path.isNotEmpty()) Breakpoints.lines(path) else emptySet()
             val cx = paddingLeft / 2f + markZone / 2f
             val radius = Ui.dp(context, 4).toFloat()
-            for (i in first..last) {
-                val top = (l.getLineTop(i) + padTop - sy).toFloat()
-                val bottom = (l.getLineBottom(i) + padTop - sy).toFloat()
+            val heads = headers()
+            for (li in first..last) {
+                // Hidden (folded) lines have no height; a wrapped line's continuation shows no number.
+                if (isHiddenLine(li) || !startsLogicalLine(li)) continue
+                val i = logicalOfLayout(li)
+                val top = (l.getLineTop(li) + padTop - sy).toFloat()
+                val bottom = (l.getLineBottom(li) + padTop - sy).toFloat()
                 if (i == executionLine) { mark.color = executionFill; canvas.drawRect(0f, top, width.toFloat(), bottom, mark) }
                 if (i == current) { canvas.drawRect(0f, top + (if (i == 0) zoneAboveFirst else 0), width.toFloat(), bottom - (zoneBelow[i] ?: 0), fill); paint.color = activeNumber } else paint.color = Ui.fg3
                 val gm = gitMarks[i]
@@ -1581,8 +2736,18 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
                     if (zb > 0) { mark.color = 0x55ff5c6c; canvas.drawRect(0f, textBottom, width.toFloat(), bottom, mark) }
                     if (i == 0 && zoneAboveFirst > 0) { mark.color = 0x55ff5c6c; canvas.drawRect(0f, top, width.toFloat(), top + zoneAboveFirst, mark) }
                 }
-                canvas.drawText((i + 1).toString(), x, (l.getLineBaseline(i) + padTop - sy).toFloat(), paint)
+                canvas.drawText((i + 1).toString(), x, (l.getLineBaseline(li) + padTop - sy).toFloat(), paint)
                 val cy = (top + bottom) / 2f
+                if (i in heads) {
+                    // ▾ for an open region, ▸ for a folded one, like VS Code's fold controls.
+                    val fx = width - paddingRight - foldZone / 2f
+                    val k = Ui.dp(context, 3).toFloat()
+                    val p = Path()
+                    if (isFoldHeader(i)) { p.moveTo(fx - k / 2, cy - k); p.lineTo(fx + k / 2, cy); p.lineTo(fx - k / 2, cy + k) }
+                    else { p.moveTo(fx - k, cy - k / 2); p.lineTo(fx, cy + k / 2); p.lineTo(fx + k, cy - k / 2) }
+                    chevron.color = if (isFoldHeader(i)) Ui.fg else Ui.fg3
+                    canvas.drawPath(p, chevron)
+                }
                 if ((i + 1) in breakpoints) { mark.color = breakpointRed; canvas.drawCircle(cx, cy, radius, mark) }
                 val worst = diagnostics.filter { i >= it.line && i <= it.endLine }.minByOrNull { it.severity }
                 if (worst != null) { mark.color = severityColor(worst.severity); canvas.drawRect(0f, top + 2f, Ui.dp(context, 3).toFloat(), bottom - 2f, mark) }
@@ -1597,13 +2762,16 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
             when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { downY = event.y; return true }
+                MotionEvent.ACTION_DOWN -> { downY = event.y; downX = event.x; return true }
                 MotionEvent.ACTION_UP -> {
-                    if (downY >= 0 && Math.abs(event.y - downY) < Ui.dp(context, 8) && path.isNotEmpty()) {
+                    if (downY >= 0 && Math.abs(event.y - downY) < Ui.dp(context, 8)) {
                         val l = edit.layout
                         if (l != null) {
-                            val line = l.getLineForVertical((event.y.toInt() + edit.scrollY - edit.extendedPaddingTop).coerceAtLeast(0))
-                            if (line < l.lineCount) { Breakpoints.toggle(path, line + 1); invalidate() }
+                            val li = l.getLineForVertical((event.y.toInt() + edit.scrollY - edit.extendedPaddingTop).coerceAtLeast(0))
+                            val line = logicalOfLayout(li)
+                            // The fold zone (right of the numbers) folds; the rest of the gutter sets breakpoints.
+                            if (downX >= width - paddingRight - foldZone) { if (toggleFoldAtLine(line)) invalidate() }
+                            else if (li < l.lineCount && path.isNotEmpty()) { Breakpoints.toggle(path, line + 1); invalidate() }
                         }
                     }
                     downY = -1f
@@ -1688,12 +2856,12 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
             // The visible part of the text.
             val l = edit.layout
             if (l != null && l.height > 0) {
-                val first = l.getLineForVertical(edit.scrollY)
-                val last = l.getLineForVertical(edit.scrollY + edit.height)
+                val first = logicalOfLayout(l.getLineForVertical(edit.scrollY))
+                val last = logicalOfLayout(l.getLineForVertical(edit.scrollY + edit.height))
                 val top = first * p; val bottom = (last + 1) * p
                 canvas.drawRect(0f, top, w, bottom, band)
                 canvas.drawRect(0f, top, w, top + 1f, bandEdge); canvas.drawRect(0f, bottom - 1f, w, bottom, bandEdge)
-                val cur = l.getLineForOffset(edit.selectionEnd.coerceIn(0, edit.text.length))
+                val cur = logicalLineAt(edit.selectionEnd.coerceIn(0, edit.text.length))
                 bar.color = 0xccff8a3d.toInt()
                 canvas.drawRect(0f, cur * p, 3f, cur * p + maxOf(2f, h), bar)
             }
@@ -1706,7 +2874,7 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
                     if (lines == 0) return true
                     val line = (event.y / pitch(lines)).toInt().coerceIn(0, lines - 1)
                     val l = edit.layout ?: return true
-                    val target = (l.getLineTop(line.coerceAtMost(l.lineCount - 1)) - edit.height / 2).coerceIn(0, maxScrollY())
+                    val target = (l.getLineTop(layoutLineOf(line)) - edit.height / 2).coerceIn(0, maxScrollY())
                     edit.scrollTo(edit.scrollX, target)
                     parent?.requestDisallowInterceptTouchEvent(true)
                     return true

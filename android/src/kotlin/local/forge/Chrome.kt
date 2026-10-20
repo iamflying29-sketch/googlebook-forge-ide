@@ -35,7 +35,7 @@ object Chrome {
 
     /** The 34 dp top bar: logo, folder button with a chevron, title, the search field and the icon buttons on the right. */
     fun topBar(c: Context, onFolder: (View) -> Unit, onSearch: (View) -> Unit, onTerminal: (View) -> Unit, onChat: (View) -> Unit,
-               onNewWindow: (View) -> Unit, onSettings: (View) -> Unit): TopBar {
+               onNewWindow: (View) -> Unit, onSettings: (View) -> Unit, onQuit: (View) -> Unit): TopBar {
         val h = c.resources.getDimensionPixelSize(R.dimen.top_bar_height)
         val bar = LinearLayout(c)
         bar.orientation = LinearLayout.HORIZONTAL
@@ -97,6 +97,7 @@ object Chrome {
         bar.addView(chat)
         bar.addView(Ui.button(c, R.drawable.ic_new_window, null, "New window (Ctrl Shift N)", onClick = onNewWindow))
         bar.addView(Ui.button(c, R.drawable.ic_settings, null, "Settings (Ctrl ,)", onClick = onSettings))
+        bar.addView(Ui.button(c, R.drawable.ic_power, null, "Quit Forge (Ctrl Q): stops everything Forge runs", onClick = onQuit))
         return TopBar(bar, folderLabel, title, chip, terminal, chat)
     }
 

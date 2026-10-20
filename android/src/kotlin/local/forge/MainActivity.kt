@@ -105,6 +105,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Ui.loadTheme(this)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setBackgroundDrawable(ColorDrawable(Ui.bg))
         val p = intent?.getStringExtra("path")
@@ -177,12 +178,18 @@ class MainActivity : Activity() {
                     step.startsWith("chat:ask:") -> chat.quickAsk(step.removePrefix("chat:ask:"), "ask")
                     step.startsWith("chat:type:") -> chat.typeForTest(step.removePrefix("chat:type:"))
                     step == "chat:stop" -> chat.stopForTest()
+                    step == "quit" -> doQuit()
+                    // Key presses inside a test window, for pictures of the key bindings: "key:Ctrl+K Ctrl+0".
+                    step.startsWith("key:") -> for (k in step.removePrefix("key:").split(' ')) testKey(k)
+                    // Reload Window in a test window: the reloaded window runs the steps after "reload:" ("+" between them).
+                    step.startsWith("reload:") -> { intent?.putExtra("snapshot", step.removePrefix("reload:").replace('+', ',')); intent?.putExtra("path", myFolder); recreate() }
                     step == "explorer" -> toggleExplorer()
                     step == "settings" -> startActivity(Intent(this, SettingsActivity::class.java).putExtra("snapshot", "settings"))
                 }
             }, finished = {
                 // A window opened only for pictures closes itself and leaves nothing in Recents.
-                if (intent?.getBooleanExtra("snapshot_only", false) == true) finishAndRemoveTask()
+                // A window that reloaded itself hands the task to its successor, so the old one must not close it.
+                if (!isDestroyed && intent?.getBooleanExtra("snapshot_only", false) == true) finishAndRemoveTask()
             })
         }, 6000)
     }
@@ -206,7 +213,8 @@ class MainActivity : Activity() {
             onTerminal = { toggleTerminal() },
             onChat = { toggleChat() },
             onNewWindow = { newWindow() },
-            onSettings = { openSettings() })
+            onSettings = { openSettings() },
+            onQuit = { quitForge() })
         // The model pill next to the engine chip, like the old page's model picker: the model's name and size.
         modelPill = Ui.chip(this, "model", Ui.fg3) { v -> showModelMenu(v) }
         (topBar.engineChip.parent as LinearLayout).let { p -> p.addView(modelPill, p.indexOfChild(topBar.engineChip), Ui.lp(Ui.wrap, Ui.wrap).also { it.rightMargin = Ui.dp(this, 6) }) }
@@ -656,10 +664,10 @@ class MainActivity : Activity() {
     fun commands(): List<CommandPalette.Command> {
         fun C(label: String, hint: String = "", run: () -> Unit) = CommandPalette.Command(label, hint, run)
         val sel = { editor.activeSmarts() }
-        return listOf(
-            C("New chat", "Ctrl N") { if (!chatShown) toggleChat(); chat.newChatTab() },
+        val base = listOf(
+            C("New chat", "Ctrl N in the chat") { if (!chatShown) toggleChat(); chat.newChatTab() },
             C("Toggle the AI panel", "Ctrl I") { toggleChat() },
-            C("Add the selection to the chat", "Ctrl L") { addSelectionToChat() },
+            C("Add the selection to the chat", "Ctrl Shift L") { addSelectionToChat() },
             C("Edit the selection with AI", "Ctrl K") { sel()?.openInlineEdit() ?: Ui.toast(this, "Open a file first.") },
             C("Toggle the Explorer", "Ctrl B") { toggleExplorer() },
             C("Toggle the bottom panel", "Ctrl J") { toggleBottomPanel() },
@@ -667,13 +675,16 @@ class MainActivity : Activity() {
             C("New terminal", "Ctrl Shift `") { showTerminal(); terminal.addTerminal() },
             C("Terminal: write a command with AI", "Ctrl K in the terminal") { showTerminal(); terminal.openAi() },
             C("Terminal: add the output to the chat") { addTerminalToChat(terminal.recentText(120)) },
-            C("Open a folder", "Ctrl O") { openFolderDialog() },
+            C("Open a folder", "Ctrl K, Ctrl O") { openFolderDialog() },
             C("New window", "Ctrl Shift N") { newWindow() },
+            C("Developer: Reload Window", "Ctrl R") { reloadWindow() },
+            C("Quit Forge", "Ctrl Q") { quitForge() },
+            C("File: Exit", "Ctrl Q") { quitForge() },
             C("Open a path anywhere on this computer") { openPalette("/") },
             C("Add a folder to this window (several folders in one window)") { openFolderDialog() },
             C("New file") { editor.newFileAt("") },
             C("Save", "Ctrl S") { editor.saveActive() },
-            C("Save all", "Ctrl Shift S") { editor.saveAll(null) },
+            C("Save all", "Ctrl K, S") { editor.saveAll(null) },
             C("Close the editor tab", "Ctrl W") { editor.closeActive() },
             C("Split the editor", "Ctrl \\") { editor.toggleSplit() },
             C("Markdown: open the preview to the side", "Ctrl Shift V") { editor.togglePreview() },
@@ -694,10 +705,10 @@ class MainActivity : Activity() {
             C("Replace in files", "Ctrl Shift H") { showSearch() },
             C("Show the problems", "Ctrl Shift M") { showProblems() },
             C("Fix all problems with AI") { val lines = problems.allLines(); if (lines.isEmpty()) Ui.toast(this, "There are no problems.") else quickAsk("Fix these errors and warnings. Edit the files directly and keep the behavior the same.", "agent", JSONObject().put("kind", "text").put("title", "Problems").put("name", "Problems").put("text", lines.joinToString("\n"))) },
-            C("Show the AI changes", "Ctrl Shift G G") { showSideById("review") },
+            C("Show the AI changes") { showSideById("review") },
             C("Review: open the next file with agent changes") { editor.nextReview() },
             C("Review: keep every pending agent change") { editor.keepAllReviews() },
-            C("Show the chat history", "Ctrl Shift H") { showSideById("history") },
+            C("Show the chat history") { showSideById("history") },
             C("Source control", "Ctrl Shift G") { showSideById("git") },
             C("Run and debug", "Ctrl Shift D") { showSideById("debug") },
             C("Debug: start debugging the open file", "F5") { debugPanel.start(false) },
@@ -720,9 +731,43 @@ class MainActivity : Activity() {
             C("Chat with @web context") { if (!chatShown) toggleChat(); chat.insertText("@web ") },
             C("Settings", "Ctrl ,") { openSettings() },
             C("Restart the language server of this file") { val p = editor.activePath(); if (p.isEmpty()) Ui.toast(this, "Open a file first.") else { Lsp.restart(p); editor.textOf(p)?.let { Lsp.open(p, it) } } },
-            C("Refresh the Explorer", "Ctrl R") { editor.refresh() },
+            C("Refresh the Explorer") { editor.refresh() },
             C("Unload the model from memory") { Api.async("unload", { Api.post("/api/unload", JSONObject()) }) { r, e -> flashStatus(if (r != null) "Model unloaded. It loads again on the next message." else "Not unloaded: " + (e?.message ?: "")) } },
         )
+        // Every key binding is a command too, and so are the editing commands Cursor has without a key.
+        val e = { editor.activeEditor() ?: run { flashStatus("Open a file first."); null } }
+        val more = listOf(
+            C("Transform to uppercase") { e()?.toUpper() },
+            C("Transform to lowercase") { e()?.toLower() },
+            C("Transform to title case") { e()?.toTitle() },
+            C("Transform to snake case") { e()?.toSnake() },
+            C("Transform to kebab case") { e()?.toKebab() },
+            C("Transform to camel case") { e()?.toCamel() },
+            C("Transform to Pascal case") { e()?.toPascal() },
+            C("Sort lines ascending") { e()?.sortLines(false) },
+            C("Sort lines descending") { e()?.sortLines(true) },
+            C("Sort lines ascending, ignoring case") { e()?.sortLines(false, ignoreCase = true) },
+            C("Reverse lines") { e()?.reverseLines() },
+            C("Delete duplicate lines") { e()?.deleteDuplicateLines() },
+            C("Join lines") { e()?.joinLines() },
+            C("Transpose characters around the cursor") { e()?.transposeLetters() },
+            C("Duplicate the selection") { e()?.duplicateSelection() },
+            C("Expand line selection", "Ctrl L in VS Code") { e()?.selectLine() },
+            C("Convert indentation to spaces") { e()?.indentationToSpaces() },
+            C("Convert indentation to tabs") { e()?.indentationToTabs() },
+            C("Toggle render whitespace") { editor.forEachEditor { it.renderWhitespace = !it.renderWhitespace } },
+            C("Toggle the minimap") { ForgeSettings.set("minimap", !ForgeSettings.bool("minimap", true)) },
+            C("Toggle preview tabs (a single click opens a file for a look)") { val on = !ForgeSettings.bool("preview_tabs", true); ForgeSettings.set("preview_tabs", on); flashStatus(if (on) "Preview tabs are on." else "Preview tabs are off.") },
+            C("Close the other editors") { editor.closeOtherTabs() },
+            C("Close the editors to the right") { editor.closeTabsToTheRight() },
+            C("Select all occurrences of the find match", "Alt Enter in the find bar") { e()?.selectAllFindMatches() },
+            C("Undo the last cursor operation", "Ctrl U") { e()?.undoCursorOperation() },
+            C("Remove the extra cursors", "Escape") { e()?.clearExtraCursors() },
+        )
+        val have = HashSet<String>(); for (c in base) have.add(c.label)
+        val fromKeys = keymap.filter { it.title.isNotEmpty() && it.title !in have && it.enabled() }.distinctBy { it.title }
+            .map { C(it.title, Keymap.pretty(it.keys), it.run) }
+        return base + fromKeys + more.filter { it.label !in have }
     }
 
     /** A chat code block goes in at the editor's cursor (replacing the selection). */
@@ -850,12 +895,16 @@ class MainActivity : Activity() {
     private fun loadIde() {
         loaded = true
         Api.async("status", { Api.get("/api/status") }) { r, _ ->
-            if (r != null && Api.folder.isEmpty()) Api.folder = r.optString("workspace")
+            // A window opened without a folder (from the launcher) takes the most recent folder, not the folder another
+            // window of this app happened to leave in the shared Api.folder.
+            if (r != null && (Api.folder.isEmpty() || myFolder.isEmpty())) Api.folder = r.optString("default_folder").ifEmpty { r.optString("workspace") }
             if (myFolder.isEmpty()) myFolder = Api.folder
             ForgeSettings.refresh()
             editor.restoreReviews()
             setWindowTitle("")
             editor.refresh(); chat.load(); terminal.connect()
+            startZoom()
+            intent?.getStringExtra("open_file")?.let { f -> intent?.removeExtra("open_file"); Api.main.postDelayed({ editor.openFile(f) }, 600) }
             Api.main.removeCallbacks(statusTask); Api.main.post(statusTask)
             Api.main.removeCallbacks(indexTask); Api.main.post(indexTask)
         }
@@ -1019,6 +1068,547 @@ class MainActivity : Activity() {
         startActivity(i)
     }
 
+    // ---------------------------------------------------------------- Cursor's key bindings (see Keymap)
+    private val keymap: List<Keymap.Binding> by lazy { buildBindings() }
+    private var chordPrefix = ""
+    private var chordFallback: (() -> Unit)? = null
+    private val chordTimeout = Runnable { val f = chordFallback; chordPrefix = ""; chordFallback = null; f?.invoke() }
+    private var lastEscape = 0L
+
+    /** The active editor, or a short note that a file must be open first. */
+    private fun ed(): CodeEditor? = editor.activeEditor() ?: run { flashStatus("Open a file first."); null }
+
+    /** The text selected in the active editor, with the file and lines, kept when copied so Ctrl V in the chat can
+     *  add it as a reference to those lines (Cursor's copied code as context). */
+    private var copiedRef: Triple<String, IntRange, String>? = null
+
+    private fun copyFromEditor(cut: Boolean) {
+        val e = editor.activeEditor() ?: return
+        val text = e.selectionText()
+        if (text.isEmpty()) { e.copyLineIfEmpty(cut); copiedRef = null; return }
+        copyToClipboard(text)
+        val a = minOf(e.edit.selectionStart, e.edit.selectionEnd); val b = maxOf(e.edit.selectionStart, e.edit.selectionEnd)
+        copiedRef = Triple(editor.activePath(), (e.lineColOf(a).first + 1)..(e.lineColOf(b).first + 1), text)
+        if (cut) e.replaceRange(a, b, "")
+    }
+
+    private fun clipboardText(): String = try { (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).primaryClip?.getItemAt(0)?.coerceToText(this)?.toString() ?: "" } catch (e: Exception) { "" }
+
+    private fun buildBindings(): List<Keymap.Binding> {
+        val W = Keymap.Where.WINDOW; val E = Keymap.Where.EDITOR; val C = Keymap.Where.CHAT; val T = Keymap.Where.TERMINAL; val A = Keymap.Where.ANYWHERE
+        fun b(keys: String, where: Keymap.Where, title: String, enabled: () -> Boolean = { true }, run: () -> Unit) = Keymap.Binding(keys, where, title, run, enabled)
+        val sm = { editor.activeSmarts() }
+        return listOf(
+            // ---- Cursor: the AI panel, agent and chat
+            b("Ctrl+I", A, "Toggle the AI panel (Agent)") { toggleChat(); if (chatShown) chat.focusPrompt() },
+            b("Ctrl+L", W, "Add the selection to a new chat (or toggle the AI panel)") { if (editor.selectionText().isNotEmpty()) { if (!chatShown) toggleChat(); chat.newChatTab(); Api.main.postDelayed({ addSelectionToChat() }, 400) } else { toggleChat(); if (chatShown) chat.focusPrompt() } },
+            b("Ctrl+Shift+L", W, "Add the selection to the chat") { addSelectionToChat() },
+            b("Ctrl+E", W, "Toggle the Agent layout (the chat takes the window)") { toggleAgentLayout() },
+            b("Ctrl+Shift+J", A, "Cursor settings (Forge's AI settings)") { openSettingsAt("ai") },
+            b("Ctrl+Alt+I", A, "Open the chat view") { if (!chatShown) toggleChat(); chat.focusPrompt() },
+            b("Ctrl+Shift+Alt+I", A, "Open the chat in Agent mode") { if (!chatShown) toggleChat(); chat.setModePublic("agent"); chat.focusPrompt() },
+            b("Ctrl+Shift+Alt+L", A, "Quick chat (ask a question in a small box)") { quickChatDialog() },
+            b("Ctrl+Alt+.", A, "Pick the language model") { if (!chatShown) toggleChat(); chat.modelMenu() },
+            b("Ctrl+Alt+/", A, "Model toggle (pick the model)") { if (!chatShown) toggleChat(); chat.modelMenu() },
+            b("Ctrl+N", C, "New chat") { chat.newChatTab() },
+            b("Ctrl+T", C, "New chat tab") { chat.newChatTab() },
+            b("Ctrl+[", C, "Previous chat") { chat.stepChat(-1) },
+            b("Ctrl+]", C, "Next chat") { chat.stepChat(1) },
+            b("Ctrl+W", C, "Close the chat tab") { chat.closeChat() },
+            b("Ctrl+.", C, "Mode menu (Agent, Ask, Plan)") { chat.modeMenu() },
+            b("Shift+Tab", C, "Rotate between the agent modes") { chat.nextMode() },
+            b("Ctrl+/", C, "Loop between the AI models") { chat.nextModel() },
+            b("Ctrl+Shift+Backspace", C, "Cancel the reply (or undo the last reply's changes)") { chat.cancelOrReject() },
+            b("Ctrl+Enter", C, "Accept all changes (with suggested changes waiting)", { !chat.isRunning() && chat.promptEmpty() && editor.pendingReviews().isNotEmpty() }) { editor.keepAllReviews(); flashStatus("Kept every change.") },
+            b("Ctrl+Shift+V", C, "Paste the clipboard into the input as text") { chat.pasteAsText() },
+            b("Ctrl+V", C, "Paste copied code as context (a reference to its lines)", { copiedRef?.third == clipboardText() && clipboardText().isNotEmpty() }) { copiedRef?.let { chat.pasteCodeReference(it.first, it.second.first, it.second.last, it.third) } },
+            b("Up", C, "Edit your previous message (empty input)", { chat.promptEmpty() && !chat.isRunning() }) { chat.recallMessage(1) },
+            b("Tab", C, "Cycle to the next message (your earlier messages)", { chat.promptEmpty() }) { chat.recallMessage(1) },
+            b("Escape", C, "Leave the input (back to the editor)", { !chat.isRunning() }) { editor.focusEditor() },
+            b("Ctrl+Shift+Space", A, "Voice input") { chat.dictateIntoPrompt() },
+
+            // ---- general
+            b("Ctrl+Shift+P", A, "Show all commands") { openPalette(">") },
+            b("F1", W, "Show all commands") { openPalette(">") },
+            b("Ctrl+P", A, "Go to file (Quick Open)") { openPalette("") },
+            b("Ctrl+Shift+N", A, "New window") { newWindow() },
+            b("Ctrl+Shift+W", W, "Close the window") { closeWindow() },
+            b("Alt+F4", A, "Close the window") { closeWindow() },
+            b("Ctrl+,", A, "Settings") { openSettings() },
+            b("Ctrl+K Ctrl+S", W, "Keyboard shortcuts") { showKeyboardShortcuts() },
+            b("Ctrl+Q", A, "Quit Forge") { quitForge() },
+            b("Ctrl+K Ctrl+T", W, "Color theme") { colorThemeDialog() },
+            b("Ctrl+K Ctrl+M", W, "Toggle the tab moves focus mode (same as Ctrl M)") { toggleTabFocusMode() },
+            b("Ctrl+M", W, "Toggle the Tab key moves focus") { toggleTabFocusMode() },
+
+            // ---- files
+            b("Ctrl+N", W, "New file (Untitled)") { editor.newUntitled() },
+            b("Ctrl+O", W, "Open a file") { openPalette("/") },
+            b("Ctrl+K Ctrl+O", W, "Open a folder") { openFolderDialog() },
+            b("Ctrl+K F", W, "Close the folder") { closeFolder() },
+            b("Ctrl+S", W, "Save") { editor.saveActive() },
+            b("Ctrl+Shift+S", W, "Save as") { editor.saveAsActive() },
+            b("Ctrl+K S", W, "Save all") { editor.saveAll(null) },
+            b("Ctrl+Alt+S", W, "Save all") { editor.saveAll(null) },
+            b("Ctrl+W", W, "Close the editor (the window when no editor is open)") { if (editor.hasOpenTabs()) editor.closeActive() else closeWindow() },
+            b("Ctrl+F4", W, "Close the editor") { editor.closeActive() },
+            b("Ctrl+K W", W, "Close the editor group") { editor.closeGroupTabs() },
+            b("Ctrl+K Ctrl+W", W, "Close all editors") { editor.closeAllTabs() },
+            b("Ctrl+K U", W, "Close the saved editors") { editor.closeSavedTabs() },
+            b("Ctrl+Shift+T", W, "Reopen the closed editor") { editor.reopenClosed() },
+            b("Ctrl+K Enter", W, "Keep the editor open (end preview mode)") { editor.keepOpen() },
+            b("Ctrl+K P", W, "Copy the path of the active file") { editor.copyActivePath(relative = false) },
+            b("Ctrl+K Ctrl+Shift+C", W, "Copy the relative path of the active file") { editor.copyActivePath(relative = true) },
+            b("Ctrl+Shift+Alt+C", W, "Copy the relative path of the active file") { editor.copyActivePath(relative = true) },
+            b("Ctrl+K R", W, "Reveal the active file in the Explorer") { editor.revealActive() },
+            b("Ctrl+K O", W, "Show the active file in a new window") { openActiveInNewWindow() },
+
+            // ---- editor groups and tabs
+            b("Ctrl+\\", W, "Split the editor") { editor.toggleSplit() },
+            b("Ctrl+1", W, "Focus the first editor group") { editor.focusGroupAt(0) },
+            b("Ctrl+2", W, "Focus the second editor group") { editor.focusGroupAt(1) },
+            b("Ctrl+3", W, "Focus the third editor group (Forge has two)") { editor.focusGroupAt(1); flashStatus("Forge splits the editor into two groups; this is the second one.") },
+            b("Ctrl+K Ctrl+Left", W, "Focus the editor group on the left") { editor.focusNextGroup(-1) },
+            b("Ctrl+K Ctrl+Right", W, "Focus the editor group on the right") { editor.focusNextGroup(1) },
+            b("Ctrl+K Left", W, "Move the active editor group left") { editor.swapGroups() },
+            b("Ctrl+K Right", W, "Move the active editor group right") { editor.swapGroups() },
+            b("Ctrl+Alt+Right", W, "Move the editor into the next group") { editor.moveTabToGroup(1) },
+            b("Ctrl+Alt+Left", W, "Move the editor into the previous group") { editor.moveTabToGroup(-1) },
+            b("Ctrl+Shift+PageUp", W, "Move the editor left") { editor.moveTab(-1) },
+            b("Ctrl+Shift+PageDown", W, "Move the editor right") { editor.moveTab(1) },
+            b("Ctrl+PageDown", W, "Open the next editor") { editor.cycleTab(1) },
+            b("Ctrl+PageUp", W, "Open the previous editor") { editor.cycleTab(-1) },
+            b("Ctrl+Tab", W, "Open the next recently used editor") { editor.cycleRecent(1) },
+            b("Ctrl+Shift+Tab", W, "Open the previous recently used editor") { editor.cycleRecent(-1) },
+            b("Shift+Alt+0", W, "Toggle the editor group layout (side by side or stacked)") { editor.toggleGroupLayout() },
+            *(1..9).map { n -> b("Alt+$n", W, "Open editor $n of the group") { editor.openTabAt(n) } }.toTypedArray(),
+            b("Alt+0", W, "Open the last editor of the group") { editor.openTabAt(0) },
+
+            // ---- navigation
+            b("Ctrl+G", E, "Go to line") { ed()?.askGoToLine() },
+            b("Ctrl+T", W, "Show all symbols") { openPalette("#") },
+            b("Ctrl+Shift+O", W, "Go to a symbol in the file") { openPalette("@") },
+            b("Ctrl+Shift+M", W, "Show the problems") { showProblems() },
+            b("F8", W, "Go to the next problem") { nextProblem(1) },
+            b("Shift+F8", W, "Go to the previous problem") { nextProblem(-1) },
+            b("Ctrl+Alt+-", W, "Go back") { editor.goBack() },
+            b("Ctrl+Shift+-", W, "Go forward") { editor.goForward() },
+            b("Ctrl+K Ctrl+Q", W, "Go to the last edit location") { editor.goToLastEdit() },
+            b("Ctrl+Shift+;", W, "Focus the breadcrumbs (the symbols of the file)") { openPalette("@") },
+
+            // ---- display
+            b("F11", W, "Toggle full screen", { !debugPanel.active() }) { toggleFullScreen() },
+            b("Ctrl+K Z", W, "Toggle Zen mode (Escape twice leaves it)") { toggleZen() },
+            b("Ctrl+=", A, "Zoom in") { zoomBy(1) },
+            b("Ctrl+Shift+=", A, "Zoom in") { zoomBy(1) },
+            b("Ctrl+-", A, "Zoom out") { zoomBy(-1) },
+            b("Ctrl+Numpad0", A, "Reset the zoom") { zoomReset() },
+            b("Ctrl+0", W, "Reset the zoom") { zoomReset() },
+            b("Ctrl+B", W, "Toggle the side bar") { toggleExplorer() },
+            b("Ctrl+Alt+B", W, "Toggle the secondary side bar (the AI panel)") { toggleChat() },
+            b("Ctrl+J", W, "Toggle the panel") { toggleBottomPanel() },
+            b("Ctrl+Shift+E", W, "Show the Explorer") { showExplorer() },
+            b("Ctrl+Shift+F", A, "Search in files") { showSearch(editor.selectionText().takeIf { !it.contains('\n') } ?: "") },
+            b("Ctrl+Shift+H", W, "Replace in files") { showSearch(editor.selectionText().takeIf { !it.contains('\n') } ?: "") },
+            b("Ctrl+Shift+G", W, "Show source control") { showSideById("git") },
+            b("Ctrl+Shift+D", W, "Show run and debug") { showSideById("debug") },
+            b("Ctrl+Shift+X", W, "Show the extensions (language servers and toolchains)") { showSideById("android") },
+            b("Ctrl+K Ctrl+H", W, "Show the output (the agent log)") { if (!bottomShown) toggleBottomPanel(); selectPanel(1) },
+            b("Ctrl+Shift+U", W, "Show the output (the agent log)") { if (!bottomShown) toggleBottomPanel(); selectPanel(1) },
+            b("Ctrl+Shift+Y", W, "Show the debug console") { showDebugConsole() },
+            b("Ctrl+Shift+C", W, "Open a new external terminal (the Terminal app)") { openTerminalApp() },
+            b("Ctrl+Shift+V", E, "Toggle the Markdown preview") { editor.togglePreview() },
+            b("Ctrl+K V", W, "Open the Markdown preview to the side") { editor.togglePreview() },
+            b("Ctrl+`", A, "Toggle the terminal") { if (currentFocus is TerminalView) { toggleBottomPanel(); editor.focusEditor() } else { showTerminal(); terminal.focusInput() } },
+            b("Ctrl+Shift+`", A, "New terminal") { showTerminal(); terminal.addTerminal() },
+            b("Ctrl+Shift+5", A, "Split the terminal") { showTerminal(); terminal.split() },
+            b("Ctrl+PageDown", T, "Focus the next terminal") { terminal.step(1) },
+            b("Ctrl+PageUp", T, "Focus the previous terminal") { terminal.step(-1) },
+            b("Ctrl+Shift+C", T, "Copy the terminal selection", { false }) { },
+            b("Ctrl+Shift+V", T, "Paste into the terminal", { false }) { },
+            b("Ctrl+Shift+Up", T, "Scroll the terminal up a line", { false }) { },
+            b("Ctrl+Shift+Down", T, "Scroll the terminal down a line", { false }) { },
+            b("Shift+PageUp", T, "Scroll the terminal up a page", { false }) { },
+            b("Shift+PageDown", T, "Scroll the terminal down a page", { false }) { },
+            b("Shift+Home", T, "Scroll the terminal to the top", { false }) { },
+            b("Shift+End", T, "Scroll the terminal to the bottom", { false }) { },
+            b("Ctrl+K", T, "Write a command with AI (Ctrl Enter in its box runs it)", { false }) { },
+
+            // ---- debug and tasks
+            b("F9", W, "Toggle a breakpoint") { toggleBreakpointAtCursor() },
+            b("Ctrl+F5", W, "Run without debugging") { debugPanel.start(true) },
+            b("Ctrl+Shift+F5", W, "Restart the debugger") { debugPanel.restart() },
+            b("Ctrl+Shift+B", W, "Run the build task") { runBuildTask() },
+
+            // ---- the editor (Cursor's and VS Code's editing keys)
+            b("Ctrl+K", E, "Edit the selection with AI (inline edit)", { false }) { },
+            b("Ctrl+C", E, "Copy (the whole line when nothing is selected)", { editor.activeEditor()?.hasMultipleCursors() == false }) { copyFromEditor(cut = false) },
+            b("Ctrl+X", E, "Cut (the whole line when nothing is selected)", { editor.activeEditor()?.hasMultipleCursors() == false }) { copyFromEditor(cut = true) },
+            b("Ctrl+Shift+K", E, "Delete the line (with the inline edit open: back to its input)") { val s0 = sm(); if (s0 != null && s0.inlineOpen()) s0.focusInline() else ed()?.deleteLine() },
+            b("Ctrl+Enter", E, "Insert a line below", { editor.activeEditor()?.hasReview() != true }) { ed()?.insertLineBelow() },
+            b("Ctrl+Shift+Enter", E, "Insert a line above", { editor.activeEditor()?.hasReview() != true }) { ed()?.insertLineAbove() },
+            b("Alt+Up", E, "Move the line up") { ed()?.moveLinesUp() },
+            b("Alt+Down", E, "Move the line down") { ed()?.moveLinesDown() },
+            b("Ctrl+Shift+Alt+Up", E, "Copy the line up") { ed()?.copyLinesUp() },
+            b("Ctrl+Shift+Alt+Down", E, "Copy the line down") { ed()?.copyLinesDown() },
+            b("Shift+Alt+Up", E, "Add a cursor above") { ed()?.addCursorVertical(-1) },
+            b("Shift+Alt+Down", E, "Add a cursor below") { ed()?.addCursorVertical(1) },
+            b("Ctrl+Alt+Up", E, "Add a cursor above") { ed()?.addCursorVertical(-1) },
+            b("Ctrl+Alt+Down", E, "Add a cursor below") { ed()?.addCursorVertical(1) },
+            b("Ctrl+D", E, "Add the selection to the next find match") { ed()?.addNextOccurrence() },
+            b("Ctrl+K Ctrl+D", W, "Move the last selection to the next find match") { ed()?.moveLastSelectionToNextOccurrence() },
+            b("Ctrl+U", E, "Undo the last cursor operation") { ed()?.undoCursorOperation() },
+            b("Shift+Alt+I", E, "A cursor at the end of each selected line") { ed()?.cursorsAtLineEnds() },
+            b("Ctrl+F2", E, "Select all occurrences of the current word") { ed()?.selectAllOccurrences() },
+            b("Shift+Alt+Right", E, "Expand the selection") { ed()?.expandSelection() },
+            b("Shift+Alt+Left", E, "Shrink the selection") { ed()?.shrinkSelection() },
+            b("Ctrl+Shift+\\", E, "Jump to the matching bracket") { ed()?.jumpToBracket() },
+            b("Ctrl+]", E, "Indent the line") { ed()?.indentLines() },
+            b("Ctrl+[", E, "Outdent the line") { ed()?.outdentLines() },
+            b("Ctrl+Up", E, "Scroll a line up") { ed()?.scrollLines(-1) },
+            b("Ctrl+Down", E, "Scroll a line down") { ed()?.scrollLines(1) },
+            b("Alt+PageUp", E, "Scroll a page up") { ed()?.scrollPage(-1) },
+            b("Alt+PageDown", E, "Scroll a page down") { ed()?.scrollPage(1) },
+            b("Ctrl+Shift+[", E, "Fold the region") { ed()?.foldAtCursor() },
+            b("Ctrl+Shift+]", E, "Unfold the region") { ed()?.unfoldAtCursor() },
+            b("Ctrl+K Ctrl+L", W, "Toggle the fold") { ed()?.toggleFold() },
+            b("Ctrl+K Ctrl+[", W, "Fold all subregions") { ed()?.foldRecursively(true) },
+            b("Ctrl+K Ctrl+]", W, "Unfold all subregions") { ed()?.foldRecursively(false) },
+            b("Ctrl+K Ctrl+0", W, "Fold all regions") { ed()?.foldAll() },
+            b("Ctrl+K Ctrl+J", W, "Unfold all regions") { ed()?.unfoldAll() },
+            *(1..7).map { n -> b("Ctrl+K Ctrl+$n", W, "Fold level $n") { ed()?.foldLevel(n) } }.toTypedArray(),
+            b("Ctrl+K Ctrl+/", W, "Fold all block comments") { ed()?.foldBlockComments() },
+            b("Ctrl+K Ctrl+-", W, "Fold all regions except the one with the cursor") { ed()?.foldAllExceptCursor() },
+            b("Ctrl+K Ctrl+C", W, "Add a line comment") { ed()?.setLineComment(true) },
+            b("Ctrl+K Ctrl+U", W, "Remove the line comment") { ed()?.setLineComment(false) },
+            b("Ctrl+/", E, "Toggle the line comment") { ed()?.toggleLineComment() },
+            b("Ctrl+Shift+A", E, "Toggle a block comment") { ed()?.toggleBlockComment() },
+            b("Alt+Z", W, "Toggle word wrap") { toggleWordWrapEverywhere() },
+            b("Ctrl+F", E, "Find") { ed()?.showFind() },
+            b("Ctrl+H", E, "Replace") { ed()?.showReplace() },
+            b("F3", E, "Find the next match") { ed()?.findNextMatch(true) },
+            b("Shift+F3", E, "Find the previous match") { ed()?.findNextMatch(false) },
+            b("Ctrl+F3", E, "Find the next match of the selection") { ed()?.findSelectionNext(true) },
+            b("Ctrl+Shift+F3", E, "Find the previous match of the selection") { ed()?.findSelectionNext(false) },
+            b("Ctrl+Space", E, "Trigger the suggestions") { sm()?.requestCompletionPublic() },
+            b("Ctrl+Shift+Space", E, "Trigger the parameter hints") { sm()?.requestSignaturePublic() },
+            b("Ctrl+Shift+I", E, "Format the document") { sm()?.format() },
+            b("Shift+Alt+F", E, "Format the document") { sm()?.format() },
+            b("Ctrl+K Ctrl+F", W, "Format the selection") { sm()?.formatSelection() },
+            b("F12", E, "Go to the definition") { sm()?.goToDefinition() },
+            b("Alt+F12", E, "Peek the definition") { sm()?.peekDefinition() },
+            b("Ctrl+Shift+F10", E, "Peek the definition") { sm()?.peekDefinition() },
+            b("Ctrl+K F12", W, "Open the definition to the side") { definitionToSide() },
+            b("Ctrl+F12", E, "Go to the implementations") { sm()?.goToImplementation() },
+            b("Shift+F12", E, "Go to the references") { sm()?.references() },
+            b("F2", E, "Rename the symbol") { sm()?.renameDialog() },
+            b("Ctrl+.", E, "Quick fix") { sm()?.codeActions() },
+            b("Ctrl+K Ctrl+I", W, "Show the hover") { sm()?.hoverAtCursor() },
+            b("Ctrl+K Ctrl+X", W, "Trim trailing whitespace") { ed()?.trimTrailingWhitespace() },
+            b("Ctrl+K M", W, "Change the language mode") { languageModeDialog() },
+            b("Ctrl+Shift+.", E, "Replace with the next value") { ed()?.inPlaceReplace(1) },
+            b("Ctrl+Shift+,", E, "Replace with the previous value") { ed()?.inPlaceReplace(-1) },
+            b("Alt+\\", E, "Trigger an AI completion now") { sm()?.requestGhost(true) },
+            b("Ctrl+Right", E, "Accept the next word of the suggestion (or move a word right)") { val e = ed() ?: return@b; if (!(e.hasGhost() && e.acceptGhostWord())) e.cursorWordRight(false) },
+        )
+    }
+
+    /** A key press made by a test step: the same path as a real key (the bindings, then the focused view). */
+    private fun testKey(stroke: String) {
+        val parts = stroke.split('+')
+        var meta = 0
+        for (m in parts.dropLast(1)) meta = meta or when (m) { "Ctrl" -> KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_LEFT_ON; "Shift" -> KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_LEFT_ON; "Alt" -> KeyEvent.META_ALT_ON or KeyEvent.META_ALT_LEFT_ON; else -> 0 }
+        val name = parts.last()
+        val code = (0..KeyEvent.getMaxKeyCode()).firstOrNull { Keymap.keyName(it) == name } ?: return
+        val now = android.os.SystemClock.uptimeMillis()
+        dispatchKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0, meta))
+        dispatchKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, code, 0, meta))
+    }
+
+    /** Runs a key press through the bindings; true when one took it. */
+    private fun handleBinding(event: KeyEvent): Boolean {
+        val focus = currentFocus
+        val inTerminal = focus is TerminalView
+        val inEditor = focus is CodeEditor.CodeEditText
+        val inChat = chat.promptHasFocus()
+        val stroke = Keymap.stroke(event)
+        if (stroke.isEmpty()) return false
+        if (chordPrefix.isNotEmpty()) {
+            val prefix = chordPrefix
+            chordPrefix = ""; chordFallback = null
+            Api.main.removeCallbacks(chordTimeout)
+            // Ctrl R chords are Cursor's names for VS Code's Ctrl K chords.
+            val chord = "Ctrl+K $stroke"
+            val b = keymap.firstOrNull { it.keys == chord && Keymap.applies(it, inEditor, inChat, inTerminal) && it.enabled() }
+            if (b != null) { b.run(); return true }
+            flashStatus("The key combination (" + Keymap.pretty(prefix) + ", " + Keymap.pretty(stroke) + ") is not a command.")
+            return true
+        }
+        if (stroke in Keymap.chordPrefixes && !inTerminal) {
+            chordPrefix = stroke
+            // Ctrl K alone opens the editor's inline edit (Cursor) and Ctrl R alone reloads the window, unless a second
+            // key comes first.
+            chordFallback = if (stroke == "Ctrl+K") (if (inEditor) ({ editor.activeSmarts()?.openInlineEdit() }) else null) else ({ reloadWindow() })
+            flashStatus("(" + Keymap.pretty(stroke) + ") was pressed. Waiting for the second key of the chord.")
+            Api.main.removeCallbacks(chordTimeout)
+            if (chordFallback != null) Api.main.postDelayed(chordTimeout, 800)
+            return true
+        }
+        if (stroke == "Escape" && zenMode) {
+            val now = System.currentTimeMillis()
+            if (now - lastEscape < 600) { toggleZen(); lastEscape = 0; return true }
+            lastEscape = now
+        }
+        val b = keymap.firstOrNull { it.keys == stroke && Keymap.applies(it, inEditor, inChat, inTerminal) && it.enabled() } ?: return false
+        b.run()
+        return true
+    }
+
+    // ---------------------------------------------------------------- zoom (Ctrl = and Ctrl -), full screen, Zen and the Agent layout
+    private var zoomLevel = 0
+    private val zoomPrefs by lazy { getSharedPreferences("forge-window", Context.MODE_PRIVATE) }
+
+    /** The whole window grows or shrinks by 10 percent per step, like Cursor's zoom; the level is remembered. */
+    private fun zoomBy(step: Int) { zoomLevel = (zoomLevel + step).coerceIn(-5, 8); applyZoom(); flashStatus("Zoom " + Math.round(zoomFactor() * 100) + "%") }
+    private fun zoomReset() { zoomLevel = 0; applyZoom(); flashStatus("Zoom 100%") }
+    private fun zoomFactor(): Float = Math.pow(1.1, zoomLevel.toDouble()).toFloat()
+
+    private fun applyZoom() {
+        try { zoomPrefs.edit().putInt("zoom", zoomLevel).apply() } catch (e: Exception) { }
+        val f = zoomFactor()
+        val w = root.width - root.paddingLeft - root.paddingRight
+        val h = root.height - root.paddingTop - root.paddingBottom
+        if (w <= 0 || h <= 0) { root.post { applyZoom() }; return }
+        ide.pivotX = 0f; ide.pivotY = 0f
+        ide.scaleX = f; ide.scaleY = f
+        val lp = ide.layoutParams as FrameLayout.LayoutParams
+        val nw = if (zoomLevel == 0) FrameLayout.LayoutParams.MATCH_PARENT else (w / f).toInt()
+        val nh = if (zoomLevel == 0) FrameLayout.LayoutParams.MATCH_PARENT else (h / f).toInt()
+        if (lp.width != nw || lp.height != nh) { lp.width = nw; lp.height = nh; ide.layoutParams = lp }
+    }
+
+    private var zoomWatcher = false
+    private fun startZoom() {
+        zoomLevel = try { zoomPrefs.getInt("zoom", 0) } catch (e: Exception) { 0 }
+        if (!zoomWatcher) { zoomWatcher = true; root.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or2, ob -> if (zoomLevel != 0 && (r - l != or2 - ol || b - t != ob - ot)) root.post { applyZoom() } } }
+        if (zoomLevel != 0) applyZoom()
+    }
+
+    private var fullScreen = false
+
+    /** F11: the window fills the screen (Android's own full screen mode for a desktop window), F11 again restores it. */
+    private fun toggleFullScreen() {
+        fullScreen = !fullScreen
+        try {
+            requestFullscreenMode(if (fullScreen) android.app.Activity.FULLSCREEN_MODE_REQUEST_ENTER else android.app.Activity.FULLSCREEN_MODE_REQUEST_EXIT,
+                object : android.os.OutcomeReceiver<Void, Throwable> {
+                    override fun onResult(result: Void?) {}
+                    override fun onError(error: Throwable) { runOnUiThread { fullScreen = !fullScreen; flashStatus("Full screen is not available here: " + (error.message ?: "")) } }
+                })
+        } catch (e: Exception) {
+            val c = window.insetsController
+            if (fullScreen) c?.hide(WindowInsets.Type.systemBars()) else c?.show(WindowInsets.Type.systemBars())
+        }
+    }
+
+    private var zenMode = false
+    private var zenSaved: BooleanArray? = null
+
+    /** Ctrl K Z: only the editor stays (no side bar, panel, AI panel, activity bar, top bar or status bar), in full
+     *  screen; Escape twice or Ctrl K Z again brings everything back. */
+    private fun toggleZen() {
+        zenMode = !zenMode
+        if (zenMode) {
+            zenSaved = booleanArrayOf(explorerShown, bottomShown, chatShown, sideView != null)
+            if (sideView != null) closeSide()
+            if (explorerShown) toggleExplorer()
+            if (bottomShown) toggleBottomPanel()
+            if (chatShown) toggleChat()
+            activityBar.view.visibility = View.GONE; topBar.view.visibility = View.GONE; statusBar.view.visibility = View.GONE
+            if (!fullScreen) toggleFullScreen()
+            flashStatus("Zen mode. Press Escape twice to leave it.")
+        } else {
+            val s = zenSaved ?: booleanArrayOf(true, true, true, false)
+            activityBar.view.visibility = View.VISIBLE; topBar.view.visibility = View.VISIBLE; statusBar.view.visibility = View.VISIBLE
+            if (s[0] != explorerShown) toggleExplorer()
+            if (s[1] != bottomShown) toggleBottomPanel()
+            if (s[2] != chatShown) toggleChat()
+            if (fullScreen) toggleFullScreen()
+        }
+        editor.focusEditor()
+    }
+
+    private var agentLayout = false
+    private var agentSaved: BooleanArray? = null
+
+    /** Ctrl E: Cursor's Agent layout, where the chat takes the whole window; Ctrl E again brings the editor back. */
+    private fun toggleAgentLayout() {
+        agentLayout = !agentLayout
+        val lp = chat.view.layoutParams as LinearLayout.LayoutParams
+        if (agentLayout) {
+            agentSaved = booleanArrayOf(chatShown, bottomShown)
+            if (!chatShown) toggleChat()
+            center.visibility = View.GONE; sideHost.visibility = View.GONE; rightSplitter.visibility = View.GONE
+            lp.width = 0; lp.weight = 1f
+            chat.focusPrompt()
+        } else {
+            center.visibility = View.VISIBLE; if (sideView != null) sideHost.visibility = View.VISIBLE
+            lp.width = chatWidth; lp.weight = 0f
+            rightSplitter.visibility = if (chatShown) View.VISIBLE else View.GONE
+            val s = agentSaved
+            if (s != null && !s[0] && chatShown) toggleChat()
+        }
+        chat.view.layoutParams = lp
+    }
+
+    // ---------------------------------------------------------------- more commands
+    private fun toggleTabFocusMode() {
+        CodeEditor.tabMovesFocus = !CodeEditor.tabMovesFocus
+        flashStatus(if (CodeEditor.tabMovesFocus) "Tab moves the focus. Ctrl M again to type tabs." else "Tab types a tab again.")
+    }
+
+    private fun toggleWordWrapEverywhere() {
+        val on = !(editor.activeEditor()?.wordWrap ?: wrapAll)
+        wrapAll = on
+        editor.forEachEditor { it.setWordWrap(on) }
+        flashStatus(if (on) "Word wrap is on." else "Word wrap is off.")
+    }
+    private var wrapAll = false
+
+    private fun closeWindow() {
+        val dirty = editor.dirtyCount()
+        if (dirty == 0) { finishAndRemoveTask(); return }
+        AlertDialog.Builder(this).setTitle("Close the window?").setMessage(if (dirty == 1) "One file has unsaved changes." else "$dirty files have unsaved changes.")
+            .setPositiveButton("Save and close") { _, _ -> editor.saveAll { finishAndRemoveTask() } }
+            .setNeutralButton("Close without saving") { _, _ -> finishAndRemoveTask() }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    /** Ctrl K F: every editor of the folder closes and the folder picker opens for the next one. */
+    private fun closeFolder() {
+        editor.closeAllTabs()
+        Api.main.postDelayed({ if (!editor.hasOpenTabs()) openFolderDialog() }, 300)
+    }
+
+    private fun openActiveInNewWindow() {
+        val p = editor.activePath()
+        if (p.isEmpty() || editor.isUntitled(p)) { flashStatus("Open a saved file first."); return }
+        val i = Intent(this, MainActivity::class.java)
+        i.putExtra("path", myFolder.ifEmpty { Api.folder })
+        i.putExtra("open_file", p)
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT or Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
+        startActivity(i)
+    }
+
+    /** F8 and Shift F8: the next or previous problem, in this file first and then in the Problems list. */
+    private fun nextProblem(dir: Int) {
+        val e = editor.activeEditor()
+        if (e != null && e.gotoDiagnostic(dir)) return
+        showProblems()
+        problems.step(dir)
+    }
+
+    /** Ctrl K F12: the definition opens in the other editor group. */
+    private fun definitionToSide() {
+        val smarts = editor.activeSmarts() ?: run { flashStatus("Open a file first."); return }
+        editor.focusGroupAt(1)
+        Api.main.postDelayed({ smarts.goToDefinition() }, 250)
+    }
+
+    private fun quickChatDialog() {
+        val input = Ui.input(this, "Ask a quick question (Enter asks, the answer appears in the AI panel)", mono = false)
+        val d = AlertDialog.Builder(this).setTitle("Quick chat").setView(input)
+            .setPositiveButton("Ask") { _, _ -> val q = input.text.toString().trim(); if (q.isNotEmpty()) quickAsk(q, "ask") }
+            .setNegativeButton("Cancel", null).create()
+        input.setOnKeyListener { _, code, ev -> if (ev.action == KeyEvent.ACTION_DOWN && code == KeyEvent.KEYCODE_ENTER && !ev.isShiftPressed) { val q = input.text.toString().trim(); if (q.isNotEmpty()) quickAsk(q, "ask"); d.dismiss(); true } else false }
+        d.show(); input.requestFocus()
+    }
+
+    /** Ctrl K M: the language the active file is colored and commented as. */
+    private fun languageModeDialog() {
+        val e = ed() ?: return
+        val ids = Highlighter.allIds()
+        AlertDialog.Builder(this).setTitle("Language mode of " + editor.displayName(editor.activePath()))
+            .setItems(ids.map { if (it == e.lang.id) "✓ $it" else "    $it" }.toTypedArray()) { _, w -> e.lang = Highlighter.lang(ids[w]); flashStatus("Language mode: " + ids[w]) }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    /** Ctrl K Ctrl T: Forge's color themes. */
+    private fun colorThemeDialog() {
+        val names = Ui.themeNames()
+        val cur = Ui.currentTheme(this)
+        AlertDialog.Builder(this).setTitle("Color theme")
+            .setItems(names.map { if (it == cur) "✓ $it" else "    $it" }.toTypedArray()) { _, w ->
+                if (names[w] != cur) { Ui.setTheme(this, names[w]); reloadWindow() }
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    /** Ctrl Shift B: the build tasks this folder has (scripts in package.json, a Makefile, Gradle, Cargo, Go, CMake,
+     *  a build script), run in a new terminal tab. */
+    private fun runBuildTask() {
+        Api.async("build-tasks", {
+            val out = ArrayList<Pair<String, String>>()
+            fun exists(p: String): Boolean = try { Api.get("/api/file", mapOf("path" to p)); true } catch (e: Exception) { false }
+            fun read(p: String): String = try { Api.get("/api/file", mapOf("path" to p)).optString("content") } catch (e: Exception) { "" }
+            val pkg = read("package.json")
+            if (pkg.isNotEmpty()) try { JSONObject(pkg).optJSONObject("scripts")?.keys()?.forEach { k -> out.add("npm: $k" to "npm run $k") } } catch (e: Exception) { }
+            val mk = read("Makefile")
+            if (mk.isNotEmpty()) { out.add("make" to "make"); Regex("^([A-Za-z0-9_.-]+):", RegexOption.MULTILINE).findAll(mk).map { it.groupValues[1] }.filter { !it.startsWith(".") }.distinct().take(15).forEach { out.add("make $it" to "make $it") } }
+            if (exists("gradlew")) { out.add("gradle: build" to "./gradlew build"); out.add("gradle: assembleDebug" to "./gradlew assembleDebug") }
+            if (exists("Cargo.toml")) { out.add("cargo build" to "cargo build"); out.add("cargo run" to "cargo run"); out.add("cargo test" to "cargo test") }
+            if (exists("go.mod")) { out.add("go build" to "go build ./..."); out.add("go test" to "go test ./...") }
+            if (exists("CMakeLists.txt")) out.add("cmake: configure and build" to "cmake -S . -B build && cmake --build build")
+            if (exists("build.sh")) out.add("./build.sh" to "bash ./build.sh")
+            if (exists("android/build.sh")) out.add("android/build.sh" to "bash android/build.sh")
+            if (exists("pyproject.toml")) out.add("python: build" to "python3 -m build")
+            out
+        }) { r, e ->
+            val tasks = r ?: emptyList()
+            if (tasks.isEmpty()) { flashStatus("No build task found in this folder" + (if (e != null) ": " + e.message else ".")); return@async }
+            AlertDialog.Builder(this).setTitle("Run a build task")
+                .setItems(tasks.map { it.first + "    " + it.second }.toTypedArray()) { _, w -> showTerminal(); terminal.runCommand(tasks[w].second, tasks[w].first) }
+                .setNegativeButton("Cancel", null).show()
+        }
+    }
+
+    /** Ctrl K Ctrl S: every key binding, searchable, with where it applies. */
+    private fun showKeyboardShortcuts() {
+        val all = keymap.filter { it.title.isNotEmpty() }
+        val box = Ui.column(this)
+        val search = Ui.input(this, "Type to search the keyboard shortcuts", mono = false)
+        val list = Ui.column(this)
+        fun where(w: Keymap.Where): String = when (w) { Keymap.Where.EDITOR -> "editor"; Keymap.Where.CHAT -> "chat input"; Keymap.Where.TERMINAL -> "terminal"; Keymap.Where.WINDOW -> "window"; Keymap.Where.ANYWHERE -> "everywhere" }
+        fun render() {
+            list.removeAllViews()
+            val q = search.text.toString().trim().lowercase()
+            for (b in all) {
+                val keys = Keymap.pretty(b.keys)
+                if (q.isNotEmpty() && !b.title.lowercase().contains(q) && !keys.lowercase().contains(q)) continue
+                val k = Ui.text(this, keys, 12f, Ui.accent2, mono = true)
+                val t = Ui.text(this, b.title, 12.5f, Ui.fg)
+                val w = Ui.text(this, where(b.where), 11f, Ui.fg3)
+                val row = Ui.row(this, t, k, w)
+                t.layoutParams = Ui.lp(0, Ui.wrap, 1f)
+                k.layoutParams = Ui.lp(Ui.dp(this, 200), Ui.wrap)
+                w.layoutParams = Ui.lp(Ui.dp(this, 90), Ui.wrap)
+                row.setPadding(Ui.dp(this, 4), Ui.dp(this, 5), Ui.dp(this, 4), Ui.dp(this, 5))
+                list.addView(row, Ui.lp(Ui.match, Ui.wrap))
+            }
+        }
+        search.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, n: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, n: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) { render() }
+        })
+        render()
+        box.addView(search, Ui.lp(Ui.match, Ui.wrap))
+        box.addView(Ui.scroll(this, list), Ui.lp(Ui.match, Ui.dp(this, 480)))
+        box.setPadding(Ui.dp(this, 16), Ui.dp(this, 8), Ui.dp(this, 16), 0)
+        AlertDialog.Builder(this).setTitle("Keyboard shortcuts (" + all.size + ")").setView(box).setPositiveButton("Close", null).show()
+        search.requestFocus()
+    }
+
     // ---------------------------------------------------------------- images and voice
     fun pickImage() {
         val i = Intent(Intent.ACTION_GET_CONTENT); i.type = "image/*"; i.addCategory(Intent.CATEGORY_OPENABLE)
@@ -1111,6 +1701,7 @@ class MainActivity : Activity() {
      * editor, the terminal input and the chat prompt alike. Everything else passes through.
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN && loaded && handleBinding(event)) return true
         if (event.action == KeyEvent.ACTION_DOWN && loaded) {
             val inTerminal = currentFocus is TerminalView
             if (event.isCtrlPressed && !event.isAltPressed && handleShortcut(event, inTerminal)) return true
@@ -1135,6 +1726,7 @@ class MainActivity : Activity() {
             }
             KeyEvent.KEYCODE_K -> if (inTerminal && !shift) { terminal.openAi(); return true }
             KeyEvent.KEYCODE_N -> if (shift) { newWindow(); return true }
+            KeyEvent.KEYCODE_Q -> if (!shift) { quitForge(); return true }
             KeyEvent.KEYCODE_COMMA -> { openSettings(); return true }
             KeyEvent.KEYCODE_I -> if (!shift) { toggleChat(); if (chatShown) chat.focusPrompt(); return true }
             KeyEvent.KEYCODE_F -> if (shift) { showSearch(editor.selectionText().takeIf { !it.contains('\n') } ?: ""); return true }
@@ -1161,7 +1753,7 @@ class MainActivity : Activity() {
             KeyEvent.KEYCODE_Y -> if (shift) { showDebugConsole(); return true }
             // Ctrl Shift Space: voice input, except in the code editor, where it shows signature help (as in Cursor).
             KeyEvent.KEYCODE_SPACE -> if (shift && currentFocus !is CodeEditor.CodeEditText) { chat.dictateIntoPrompt(); return true }
-            KeyEvent.KEYCODE_R -> if (!shift) { if (!loaded) connect() else { editor.refresh(); refreshStatus() }; return true }
+            KeyEvent.KEYCODE_R -> if (!shift) { if (!loaded) connect() else reloadWindow(); return true }
             KeyEvent.KEYCODE_F5 -> return debugPanel.handleKey(event)
         }
         return false
@@ -1198,5 +1790,84 @@ class MainActivity : Activity() {
         Api.main.removeCallbacks(probeTask); Api.main.removeCallbacks(statusTask); Api.main.removeCallbacks(indexTask)
         voice?.stop()
     }
-    override fun onDestroy() { super.onDestroy(); terminal.close(); logcat.close(); chat.stop() }
+    override fun onDestroy() {
+        super.onDestroy()
+        // The repeating tasks belong to this window; a reloaded window starts its own.
+        for (r in listOf(flashTask, probeTask, statusTask, indexTask)) Api.main.removeCallbacks(r)
+        terminal.close(); logcat.close(); chat.stop()
+    }
+
+    /**
+     * Developer: Reload Window (Ctrl R, as in Cursor): the window is built again from scratch in the same folder, with
+     * its open files, chat tabs and drafts restored, and it reconnects to the server, the shells and the GPU engine
+     * status. Unsaved files and a running chat reply are asked about first, because a reload would lose them.
+     */
+    fun reloadWindow() {
+        val dirty = editor.dirtyCount()
+        val busy = chat.busyCount()
+        if (dirty == 0 && busy == 0) { doReload(); return }
+        val why = ArrayList<String>()
+        if (dirty > 0) why.add(if (dirty == 1) "One file has unsaved changes." else "$dirty files have unsaved changes.")
+        if (busy > 0) why.add(if (busy == 1) "A chat reply is still running, and reloading stops it." else "$busy chat replies are still running, and reloading stops them.")
+        val b = AlertDialog.Builder(this).setTitle("Reload the window?").setMessage(why.joinToString(" "))
+            .setNegativeButton("Cancel", null)
+        if (dirty > 0) {
+            b.setPositiveButton("Save and reload") { _, _ -> editor.saveAll { doReload() } }
+            b.setNeutralButton("Reload without saving") { _, _ -> doReload() }
+        } else b.setPositiveButton("Reload") { _, _ -> doReload() }
+        b.show()
+    }
+
+    /**
+     * Quit Forge (Ctrl Q, the power button in the top bar): everything Forge runs stops. On the Googlebook that is the
+     * GPU engine, the vision model, the engine notification and every Forge window, and last the app's own process.
+     * In the Linux VM the server stops chat replies, virtual devices, language servers, kernels, builds and shells,
+     * Ollama and the Forge Android guard, and then itself (POST /api/quit). Opening Forge starts it all again.
+     */
+    fun quitForge() {
+        val dirty = editor.dirtyCount()
+        val busy = chat.busyCount()
+        val parts = ArrayList<String>()
+        parts.add("This stops everything Forge runs: the GPU engine, the vision model, chat replies, terminals, language servers, virtual devices, Ollama and the Forge Android guard. Opening Forge starts them again.")
+        if (dirty > 0) parts.add(if (dirty == 1) "One file has unsaved changes." else "$dirty files have unsaved changes.")
+        if (busy > 0) parts.add(if (busy == 1) "A chat reply is still running, and it will be stopped." else "$busy chat replies are still running, and they will be stopped.")
+        val b = AlertDialog.Builder(this).setTitle("Quit Forge?").setMessage(parts.joinToString("\n\n"))
+            .setNegativeButton("Cancel", null)
+        if (dirty > 0) {
+            b.setPositiveButton("Save and quit") { _, _ -> editor.saveAll { doQuit() } }
+            b.setNeutralButton("Quit without saving") { _, _ -> doQuit() }
+        } else b.setPositiveButton("Quit") { _, _ -> doQuit() }
+        b.show()
+    }
+
+    private fun doQuit() {
+        val wait = AlertDialog.Builder(this).setTitle("Quitting Forge").setMessage("Stopping everything Forge runs. This takes a few seconds, longer when virtual devices are running.")
+            .setCancelable(false).show()
+        chat.stopAllRuns()
+        val app = applicationContext
+        Api.async("quit", {
+            // The VM side first, while the app can still report what happened; then this side.
+            val r = try { Api.post("/api/quit", JSONObject(), 240000) } catch (e: Exception) { JSONObject().put("error", e.message ?: "no answer") }
+            try { VisionControl.stop("Forge quit") } catch (e: Exception) { }
+            try { EngineService.stopNow("Forge quit") } catch (e: Exception) { }
+            r
+        }) { r, _ ->
+            try { wait.dismiss() } catch (e: Exception) { }
+            val err = r?.optString("error").orEmpty()
+            Log.i(TAG, "quit: " + (r?.optJSONArray("steps")?.toString() ?: err))
+            if (err.isNotEmpty()) Ui.toast(app, "Forge quit. The Linux VM did not answer ($err), so its part may still be running.")
+            try { app.stopService(Intent(app, EngineService::class.java)) } catch (e: Exception) { }
+            try { (getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager).cancelAll() } catch (e: Exception) { }
+            try { for (t in (getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).appTasks) t.finishAndRemoveTask() } catch (e: Exception) { }
+            // Nothing of Forge stays behind on the Googlebook either: the app's own process ends.
+            Api.main.postDelayed({ android.os.Process.killProcess(android.os.Process.myPid()) }, 700)
+        }
+    }
+
+    private fun doReload() {
+        chat.stopAllRuns()
+        intent?.putExtra("path", myFolder)
+        intent?.removeExtra("snapshot"); intent?.removeExtra("snapshot_only")
+        recreate()
+    }
 }

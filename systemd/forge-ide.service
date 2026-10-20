@@ -1,6 +1,9 @@
 [Unit]
 Description=Forge IDE (local Cursor-style AI coding IDE for Ollama)
 After=network.target
+# Started by forge-ide.socket when the Forge app connects; Quit Forge stops it and everything it started.
+Requires=forge-ide.socket
+After=forge-ide.socket
 
 [Service]
 Type=simple
@@ -12,5 +15,3 @@ Environment=PYTHONUNBUFFERED=1
 # Never let a runaway run eat the machine: 2 GB cap for the IDE server itself (the model lives in Ollama).
 MemoryMax=2G
 
-[Install]
-WantedBy=default.target

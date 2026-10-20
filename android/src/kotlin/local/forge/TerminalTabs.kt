@@ -26,7 +26,9 @@ class TerminalTabs(private val ctx: Context, private val host: MainActivity) {
     val view: LinearLayout = LinearLayout(ctx)
     private val tabRow = LinearLayout(ctx)
     private val state = Ui.text(ctx, "", 10.5f, Ui.fg3, bold = true)
-    private val content = FrameLayout(ctx)
+    /** The shells side by side: the shown shell and, after Split (Ctrl Shift 5), a second one next to it. */
+    private val content = LinearLayout(ctx)
+    private var splitWith: TerminalPanel? = null
     private val panels = ArrayList<TerminalPanel>()
     /** Declared before init: init opens the first shell, which reads it. */
     private var fontSp = 12.5f
@@ -83,7 +85,7 @@ class TerminalTabs(private val ctx: Context, private val host: MainActivity) {
         aiInput.setOnKeyListener { _, code, ev ->
             if (ev.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
             when (code) {
-                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> { runAi(); true }
+                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> { runAi(run = ev.isCtrlPressed); true }
                 KeyEvent.KEYCODE_ESCAPE -> { closeAi(); true }
                 else -> false
             }
@@ -106,7 +108,7 @@ class TerminalTabs(private val ctx: Context, private val host: MainActivity) {
         p.setFontSize(fontSp)
         panels.add(p)
         if (title.isNotEmpty()) titles[p] = title
-        content.addView(p.view, FrameLayout.LayoutParams(Ui.match, Ui.match))
+        content.addView(p.view, Ui.lp(0, Ui.match, 1f))
         activate(p)
         if (online) { p.connect(); p.focusInput() }
         return p
@@ -129,7 +131,8 @@ class TerminalTabs(private val ctx: Context, private val host: MainActivity) {
 
     private fun activate(p: TerminalPanel) {
         active = p
-        for (q in panels) q.view.visibility = if (q === p) View.VISIBLE else View.GONE
+        if (splitWith === p) splitWith = null
+        for (q in panels) q.view.visibility = if (q === p || q === splitWith) View.VISIBLE else View.GONE
         renderTabs()
         showState()
     }
@@ -155,9 +158,28 @@ class TerminalTabs(private val ctx: Context, private val host: MainActivity) {
         }
     }
 
+    /** Ctrl Shift 5: a new shell next to the shown one; again, the two show one at a time. */
+    fun split() {
+        val keep = active ?: return
+        if (splitWith != null) { splitWith = null; activate(keep); return }
+        val p = addTerminal()
+        splitWith = keep
+        activate(p)
+    }
+
+    /** Ctrl Page Up and Down in the terminal: the previous or next shell. */
+    fun step(dir: Int) {
+        val p = active ?: return
+        if (panels.size < 2) return
+        val i = panels.indexOf(p)
+        val n = panels[((i + dir) % panels.size + panels.size) % panels.size]
+        activate(n); n.focusInput()
+    }
+
     /** Ends the shown shell on the server; the last shell is replaced by a fresh one instead of leaving nothing. */
     fun killActive() {
         val p = active ?: return
+        if (splitWith === p) splitWith = null
         p.kill()
         if (panels.size == 1) { if (online) p.connect(); return }
         panels.remove(p)
@@ -200,7 +222,8 @@ class TerminalTabs(private val ctx: Context, private val host: MainActivity) {
         active?.focusInput()
     }
 
-    private fun runAi() {
+    /** [run]: Ctrl Enter runs the command as soon as it is written (Cursor's "run generated command"). */
+    private fun runAi(run: Boolean = false) {
         val instruction = aiInput.text.toString().trim()
         if (instruction.isEmpty() || aiBusy) return
         aiBusy = true
@@ -215,6 +238,7 @@ class TerminalTabs(private val ctx: Context, private val host: MainActivity) {
             val cmd = r.optString("command").trim()
             if (cmd.isEmpty()) { aiStatus.setTextColor(Ui.red); aiStatus.text = "The model returned no command."; return@async }
             val dangerous = r.optBoolean("dangerous", false)
+            if (run && !dangerous) { active?.pasteText(cmd + "\n"); closeAi(); return@async }
             active?.pasteText(cmd)
             aiStatus.setTextColor(if (dangerous) Ui.yellow else Ui.green)
             aiStatus.text = if (dangerous) "This command looks destructive. Read it before you press Enter." else "Typed into the terminal. Press Enter there to run it."

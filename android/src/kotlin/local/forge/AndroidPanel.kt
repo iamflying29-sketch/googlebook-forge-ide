@@ -82,7 +82,7 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
     private var googleStatusAt = 0L
     private var googleModels: JSONObject? = null
 
-    private val kindNames = mapOf("googlebook" to "Googlebook", "virtual" to "Virtual device", "waydroid" to "Waydroid", "phone" to "Phone",
+    private val kindNames = mapOf("googlebook" to "Googlebook", "virtual" to "Virtual device", "phone" to "Phone",
         "tablet" to "Tablet", "foldable" to "Foldable", "watch" to "Watch", "tv" to "TV")
 
     init {

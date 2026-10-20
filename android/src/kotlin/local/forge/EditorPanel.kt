@@ -210,7 +210,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         treeList.setOnItemClickListener { _, _, pos, _ ->
             val e = visible.getOrNull(pos) ?: return@setOnItemClickListener
             if (e.placeholder) return@setOnItemClickListener
-            if (e.dir) { selectedPath = e.path; toggle(e) } else openFile(e.path)
+            if (e.dir) { selectedPath = e.path; toggle(e) } else openFilePreview(e.path)
         }
         treeList.setOnItemLongClickListener { _, v, pos, _ ->
             val e = visible.getOrNull(pos) ?: return@setOnItemLongClickListener false
@@ -717,6 +717,19 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         if (src != null) open(src.path, g, activate = true) { } else renderTabs(groups[0])
     }
 
+    /** Shift Alt 0: the two groups side by side or one above the other. */
+    fun toggleGroupLayout() {
+        if (groups.size < 2) { host.flashStatus("Split the editor first (Ctrl \\)."); return }
+        val vertical = groupsRow.orientation == LinearLayout.HORIZONTAL
+        groupsRow.removeAllViews()
+        groupsRow.orientation = if (vertical) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+        val sp = Chrome.splitter(ctx, vertical = !vertical, onDrag = { d -> resizeGroups(d) })
+        groupSplitter = sp
+        groupsRow.addView(groups[0].view, if (vertical) Ui.lp(Ui.match, 0, 1f) else Ui.lp(0, Ui.match, 1f))
+        groupsRow.addView(sp)
+        groupsRow.addView(groups[1].view, if (vertical) Ui.lp(Ui.match, 0, 1f) else Ui.lp(0, Ui.match, 1f))
+    }
+
     fun openToSide(path: String) {
         if (groups.size < 2) {
             val g = Group()
@@ -735,9 +748,10 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         if (groups.size < 2) return
         val a = groups[0].view.layoutParams as LinearLayout.LayoutParams
         val b = groups[1].view.layoutParams as LinearLayout.LayoutParams
-        val total = groups[0].view.width + groups[1].view.width
+        val stacked = groupsRow.orientation == LinearLayout.VERTICAL
+        val total = if (stacked) groups[0].view.height + groups[1].view.height else groups[0].view.width + groups[1].view.width
         if (total <= 0) return
-        val wa = (groups[0].view.width + delta).coerceIn(dp(200), total - dp(200))
+        val wa = ((if (stacked) groups[0].view.height else groups[0].view.width) + delta).coerceIn(dp(120), total - dp(120))
         a.weight = wa.toFloat() / total; b.weight = 1f - a.weight
         groups[0].view.layoutParams = a; groups[1].view.layoutParams = b
     }
@@ -802,6 +816,254 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         menu.show()
     }
 
+
+    // ---------------------------------------------------------------- Cursor's editor commands: groups, tabs and files
+    /** Paths of closed tabs, newest last, for Ctrl Shift T. */
+    private val closedPaths = ArrayList<String>()
+    private var untitledCounter = 0
+    /** Tabs in the order they were last active, newest last (Ctrl Tab goes back through them). */
+    private val mru = ArrayList<Tab>()
+    private var mruStep = 0
+    private var mruTime = 0L
+
+    fun isUntitled(path: String): Boolean = path.startsWith("untitled:")
+    fun displayName(path: String): String = if (isUntitled(path)) "Untitled-" + path.removePrefix("untitled:") else path.substringAfterLast('/')
+
+    fun groupCount(): Int = groups.size
+
+    /** Ctrl 1 and Ctrl 2: the first or second editor group; the second is created when there is none. */
+    fun focusGroupAt(i: Int) {
+        if (i <= 0) { focusGroup(groups[0]); groups[0].active?.focus(); return }
+        if (groups.size < 2) { toggleSplit(); return }
+        focusGroup(groups[1]); groups[1].active?.focus()
+    }
+
+    /** Ctrl K Ctrl Left and Right: the group to the left or right. */
+    fun focusNextGroup(dir: Int) {
+        if (groups.size < 2) return
+        val i = groups.indexOf(current)
+        focusGroupAt(((i + dir) % groups.size + groups.size) % groups.size)
+    }
+
+    /** Ctrl Shift Page Up and Down: the active tab moves left or right in its group. */
+    fun moveTab(dir: Int) {
+        val g = current; val t = g.active ?: return
+        val i = g.tabs.indexOf(t); val j = (i + dir).coerceIn(0, g.tabs.size - 1)
+        if (i == j) return
+        g.tabs.removeAt(i); g.tabs.add(j, t); renderTabs(g)
+    }
+
+    /** Ctrl Alt Right and Left: the active tab moves to the next or previous group (a new one on the right if needed). */
+    fun moveTabToGroup(dir: Int) {
+        val t = current.active ?: return
+        if (t is NotebookTab && t.dirty) { Ui.toast(ctx, "Save the notebook first."); return }
+        val i = groups.indexOf(current) + dir
+        if (i < 0) return
+        if (i >= groups.size) { if (groups.size >= 2) return; openToSide(t.path); closeNow(t); return }
+        val target = groups[i]
+        open(t.path, target, activate = true) { }
+        closeNow(t)
+    }
+
+    /** Ctrl K Left and Right: the two groups change places. */
+    fun swapGroups() {
+        if (groups.size < 2) return
+        val a = groups[0]; val b = groups[1]
+        groupsRow.removeAllViews()
+        groups.clear(); groups.add(b); groups.add(a)
+        groupsRow.addView(b.view, Ui.lp(0, Ui.match, 1f))
+        groupSplitter?.let { groupsRow.addView(it) }
+        groupsRow.addView(a.view, Ui.lp(0, Ui.match, 1f))
+        for (x in groups) renderTabs(x)
+    }
+
+    /** Ctrl K W: closes the tabs of the focused group (and the group itself when there are two). */
+    fun closeGroupTabs() { if (groups.size > 1) closeGroup(current) else for (x in current.tabs.toList()) close(x) }
+    /** Ctrl K Ctrl W: closes every tab of every group. */
+    fun closeAllTabs() { for (g in groups.toList()) for (x in g.tabs.toList()) close(x) }
+    /** Ctrl K U: closes the saved tabs of the focused group. */
+    fun closeSavedTabs() { for (x in current.tabs.toList()) if (!x.dirty) closeNow(x) }
+    fun closeOtherTabs() { val t = current.active ?: return; for (x in current.tabs.toList()) if (x !== t) close(x) }
+    fun closeTabsToTheRight() { val t = current.active ?: return; val i = current.tabs.indexOf(t); for (x in current.tabs.toList().drop(i + 1)) close(x) }
+    fun hasOpenTabs(): Boolean = groups.any { it.tabs.isNotEmpty() }
+
+    /** Ctrl Shift T: opens the tab closed last again. */
+    fun reopenClosed() {
+        val p = closedPaths.removeLastOrNull() ?: run { host.flashStatus("No closed tab to open again."); return }
+        openFile(p)
+    }
+
+    /** Alt 1 to 9: the tab at that place in the focused group (Alt 0 is the last one). */
+    fun openTabAt(n: Int) {
+        val tabs = current.tabs
+        if (tabs.isEmpty()) return
+        val t = if (n <= 0) tabs.last() else tabs.getOrNull(n - 1) ?: return
+        activate(t)
+    }
+
+    /** Ctrl Tab and Ctrl Shift Tab: the tabs in the order they were last used, like Cursor's editor history. */
+    fun cycleRecent(dir: Int) {
+        val now = System.currentTimeMillis()
+        val live = mru.filter { x -> groups.any { g -> x in g.tabs } }
+        if (live.size < 2) { cycleTab(dir); return }
+        mruStep = if (now - mruTime < 1500) mruStep + dir else dir
+        mruTime = now
+        val order = live.reversed()
+        val idx = ((mruStep % order.size) + order.size) % order.size
+        val t = order[if (idx == 0 && dir > 0) 1 else idx]
+        holdMru = true
+        try { activate(t) } finally { holdMru = false }
+    }
+    private var holdMru = false
+
+    private fun noteActive(t: Tab) {
+        if (holdMru) return
+        mru.remove(t); mru.add(t)
+        if (mru.size > 60) mru.removeAt(0)
+    }
+
+    /** Ctrl K P: the active file's full path; Ctrl K Ctrl Shift C: its path inside the folder. */
+    fun copyActivePath(relative: Boolean) {
+        val p = activePath()
+        if (p.isEmpty() || isUntitled(p)) { Ui.toast(ctx, "Open a saved file first."); return }
+        val abs = if (p.startsWith("/")) p else Api.folder.trimEnd('/') + "/" + p
+        val out = if (relative) abs.removePrefix(Api.folder.trimEnd('/') + "/") else abs
+        host.copyToClipboard(out)
+        host.flashStatus("Copied $out")
+    }
+
+    /** Ctrl K R: shows the active file in the Explorer. */
+    fun revealActive() {
+        val p = activePath()
+        if (p.isEmpty() || isUntitled(p)) return
+        host.showExplorer()
+        revealInTree(p)
+    }
+
+    /** Ctrl N: a new Untitled file, saved under a name the first time it is saved. */
+    fun newUntitled() {
+        untitledCounter++
+        val path = "untitled:$untitledCounter"
+        val d = Doc(path)
+        docs[path] = d
+        val t = makeTextTab(current, d, "")
+        addTab(t, true)
+    }
+
+    /** Ctrl Shift S: saves the active file under a new name and continues in that file. */
+    fun saveAsActive() {
+        val t = current.active as? TextTab ?: run { Ui.toast(ctx, "Open a text file first."); return }
+        saveAsDoc(t.doc) { }
+    }
+
+    private fun saveAsDoc(d: Doc, done: () -> Unit) {
+        val old = d.path
+        val input = Ui.input(ctx, "Path in this folder, for example src/notes.txt", mono = true)
+        input.setText(if (isUntitled(old)) "" else old)
+        input.setSelection(input.text.length)
+        val dialog = AlertDialog.Builder(ctx).setTitle("Save as").setView(input)
+            .setPositiveButton("Save", null).setNegativeButton("Cancel", null).create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val target = input.text.toString().trim()
+                if (target.isEmpty()) return@setOnClickListener
+                val text = d.text()
+                Api.async("save-as", { Api.post("/api/file", JSONObject().put("path", target).put("content", text)) }) { r, e ->
+                    if (r == null) { Ui.toast(ctx, "Not saved: " + (e?.message ?: "")); return@async }
+                    dialog.dismiss()
+                    host.flashStatus("Saved $target")
+                    if (isUntitled(old)) {
+                        // The Untitled file becomes the saved one, in the same tab.
+                        docs.remove(old); d.path = target; docs[target] = d
+                        d.dirty = false; d.mtime = r.optDouble("mtime", 0.0)
+                        for (x in d.tabs) { x.renamed(target); x.editor.lang = Highlighter.langFor(target) }
+                        Lsp.open(target, text)
+                        for (g in groups) renderTabs(g)
+                        current.active?.let { onActiveChanged(it) }
+                    } else {
+                        // Save As of a saved file: its tab is replaced by the new file, and the old file stays as it is on disk.
+                        val tabsOf = d.tabs.toList()
+                        val g = tabsOf.firstOrNull()?.group ?: current
+                        d.dirty = false
+                        open(target, g, activate = true) { }
+                        for (x in tabsOf) closeNow(x)
+                    }
+                    refresh()
+                    done()
+                }
+            }
+        }
+        dialog.show()
+        input.requestFocus()
+    }
+
+    // ---------------------------------------------------------------- preview tabs (a single click opens a file for a look)
+    private val previewTabs = HashSet<Tab>()
+
+    /** A single click in the Explorer opens a preview tab (its name in italics) that the next preview replaces, as in
+     *  Cursor. Editing the file, a double click on the tab or Ctrl K Enter keeps it open. */
+    fun openFilePreview(path: String) {
+        if (!ForgeSettings.bool("preview_tabs", true)) { openFile(path); return }
+        val g = current
+        val existing = g.tabs.firstOrNull { it.path == path }
+        if (existing != null) { activate(existing); return }
+        val old = g.tabs.firstOrNull { it in previewTabs && !it.dirty }
+        open(path, g, activate = true) { t ->
+            if (old != null && old !== t) closeNow(old)
+            previewTabs.add(t); renderTabs(g)
+        }
+    }
+
+    fun keepOpen(t: Tab? = current.active) { if (t != null && previewTabs.remove(t)) renderTabs(t.group) }
+    fun isPreviewTab(t: Tab): Boolean = t in previewTabs
+
+    // ---------------------------------------------------------------- back and forward (Ctrl Alt minus, Ctrl Shift minus)
+    private class Spot(val path: String, val offset: Int)
+    private val backStack = ArrayList<Spot>()
+    private val forwardStack = ArrayList<Spot>()
+    private var lastSpot: Spot? = null
+    private var navigating = false
+    private var lastEdit: Spot? = null
+
+    /** Called when the cursor moves: a jump of more than 10 lines or to another file is a place to come back to. */
+    private fun notePosition(path: String, ed: CodeEditor) {
+        if (navigating) { lastSpot = Spot(path, ed.cursorOffset()); return }
+        val off = ed.cursorOffset()
+        val prev = lastSpot
+        if (prev != null && (prev.path != path || Math.abs(ed.logicalLineAt(off) - lineOfSpot(prev, ed)) > 10)) {
+            backStack.add(prev); if (backStack.size > 100) backStack.removeAt(0)
+            forwardStack.clear()
+        }
+        lastSpot = Spot(path, off)
+    }
+
+    private fun lineOfSpot(s: Spot, ed: CodeEditor): Int = if (s.path == ed.path) ed.logicalLineAt(s.offset.coerceIn(0, ed.text().length)) else -1000
+
+    fun goBack() = travel(backStack, forwardStack)
+    fun goForward() = travel(forwardStack, backStack)
+
+    private fun travel(from: ArrayList<Spot>, to: ArrayList<Spot>) {
+        val s = from.removeLastOrNull() ?: return
+        lastSpot?.let { to.add(it) }
+        goToSpot(s)
+    }
+
+    private fun goToSpot(s: Spot) {
+        navigating = true
+        open(s.path, current, activate = true) { t ->
+            if (t is TextTab) { val off = s.offset.coerceIn(0, t.editor.text().length); val (l, c) = t.editor.lineColOf(off); t.editor.goTo(l, c) }
+            Api.main.postDelayed({ navigating = false }, 300)
+        }
+    }
+
+    /** Ctrl K Ctrl Q: the place of the last edit. */
+    fun goToLastEdit() { val s = lastEdit ?: return; goToSpot(s) }
+
+    fun noteEdit(path: String, ed: CodeEditor) { lastEdit = Spot(path, ed.cursorOffset()) }
+
+    // ---------------------------------------------------------------- editor options for every open editor
+    fun forEachEditor(f: (CodeEditor) -> Unit) { for (d in docs.values) for (t in d.tabs) f(t.editor) }
+
     // ---------------------------------------------------------------- opening files
     /** Opens a file in the focused group (or brings its tab to the front); a line above 0 (1-based) moves the cursor there. */
     fun openFile(path: String, line: Int = 0) {
@@ -819,6 +1081,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         val existing = g.tabs.firstOrNull { it.path == path }
         if (existing != null) { if (activate) activate(existing); then(existing); return }
         when {
+            isUntitled(path) -> { val d = docs[path] ?: return; val t = makeTextTab(g, d, d.text()); addTab(t, activate); then(t) }
             PreviewPanel.isImage(path) -> { val t = ImageTab(g, path); addTab(t, activate); then(t) }
             path.endsWith(".ipynb", ignoreCase = true) -> { val t = NotebookTab(g, path); t.nb.open(path); addTab(t, activate); then(t) }
             else -> {
@@ -849,13 +1112,18 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         ed.setContent(text, doc.path)
         ed.history = doc.history
         doc.tabs.add(t)
-        ed.onChanged = { if (!doc.dirty) { doc.dirty = true; for (x in groups) renderTabs(x) }; scheduleReview(doc.path); scheduleSymbols(); scheduleGitMarks(doc.path) }
+        ed.onChanged = {
+            if (t in previewTabs) previewTabs.remove(t)
+            if (!doc.dirty) { doc.dirty = true; for (x in groups) renderTabs(x) }
+            noteEdit(doc.path, ed)
+            if (!isUntitled(doc.path)) { scheduleReview(doc.path); scheduleSymbols(); scheduleGitMarks(doc.path) }
+        }
         // Changes made in one editor of the file appear in its other editor (the split view).
         ed.changeHook = { start, removed, added -> for (o in doc.tabs) if (o !== t) o.editor.mirrorEdit(start, removed, added); if (doc.tabs.size > 1) scheduleReview(doc.path) }
         ed.focusHook = { if (current !== t.group) focusGroup(t.group); if (t.group.active === t) onActiveChanged(t) }
         ed.onReviewHunk = { i, keep -> reviewHunk(doc.path, ed, i, keep) }
         ed.onReviewAll = { keep -> reviewAll(doc.path, keep) }
-        scheduleGitMarks(doc.path, 300)
+        if (!isUntitled(doc.path)) scheduleGitMarks(doc.path, 300)
         ed.onTextChanged = { t.preview?.update(ed.text()) }
         applyEditorSettings(ed)
         t.smarts = EditorSmarts(ctx, host, this, ed)
@@ -883,6 +1151,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         }
         g.welcome?.visibility = View.GONE
         current = g
+        noteActive(t)
         for (x in groups) renderTabs(x)
         onActiveChanged(t)
         t.focus()
@@ -893,9 +1162,9 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     private fun onActiveChanged(t: Tab) {
         selectedPath = t.path
         treeAdapter.notifyDataSetChanged()
-        host.setWindowTitle(t.path.substringAfterLast('/'))
+        host.setWindowTitle(displayName(t.path))
         showCrumbs(t.group)
-        if (t is TextTab) { host.onEditorState(t.editor, t.path); scheduleSymbols(0) } else { host.onEditorState(null, t.path); symbols = emptyList(); symbolsFor = ""; showOutline() }
+        if (t is TextTab) { host.onEditorState(t.editor, t.path); notePosition(t.path, t.editor); if (!isUntitled(t.path)) scheduleSymbols(0) } else { host.onEditorState(null, t.path); symbols = emptyList(); symbolsFor = ""; showOutline() }
     }
 
     // ---------------------------------------------------------------- tabs
@@ -916,7 +1185,8 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         val g = t.group
         val isActive = t === g.active
         val focused = isActive && g === current
-        val name = Ui.text(ctx, t.path.substringAfterLast('/'), 12.5f, if (isActive) Ui.fg else Ui.fg3)
+        val name = Ui.text(ctx, displayName(t.path), 12.5f, if (isActive) Ui.fg else Ui.fg3)
+        if (t in previewTabs) name.setTypeface(name.typeface, android.graphics.Typeface.ITALIC)
         if (reviews.containsKey(t.path)) name.setTextColor(accent2)
         val icon = ImageView(ctx)
         icon.setImageDrawable(FileIcons.file(ctx, t.path.substringAfterLast('/')))
@@ -935,7 +1205,8 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         col.addView(line, Ui.lp(Ui.match, dp(2)))
         col.addView(inner, Ui.lp(Ui.wrap, 0, 1f))
         col.setBackgroundColor(if (isActive) Ui.bg else Ui.bg2)
-        col.setOnClickListener { activate(t) }
+        var lastClick = 0L
+        col.setOnClickListener { val now = System.currentTimeMillis(); if (now - lastClick < 400) keepOpen(t); lastClick = now; activate(t) }
         col.setOnLongClickListener { tabMenu(t, col); true }
         col.setOnTouchListener { v, ev ->
             if (ev.actionMasked == MotionEvent.ACTION_DOWN && (ev.buttonState and MotionEvent.BUTTON_TERTIARY) != 0) { close(t); true }
@@ -1019,6 +1290,8 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     private fun closeNow(t: Tab) {
         val g = t.group
         val idx = g.tabs.indexOf(t)
+        previewTabs.remove(t); mru.remove(t)
+        if (!isUntitled(t.path)) { closedPaths.remove(t.path); closedPaths.add(t.path); if (closedPaths.size > 50) closedPaths.removeAt(0) }
         disposeTab(t)
         g.tabs.remove(t)
         g.frame.removeView(t.content)
@@ -1064,6 +1337,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     private fun saveDoc(d: Doc, done: () -> Unit) {
+        if (isUntitled(d.path)) { saveAsDoc(d, done); return }
         val text = d.text()
         val path = d.path
         Api.async("save", { Api.post("/api/file", JSONObject().put("path", path).put("content", text)) }) { r, e ->
@@ -1261,6 +1535,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     fun cursorMoved(editor: CodeEditor) {
         val t = current.active as? TextTab ?: return
         if (t.editor !== editor) return
+        notePosition(t.path, editor)
         Api.main.removeCallbacks(crumbTask); Api.main.postDelayed(crumbTask, 200)
         host.onEditorState(editor, t.path)
     }

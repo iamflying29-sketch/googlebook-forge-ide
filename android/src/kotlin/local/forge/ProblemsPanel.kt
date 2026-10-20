@@ -143,6 +143,17 @@ class ProblemsPanel(private val ctx: Context, private val host: MainActivity) {
         onCounts?.invoke(errors, warnings)
     }
 
+    private var stepIndex = -1
+
+    /** F8 and Shift F8 when the file has no more problems: the next or previous one in this list. */
+    fun step(dir: Int) {
+        val ps = rows.filterIsInstance<Problem>()
+        if (ps.isEmpty()) { Ui.toast(ctx, "There are no problems."); return }
+        stepIndex = ((stepIndex + dir) % ps.size + ps.size) % ps.size
+        val p = ps[stepIndex]
+        host.openFileAt(p.path, p.line + 1, p.col)
+    }
+
     private fun fixAll() {
         val lines = allLines()
         if (lines.isEmpty()) { Ui.toast(ctx, "There are no problems to fix."); return }

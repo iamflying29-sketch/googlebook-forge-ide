@@ -81,6 +81,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "vision_extra_args": "-fa off",   # "--fit off" made the vision server fail to load its model (2026-10-19)
     "font_size": 13,
     "minimap": True,                     # the editor's minimap on the right of the code
+    "preview_tabs": True,                # a single click in the Explorer opens a preview tab, as in Cursor
     "theme": "forge-dark",
     "workspace": os.path.expanduser("~/projects"),
     "recent_workspaces": [],
@@ -537,11 +538,14 @@ class State:
         KV cache, compute buffers and margin (the same sum EngineService uses). Cached, locating the blob asks Ollama."""
         now = time.time()
         name = str(self.settings.get("gpu_model") or "forge-coder")
-        if now - self._need_mb_ts > 600 or name != self._need_mb_for:
-            self._need_mb_ts, self._need_mb_for = now, name
+        if (now - self._need_mb_ts > 600 or name != self._need_mb_for) and now - getattr(self, "_need_try_ts", 0.0) > 15:
+            self._need_try_ts = now   # a failed look-up is tried again after 15 seconds, not on every status poll
             try:
                 mf = self.gpu_model_file()
                 if mf and mf.get("size"):
+                    # Kept only when it worked: right after Quit Forge, Ollama is still starting, and a failed look-up
+                    # must not leave the 5.6 GB fallback in place for ten minutes (seen 2026-10-20).
+                    self._need_mb_ts, self._need_mb_for = now, name
                     self._need_mb = int(mf["size"]) // (1024 * 1024) + 1200
                     # The vision projector and its image encoder, when the engine loads one (EngineService adds the same).
                     pf = self.gpu_mmproj_file()
@@ -1839,6 +1843,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/unload":
             st.unload_model()
             return self._json(200, {"ok": True})
+        if path == "/api/quit":
+            # Quit Forge: everything Forge runs in the VM stops, and then the server itself.
+            from . import quit as forge_quit
+
+            def cancel_runs() -> int:
+                live = [r for r in list(st.runs.values()) if not r.done]
+                for r in live:
+                    r.cancel.set()
+                return len(live)
+            steps = forge_quit.stop_everything(cancel_runs, st.unload_model)
+            forge_quit.stop_server_soon()
+            return self._json(200, {"ok": True, "steps": steps})
         if path == "/api/prewarm":
             s = st.sessions.get(str(b.get("session_id")))
             if s:
@@ -2346,7 +2362,20 @@ def main(argv: Optional[list] = None) -> int:
         STATE.set_workspace(args.workspace)
     if not os.path.isdir(STATE.workspace.root):
         os.makedirs(STATE.workspace.root, exist_ok=True)
-    srv = Server((args.host, args.port), Handler)
+    # Started by forge-ide.socket, systemd hands over the listening socket (fd 3), so the server can stop completely
+    # (Quit Forge) and the next connection starts it again.
+    if os.environ.get("LISTEN_PID") == str(os.getpid()) and os.environ.get("LISTEN_FDS") == "1":
+        srv = Server((args.host, args.port), Handler, bind_and_activate=False)
+        srv.socket.close()
+        srv.socket = socket.fromfd(3, socket.AF_INET, socket.SOCK_STREAM)
+        os.close(3)
+        srv.server_address = srv.socket.getsockname()
+    else:
+        srv = Server((args.host, args.port), Handler)
+    # Ollama and the Forge Android guard are stopped by Quit Forge and come back with the server.
+    from . import quit as forge_quit
+    threading.Thread(target=lambda: [print("Forge:", m, flush=True) for m in forge_quit.start_companions()],
+                     name="companions", daemon=True).start()
     try:
         srv.allowed_hosts = {socket.gethostname().lower()} | set(_local_ips())
     except OSError:

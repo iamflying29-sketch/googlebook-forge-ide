@@ -27,16 +27,35 @@ import android.widget.TextView
  * after them (icons, icon buttons, chips, keyboard hints and state drawables).
  */
 object Ui {
-    val bg = Color.parseColor("#0f1117")
-    val bg2 = Color.parseColor("#141720")
-    val bg3 = Color.parseColor("#1b1f2a")
-    val bg4 = Color.parseColor("#222738")
-    val panel = Color.parseColor("#12151d")
-    val border = Color.parseColor("#262b38")
-    val border2 = Color.parseColor("#2f3548")
-    val fg = Color.parseColor("#d7dbe7")
-    val fg2 = Color.parseColor("#a7adbd")
-    val fg3 = Color.parseColor("#6b7489")
+    // The colors of the current theme (Ctrl K Ctrl T). They are set before a window builds its views.
+    var bg = Color.parseColor("#0f1117"); private set
+    var bg2 = Color.parseColor("#141720"); private set
+    var bg3 = Color.parseColor("#1b1f2a"); private set
+    var bg4 = Color.parseColor("#222738"); private set
+    var panel = Color.parseColor("#12151d"); private set
+    var border = Color.parseColor("#262b38"); private set
+    var border2 = Color.parseColor("#2f3548"); private set
+    var fg = Color.parseColor("#d7dbe7"); private set
+    var fg2 = Color.parseColor("#a7adbd"); private set
+    var fg3 = Color.parseColor("#6b7489"); private set
+
+    /** Forge's color themes, all dark: bg, bg2, bg3, bg4, panel, border, border2, fg, fg2, fg3. */
+    private val themes = linkedMapOf(
+        "Forge Dark" to listOf("#0f1117", "#141720", "#1b1f2a", "#222738", "#12151d", "#262b38", "#2f3548", "#d7dbe7", "#a7adbd", "#6b7489"),
+        "Forge Midnight" to listOf("#07080c", "#0c0e14", "#13161f", "#1a1e2a", "#0a0c11", "#1c2030", "#262b3d", "#d3d8e6", "#9ea5b8", "#5f6880"),
+        "Forge Dimmed" to listOf("#1e2229", "#23272f", "#2a2f38", "#323844", "#20242b", "#363c48", "#414857", "#d4d8e0", "#aab0bc", "#7c8494"),
+        "Forge High Contrast" to listOf("#000000", "#050505", "#101010", "#1a1a1a", "#030303", "#6b7489", "#9aa3b8", "#ffffff", "#e0e4ee", "#b4bccc"))
+
+    fun themeNames(): List<String> = themes.keys.toList()
+    fun currentTheme(c: Context): String = c.getSharedPreferences("forge-window", Context.MODE_PRIVATE).getString("theme", "Forge Dark") ?: "Forge Dark"
+    fun setTheme(c: Context, name: String) { c.getSharedPreferences("forge-window", Context.MODE_PRIVATE).edit().putString("theme", name).apply(); loadTheme(c) }
+
+    /** Applies the saved theme; every window calls this before it builds its views. */
+    fun loadTheme(c: Context) {
+        val t = themes[currentTheme(c)] ?: themes.values.first()
+        val v = t.map { Color.parseColor(it) }
+        bg = v[0]; bg2 = v[1]; bg3 = v[2]; bg4 = v[3]; panel = v[4]; border = v[5]; border2 = v[6]; fg = v[7]; fg2 = v[8]; fg3 = v[9]
+    }
     val accent = Color.parseColor("#ff8a3d")
     val accent2 = Color.parseColor("#ffb07a")
     val accentSoft = Color.parseColor("#24ff8a3d")
