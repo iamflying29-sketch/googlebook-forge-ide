@@ -34,6 +34,34 @@ import org.json.JSONObject
  */
 class MainActivity : Activity() {
     companion object {
+        /** Forge windows open now (test windows are not counted); closing the last one quits Forge. */
+        @Volatile var liveWindows = 0
+        /** Set once Forge is quitting, so the windows that close on the way do not start a second quit. */
+        @Volatile var quitting = false
+
+        /**
+         * Everything Forge runs stops: the VM side first (POST /api/quit), then the vision model and the GPU engine,
+         * the engine service, the notifications, every Forge window, and last the app's own process. Used by Quit
+         * Forge and by closing the last Forge window.
+         */
+        fun quitEverything(app: Context, done: ((JSONObject?) -> Unit)? = null) {
+            quitting = true
+            Api.async("quit", {
+                val r = try { Api.post("/api/quit", JSONObject(), 240000) } catch (e: Exception) { JSONObject().put("error", e.message ?: "no answer") }
+                try { VisionControl.stop("Forge quit") } catch (e: Exception) { }
+                try { EngineService.stopNow("Forge quit") } catch (e: Exception) { }
+                r
+            }) { r, _ ->
+                Log.i("Forge", "quit: " + (r?.optJSONArray("steps")?.toString() ?: r?.optString("error").orEmpty()))
+                try { done?.invoke(r) } catch (e: Exception) { }
+                try { app.stopService(Intent(app, EngineService::class.java)) } catch (e: Exception) { }
+                try { (app.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager).cancelAll() } catch (e: Exception) { }
+                try { for (t in (app.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).appTasks) t.finishAndRemoveTask() } catch (e: Exception) { }
+                // Nothing of Forge stays behind on the Googlebook either: the app's own process ends.
+                Api.main.postDelayed({ android.os.Process.killProcess(android.os.Process.myPid()) }, 700)
+            }
+        }
+
         const val VERSION = "4.0"
         private const val TAG = "Forge"
         private const val TERMINAL_PACKAGE = "com.android.virtualization.terminal"
@@ -106,6 +134,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Ui.loadTheme(this)
+        if (intent?.getBooleanExtra("snapshot_only", false) != true) { counted = true; liveWindows++ }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setBackgroundDrawable(ColorDrawable(Ui.bg))
         val p = intent?.getStringExtra("path")
@@ -282,6 +311,9 @@ class MainActivity : Activity() {
         posItem = statusBar.addItem(this, 0, "Go to line (Ctrl G)") { openPalette(":") }
         langItem = statusBar.addItem(this, 0, "The language of the file and its language server") { showLspMenu(it) }
         lspItem = langItem
+        encItem = statusBar.addItem(this, 0, "The file's encoding: click to reopen or save it with another one") { encodingMenu() }
+        eolItem = statusBar.addItem(this, 0, "The file's line ending: click to change it") { eolMenu() }
+        encItem.first.visibility = View.GONE; eolItem.first.visibility = View.GONE
         tabItem = statusBar.addItem(this, R.drawable.ic_sparkle, "AI Tab completions: click to turn them on or off (Alt \\ asks at once)") { toggleTabCompletions() }
         posItem.first.visibility = View.GONE; langItem.first.visibility = View.GONE
         ide.addView(statusBar.view)
@@ -536,6 +568,9 @@ class MainActivity : Activity() {
 
     /** The active editor changed or its cursor moved: the position and language items of the status bar follow. */
     fun onEditorState(ed: CodeEditor?, path: String) {
+        val codec = if (ed != null) editor.activeCodec() else null
+        if (codec != null) { encItem.second.text = codec.first; eolItem.second.text = codec.third; encItem.first.visibility = View.VISIBLE; eolItem.first.visibility = View.VISIBLE }
+        else { encItem.first.visibility = View.GONE; eolItem.first.visibility = View.GONE }
         if (ed == null) { posItem.first.visibility = View.GONE; langItem.first.visibility = if (path.isEmpty()) View.GONE else View.VISIBLE; langItem.second.text = if (path.isEmpty()) "" else Highlighter.languageId(path); return }
         val (line, col) = ed.cursorLineCol()
         val sel = Math.abs(ed.edit.selectionEnd - ed.edit.selectionStart)
@@ -545,6 +580,50 @@ class MainActivity : Activity() {
         val client = Lsp.serverFor(path)?.let { Lsp.status().firstOrNull { s -> s.startsWith(it.first + ":") } }
         langItem.second.text = lang + (if (client != null) "  ·  " + (if (client.contains("ready")) "LSP" else "LSP starting") else "")
         langItem.first.visibility = View.VISIBLE
+    }
+
+    // ---------------------------------------------------------------- encodings and line endings
+    private lateinit var encItem: Pair<LinearLayout, TextView>
+    private lateinit var eolItem: Pair<LinearLayout, TextView>
+    private var encodingList: List<Pair<String, String>> = emptyList()
+
+    private fun withEncodings(then: (List<Pair<String, String>>) -> Unit) {
+        if (encodingList.isNotEmpty()) { then(encodingList); return }
+        Api.async("encodings", { Api.get("/api/encodings") }) { r, e ->
+            val a = r?.optJSONArray("encodings")
+            if (a == null) { flashStatus("Could not list the encodings: " + (e?.message ?: "")); return@async }
+            encodingList = (0 until a.length()).mapNotNull { i -> a.optJSONObject(i)?.let { it.optString("id") to it.optString("name") } }
+            then(encodingList)
+        }
+    }
+
+    /** Change File Encoding: Reopen with Encoding or Save with Encoding, then the encoding, as in Cursor. */
+    fun encodingMenu() {
+        val c = editor.activeCodec() ?: run { flashStatus("Open a text file first."); return }
+        AlertDialog.Builder(this).setTitle("Change file encoding (now " + c.first + ")")
+            .setItems(arrayOf("Reopen with encoding", "Save with encoding")) { _, w -> pickEncoding(reopen = w == 0) }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun pickEncoding(reopen: Boolean) {
+        val c = editor.activeCodec() ?: return
+        withEncodings { list ->
+            AlertDialog.Builder(this).setTitle(if (reopen) "Reopen with encoding" else "Save with encoding")
+                .setItems(list.map { (if (it.first == c.second) "✓ " else "    ") + it.second }.toTypedArray()) { _, w ->
+                    val (id, name) = list[w]
+                    if (reopen) editor.reopenWithEncoding(id, name) else editor.saveWithEncoding(id, name)
+                }
+                .setNegativeButton("Cancel", null).show()
+        }
+    }
+
+    /** Change End of Line Sequence: LF or CRLF. */
+    fun eolMenu() {
+        val c = editor.activeCodec() ?: run { flashStatus("Open a text file first."); return }
+        val choices = arrayOf("LF", "CRLF")
+        AlertDialog.Builder(this).setTitle("Change end of line sequence")
+            .setItems(choices.map { (if (it == c.third) "✓ " else "    ") + it + (if (it == "LF") "  (Linux, macOS)" else "  (Windows)") }.toTypedArray()) { _, w -> editor.setEol(choices[w]) }
+            .setNegativeButton("Cancel", null).show()
     }
 
     /** git: the branch item on the left of the status bar (hidden outside a repository). */
@@ -756,6 +835,11 @@ class MainActivity : Activity() {
             C("Convert indentation to spaces") { e()?.indentationToSpaces() },
             C("Convert indentation to tabs") { e()?.indentationToTabs() },
             C("Toggle render whitespace") { editor.forEachEditor { it.renderWhitespace = !it.renderWhitespace } },
+            C("Change file encoding") { encodingMenu() },
+            C("Reopen with encoding") { pickEncoding(reopen = true) },
+            C("Save with encoding") { pickEncoding(reopen = false) },
+            C("Change end of line sequence") { eolMenu() },
+            C("File: Open Recent") { openRecentDialog() },
             C("Toggle the minimap") { ForgeSettings.set("minimap", !ForgeSettings.bool("minimap", true)) },
             C("Toggle preview tabs (a single click opens a file for a look)") { val on = !ForgeSettings.bool("preview_tabs", true); ForgeSettings.set("preview_tabs", on); flashStatus(if (on) "Preview tabs are on." else "Preview tabs are off.") },
             C("Close the other editors") { editor.closeOtherTabs() },
@@ -904,6 +988,7 @@ class MainActivity : Activity() {
             setWindowTitle("")
             editor.refresh(); chat.load(); terminal.connect()
             startZoom()
+            hotExitRestore()
             intent?.getStringExtra("open_file")?.let { f -> intent?.removeExtra("open_file"); Api.main.postDelayed({ editor.openFile(f) }, 600) }
             Api.main.removeCallbacks(statusTask); Api.main.post(statusTask)
             Api.main.removeCallbacks(indexTask); Api.main.post(indexTask)
@@ -983,7 +1068,7 @@ class MainActivity : Activity() {
             val hostMem = r.opt("host_mem_mb")
             val host = if (hostMem is Number && hostMem.toInt() >= 0) hostMem.toInt() else -1
             if (r.optString("engine") == "gpu") {
-                val need = g?.opt("need_mb")
+                val need = g?.opt("need_min_mb") ?: g?.opt("need_mb")
                 val waitingForMemory = health != "ok" && g != null && g.optString("note").isNotEmpty()
                 if (health == "ok") {
                     statusBar.setEngine("GPU engine: ready", Ui.fg2)
@@ -1008,6 +1093,10 @@ class MainActivity : Activity() {
                 val avail = mem.optInt("available_mb")
                 var text = "VM " + gb(avail) + " GB free"
                 if (host >= 0) text += "  ·  Googlebook " + gb(host) + " GB free"
+                // The graphics driver's pool: memory freed by Forge's GPU processes that the driver keeps for the next one.
+                // Android does not count it as free, but the engine takes from it first, so it is shown next to it.
+                val pool = try { GpuBudget.poolMb(this) } catch (e: Exception) { 0L }
+                if (pool >= 300) text += " (+ " + gb(pool.toInt()) + " GB in the graphics driver)"
                 if (mem.optInt("swap_used_mb") > 200) text += "  ·  swap " + mem.optInt("swap_used_mb") + " MB"
                 val color = if (avail < 700 || (host in 0..2499)) Ui.red else if (avail < 1500 || (host in 0..3499)) Ui.yellow else Ui.fg2
                 statusBar.setMemory(text, color)
@@ -1040,6 +1129,18 @@ class MainActivity : Activity() {
     }
 
     // ---------------------------------------------------------------- folders and windows
+    /** File: Open Recent: the folders opened lately, newest first; the one picked opens in this window. */
+    private fun openRecentDialog() {
+        Api.async("settings", { Api.get("/api/settings") }) { r, e ->
+            val a = r?.optJSONObject("user")?.optJSONArray("recent_workspaces")
+            val list = if (a == null) emptyList() else (0 until a.length()).map { a.optString(it) }.filter { it.isNotEmpty() }
+            if (list.isEmpty()) { flashStatus("No recent folders" + (if (e != null) ": " + e.message else ".")); return@async }
+            AlertDialog.Builder(this).setTitle("Open recent")
+                .setItems(list.map { it.trimEnd('/').substringAfterLast('/') + "    " + it }.toTypedArray()) { _, w -> goToFolder(list[w]) }
+                .setNegativeButton("Cancel", null).show()
+        }
+    }
+
     private fun openFolderDialog() {
         FolderDialog.show(this, onOpen = { path -> goToFolder(path) }, onNewWindow = { path -> newWindow(path) }, onAdd = { path -> addRoot(path) })
     }
@@ -1111,6 +1212,7 @@ class MainActivity : Activity() {
             b("Ctrl+Alt+.", A, "Pick the language model") { if (!chatShown) toggleChat(); chat.modelMenu() },
             b("Ctrl+Alt+/", A, "Model toggle (pick the model)") { if (!chatShown) toggleChat(); chat.modelMenu() },
             b("Ctrl+N", C, "New chat") { chat.newChatTab() },
+            b("Ctrl+R", C, "New chat (Cursor's Ctrl R in the chat input)") { chat.newChatTab() },
             b("Ctrl+T", C, "New chat tab") { chat.newChatTab() },
             b("Ctrl+[", C, "Previous chat") { chat.stepChat(-1) },
             b("Ctrl+]", C, "Next chat") { chat.stepChat(1) },
@@ -1165,13 +1267,11 @@ class MainActivity : Activity() {
 
             // ---- editor groups and tabs
             b("Ctrl+\\", W, "Split the editor") { editor.toggleSplit() },
-            b("Ctrl+1", W, "Focus the first editor group") { editor.focusGroupAt(0) },
-            b("Ctrl+2", W, "Focus the second editor group") { editor.focusGroupAt(1) },
-            b("Ctrl+3", W, "Focus the third editor group (Forge has two)") { editor.focusGroupAt(1); flashStatus("Forge splits the editor into two groups; this is the second one.") },
+            *listOf("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth").mapIndexed { i, nth -> b("Ctrl+" + (i + 1), W, "Focus the $nth editor group") { editor.focusGroupAt(i) } }.toTypedArray(),
             b("Ctrl+K Ctrl+Left", W, "Focus the editor group on the left") { editor.focusNextGroup(-1) },
             b("Ctrl+K Ctrl+Right", W, "Focus the editor group on the right") { editor.focusNextGroup(1) },
-            b("Ctrl+K Left", W, "Move the active editor group left") { editor.swapGroups() },
-            b("Ctrl+K Right", W, "Move the active editor group right") { editor.swapGroups() },
+            b("Ctrl+K Left", W, "Move the active editor group left") { editor.swapGroups(-1) },
+            b("Ctrl+K Right", W, "Move the active editor group right") { editor.swapGroups(1) },
             b("Ctrl+Alt+Right", W, "Move the editor into the next group") { editor.moveTabToGroup(1) },
             b("Ctrl+Alt+Left", W, "Move the editor into the previous group") { editor.moveTabToGroup(-1) },
             b("Ctrl+Shift+PageUp", W, "Move the editor left") { editor.moveTab(-1) },
@@ -1344,6 +1444,8 @@ class MainActivity : Activity() {
             flashStatus("The key combination (" + Keymap.pretty(prefix) + ", " + Keymap.pretty(stroke) + ") is not a command.")
             return true
         }
+        // In the chat input Ctrl R starts a new chat, as in Cursor, instead of beginning a chord.
+        if (stroke == "Ctrl+R" && inChat) { chat.newChatTab(); return true }
         if (stroke in Keymap.chordPrefixes && !inTerminal) {
             chordPrefix = stroke
             // Ctrl K alone opens the editor's inline edit (Cursor) and Ctrl R alone reloads the window, unless a second
@@ -1791,6 +1893,10 @@ class MainActivity : Activity() {
         voice?.stop()
     }
     override fun onDestroy() {
+        val wasCounted = counted
+        if (counted) { counted = false; liveWindows-- }
+        // The last Forge window was closed by its X (not reloaded, not a test window, not closing because Forge quits).
+        if (wasCounted && isFinishing && !isChangingConfigurations && !reloading && !quitting && liveWindows <= 0 && loaded) lastWindowClosed()
         super.onDestroy()
         // The repeating tasks belong to this window; a reloaded window starts its own.
         for (r in listOf(flashTask, probeTask, statusTask, indexTask)) Api.main.removeCallbacks(r)
@@ -1845,26 +1951,57 @@ class MainActivity : Activity() {
             .setCancelable(false).show()
         chat.stopAllRuns()
         val app = applicationContext
-        Api.async("quit", {
-            // The VM side first, while the app can still report what happened; then this side.
-            val r = try { Api.post("/api/quit", JSONObject(), 240000) } catch (e: Exception) { JSONObject().put("error", e.message ?: "no answer") }
-            try { VisionControl.stop("Forge quit") } catch (e: Exception) { }
-            try { EngineService.stopNow("Forge quit") } catch (e: Exception) { }
-            r
-        }) { r, _ ->
+        quitEverything(app) { r ->
             try { wait.dismiss() } catch (e: Exception) { }
             val err = r?.optString("error").orEmpty()
-            Log.i(TAG, "quit: " + (r?.optJSONArray("steps")?.toString() ?: err))
             if (err.isNotEmpty()) Ui.toast(app, "Forge quit. The Linux VM did not answer ($err), so its part may still be running.")
-            try { app.stopService(Intent(app, EngineService::class.java)) } catch (e: Exception) { }
-            try { (getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager).cancelAll() } catch (e: Exception) { }
-            try { for (t in (getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).appTasks) t.finishAndRemoveTask() } catch (e: Exception) { }
-            // Nothing of Forge stays behind on the Googlebook either: the app's own process ends.
-            Api.main.postDelayed({ android.os.Process.killProcess(android.os.Process.myPid()) }, 700)
         }
     }
 
+    // ---------------------------------------------------------------- closing the last window quits Forge (with hot exit)
+    private var counted = false
+    private var reloading = false
+
+    /** The window's X (or Ctrl Shift W, Alt F4) on the last Forge window: unsaved files are kept for the next start, as
+     *  Cursor's hot exit does, and Forge quits. */
+    private fun lastWindowClosed() {
+        hotExitSave()
+        try { chat.stopAllRuns() } catch (e: Exception) { }
+        quitEverything(applicationContext)
+    }
+
+    private fun hotExitFile() = java.io.File(filesDir, "hot-exit.json")
+
+    /** Unsaved files of this window's folder, written to the app's own storage (the Linux VM may be stopping). */
+    private fun hotExitSave() {
+        try {
+            val docs = editor.unsavedDocs()
+            if (docs.length() == 0) return
+            val f = hotExitFile()
+            val all = try { JSONObject(f.readText()) } catch (e: Exception) { JSONObject() }
+            all.put(myFolder.ifEmpty { Api.folder }, docs)
+            f.writeText(all.toString())
+            Log.i(TAG, "hot exit: kept " + docs.length() + " unsaved files")
+        } catch (e: Exception) { Log.w(TAG, "hot exit not saved", e) }
+    }
+
+    /** At start: the unsaved files kept at the last close come back, still unsaved. */
+    private fun hotExitRestore() {
+        try {
+            val f = hotExitFile()
+            if (!f.exists()) return
+            val all = JSONObject(f.readText())
+            val key = myFolder.ifEmpty { Api.folder }
+            val docs = all.optJSONArray(key) ?: return
+            all.remove(key)
+            f.writeText(all.toString())
+            editor.restoreUnsaved(docs)
+            flashStatus(if (docs.length() == 1) "Restored one unsaved file from the last session." else "Restored " + docs.length() + " unsaved files from the last session.")
+        } catch (e: Exception) { Log.w(TAG, "hot exit not restored", e) }
+    }
+
     private fun doReload() {
+        reloading = true
         chat.stopAllRuns()
         intent?.putExtra("path", myFolder)
         intent?.removeExtra("snapshot"); intent?.removeExtra("snapshot_only")

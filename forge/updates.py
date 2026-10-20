@@ -37,6 +37,7 @@ import shlex
 import subprocess
 import threading
 import time
+import uuid
 import urllib.request
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -441,7 +442,7 @@ def check_all(gate: Callable[[], Optional[str]]) -> dict:
 
 # ------------------------------------------------------------------ installing
 def _systemd(cmd: List[str], env: Optional[Dict[str, str]] = None) -> List[str]:
-    out = ["systemd-run", "--user", "--wait", "--quiet", "--pipe", "-p", "MemoryMax=1300M", "-p", "MemorySwapMax=0"]
+    out = ["systemd-run", "--user", "--wait", "--quiet", "--pipe", "--unit=forge-update-" + uuid.uuid4().hex[:8], "-p", "MemoryMax=1300M", "-p", "MemorySwapMax=0"]
     for k, v in (env or {}).items():
         out += ["--setenv", f"{k}={v}"]
     return out + cmd
@@ -503,7 +504,7 @@ def _plan(version: str, kind: str) -> Tuple[Optional[List[str]], Optional[Dict[s
             _add_version(newid, entry)
         target = newid
         if backend == "redroid":
-            return ["sudo", "-n", "systemd-run", "--scope", "--quiet", "-p", "MemoryMax=1G", "-p", "MemorySwapMax=0", "--", "env", f"CONTAINERS_CONF_OVERRIDE={CONF}",
+            return ["sudo", "-n", "systemd-run", "--scope", "--quiet", "--unit=forge-pull-" + uuid.uuid4().hex[:8], "-p", "MemoryMax=1G", "-p", "MemorySwapMax=0", "--", "env", f"CONTAINERS_CONF_OVERRIDE={CONF}",
                     "nice", "-n", "10", "podman", "pull", entry["image"]], None, target, lambda: _record(target, entry["image"]), ""
         if backend == "waydroid":
             w = entry["waydroid"]
@@ -520,7 +521,7 @@ def _plan(version: str, kind: str) -> Tuple[Optional[List[str]], Optional[Dict[s
         return None, None, version, None, "This version cannot be upgraded by Forge."
     # an update of the same version
     if backend == "redroid":
-        return ["sudo", "-n", "systemd-run", "--scope", "--quiet", "-p", "MemoryMax=1G", "-p", "MemorySwapMax=0", "--", "env", f"CONTAINERS_CONF_OVERRIDE={CONF}",
+        return ["sudo", "-n", "systemd-run", "--scope", "--quiet", "--unit=forge-pull-" + uuid.uuid4().hex[:8], "-p", "MemoryMax=1G", "-p", "MemorySwapMax=0", "--", "env", f"CONTAINERS_CONF_OVERRIDE={CONF}",
                 "nice", "-n", "10", "podman", "pull", info["image"]], None, version, lambda: _record(version, "pulled " + time.strftime("%Y-%m-%d")), ""
     if backend == "waydroid":
         w = WAYDROID.get(version) or info.get("waydroid")

@@ -141,7 +141,7 @@ object VisionControl {
             BufferedReader(InputStreamReader(p.inputStream)).use { r ->
                 while (true) {
                     val line = r.readLine() ?: break
-                    if (line.contains("server is listening") || line.contains("all slots are idle")) {
+                    if (line.contains("server is listening") || line.contains("listening on") || line.contains("model loaded") || line.contains("all slots are idle")) {
                         if (vstate != "running") { vstate = "running"; vdetail = "$vtier on the Intel GPU"; report() }
                     }
                     if (line.contains("error") || line.contains("ggml_vulkan: 0") || line.contains("listening")) log(line)

@@ -27,6 +27,7 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.PopupMenu
 import android.widget.TextView
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -87,6 +88,10 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     inner class Doc(var path: String) {
         var dirty = false
         var mtime = 0.0
+        /** The file's encoding (Forge's id, see /api/encodings) and line ending, kept when it is saved. */
+        var encoding = "utf8"
+        var encodingName = "UTF-8"
+        var eol = "LF"
         val history = CodeEditor.History()
         val tabs = ArrayList<TextTab>()
         fun text(): String = tabs.firstOrNull()?.editor?.text() ?: ""
@@ -168,7 +173,6 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     private val groups = ArrayList<Group>()
     private val groupsRow = LinearLayout(ctx)
     private var current: Group
-    private var groupSplitter: View? = null
 
     // ---------------------------------------------------------------- git (Explorer colors, gutter bars, branch)
     private var gitRepo = false
@@ -256,7 +260,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         groupsRow.orientation = LinearLayout.HORIZONTAL
         current = Group()
         groups.add(current)
-        groupsRow.addView(current.view, Ui.lp(0, Ui.match, 1f))
+        layoutGroups()
         view.addView(groupsRow, Ui.lp(0, Ui.match, 1f))
         renderTabs(current)
         showOutline()
@@ -702,58 +706,75 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         g.active?.let { onActiveChanged(it) }
     }
 
-    /** Ctrl backslash: opens the active file in a second group on the right, or closes the second group. */
-    fun toggleSplit() {
-        if (groups.size > 1) { closeGroup(groups[1]); return }
-        val src = current.active
-        val g = Group()
-        groups.add(g)
-        val sp = Chrome.splitter(ctx, vertical = true, onDrag = { d -> resizeGroups(d) })
-        groupSplitter = sp
-        groupsRow.addView(sp)
-        groupsRow.addView(g.view, Ui.lp(0, Ui.match, 1f))
-        current = g
-        renderTabs(g)
-        if (src != null) open(src.path, g, activate = true) { } else renderTabs(groups[0])
+    /** Up to eight editor groups, side by side or stacked (Shift Alt 0), like Cursor's. */
+    private val MAX_GROUPS = 8
+    private var stacked = false
+
+    /** Lays the groups out again with a splitter between every two neighbours. */
+    private fun layoutGroups() {
+        groupsRow.removeAllViews()
+        groupsRow.orientation = if (stacked) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+        for ((i, g) in groups.withIndex()) {
+            if (i > 0) {
+                val left = i - 1
+                groupsRow.addView(Chrome.splitter(ctx, vertical = !stacked, onDrag = { d -> resizeGroups(left, d) }))
+            }
+            (g.view.parent as? ViewGroup)?.removeView(g.view)
+            groupsRow.addView(g.view, if (stacked) Ui.lp(Ui.match, 0, 1f) else Ui.lp(0, Ui.match, 1f))
+        }
     }
 
-    /** Shift Alt 0: the two groups side by side or one above the other. */
+    /** A new, empty group right after [after] (or at the end). */
+    private fun addGroup(after: Group? = null): Group? {
+        if (groups.size >= MAX_GROUPS) { host.flashStatus("Forge has at most $MAX_GROUPS editor groups."); return null }
+        val g = Group()
+        val at = if (after == null) groups.size else groups.indexOf(after) + 1
+        groups.add(at.coerceIn(0, groups.size), g)
+        for (x in groups) (x.view.layoutParams as? LinearLayout.LayoutParams)?.weight = 1f
+        layoutGroups()
+        renderTabs(g)
+        return g
+    }
+
+    /** Ctrl backslash: the active file opens again in a new group to the right of the focused one (Split Editor). */
+    fun toggleSplit() {
+        val src = current.active
+        val g = addGroup(current) ?: return
+        current = g
+        if (src != null) open(src.path, g, activate = true) { t -> if (t is TextTab && src is TextTab) { val (l, c) = src.editor.lineColOf(src.editor.cursorOffset()); t.editor.goTo(l, c) } } else for (x in groups) renderTabs(x)
+    }
+
+    /** Shift Alt 0: the groups side by side or one above the other. */
     fun toggleGroupLayout() {
         if (groups.size < 2) { host.flashStatus("Split the editor first (Ctrl \\)."); return }
-        val vertical = groupsRow.orientation == LinearLayout.HORIZONTAL
-        groupsRow.removeAllViews()
-        groupsRow.orientation = if (vertical) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
-        val sp = Chrome.splitter(ctx, vertical = !vertical, onDrag = { d -> resizeGroups(d) })
-        groupSplitter = sp
-        groupsRow.addView(groups[0].view, if (vertical) Ui.lp(Ui.match, 0, 1f) else Ui.lp(0, Ui.match, 1f))
-        groupsRow.addView(sp)
-        groupsRow.addView(groups[1].view, if (vertical) Ui.lp(Ui.match, 0, 1f) else Ui.lp(0, Ui.match, 1f))
+        stacked = !stacked
+        for (x in groups) (x.view.layoutParams as? LinearLayout.LayoutParams)?.weight = 1f
+        layoutGroups()
     }
 
+    /** Opens a file in the group to the right of the focused one, making that group if there is none. */
     fun openToSide(path: String) {
-        if (groups.size < 2) {
-            val g = Group()
-            groups.add(g)
-            val sp = Chrome.splitter(ctx, vertical = true, onDrag = { d -> resizeGroups(d) })
-            groupSplitter = sp
-            groupsRow.addView(sp)
-            groupsRow.addView(g.view, Ui.lp(0, Ui.match, 1f))
-        }
-        current = groups[1]
-        open(path, groups[1], activate = true) { }
-        renderTabs(groups[0])
+        val i = groups.indexOf(current)
+        val target = groups.getOrNull(i + 1) ?: addGroup(current) ?: return
+        current = target
+        open(path, target, activate = true) { }
+        for (x in groups) renderTabs(x)
     }
 
-    private fun resizeGroups(delta: Int) {
-        if (groups.size < 2) return
-        val a = groups[0].view.layoutParams as LinearLayout.LayoutParams
-        val b = groups[1].view.layoutParams as LinearLayout.LayoutParams
-        val stacked = groupsRow.orientation == LinearLayout.VERTICAL
-        val total = if (stacked) groups[0].view.height + groups[1].view.height else groups[0].view.width + groups[1].view.width
+    /** A splitter between group [left] and the next one moved by [delta] pixels. */
+    private fun resizeGroups(left: Int, delta: Int) {
+        val a = groups.getOrNull(left) ?: return
+        val b = groups.getOrNull(left + 1) ?: return
+        val la = a.view.layoutParams as LinearLayout.LayoutParams
+        val lb = b.view.layoutParams as LinearLayout.LayoutParams
+        val sa = if (stacked) a.view.height else a.view.width
+        val sb = if (stacked) b.view.height else b.view.width
+        val total = sa + sb
         if (total <= 0) return
-        val wa = ((if (stacked) groups[0].view.height else groups[0].view.width) + delta).coerceIn(dp(120), total - dp(120))
-        a.weight = wa.toFloat() / total; b.weight = 1f - a.weight
-        groups[0].view.layoutParams = a; groups[1].view.layoutParams = b
+        val na = (sa + delta).coerceIn(dp(120), total - dp(120))
+        val pair = la.weight + lb.weight
+        la.weight = pair * na / total; lb.weight = pair - la.weight
+        a.view.layoutParams = la; b.view.layoutParams = lb
     }
 
     private fun closeGroup(g: Group) {
@@ -769,26 +790,30 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         closeGroupNow(g)
     }
 
-    /** Closes a group's tabs. The left group always stays (it holds the welcome screen): when it is the one closed,
-     *  the right group's tabs move into it. */
+    /** Closes a group and its tabs. The group with the welcome screen always stays: when it is the one closed, the
+     *  tabs of its neighbour move into it and the neighbour goes instead. */
     private fun closeGroupNow(g: Group) {
-        for (t in g.tabs.toList()) { disposeTab(t); g.frame.removeView(t.content) }
+        for (t in g.tabs.toList()) { disposeTab(t); g.frame.removeView(t.content); previewTabs.remove(t); mru.remove(t) }
         g.tabs.clear(); g.active = null
-        val left = groups[0]
-        val right = groups.getOrNull(1) ?: return
-        if (g === left) {
-            for (t in right.tabs.toList()) { right.frame.removeView(t.content); t.group = left; left.tabs.add(t) }
-            left.active = null
-            right.tabs.clear()
+        if (groups.size < 2) { renderTabs(g); return }
+        val idx = groups.indexOf(g)
+        var keep: Group
+        if (g.welcome != null) {
+            val other = groups.getOrNull(idx + 1) ?: groups[idx - 1]
+            for (t in other.tabs.toList()) { other.frame.removeView(t.content); t.group = g; g.tabs.add(t) }
+            other.tabs.clear()
+            g.active = null
+            groups.remove(other)
+            keep = g
+        } else {
+            groups.remove(g)
+            keep = groups[(idx - 1).coerceAtLeast(0)]
         }
-        groups.remove(right)
-        groupsRow.removeView(right.view)
-        groupSplitter?.let { groupsRow.removeView(it) }
-        groupSplitter = null
-        (left.view.layoutParams as LinearLayout.LayoutParams).weight = 1f
-        current = left
-        val next = left.tabs.firstOrNull()
-        if (next != null && left.active == null) activate(next) else { renderTabs(left); left.active?.let { onActiveChanged(it); it.focus() } }
+        for (x in groups) (x.view.layoutParams as? LinearLayout.LayoutParams)?.weight = 1f
+        layoutGroups()
+        current = keep
+        val next = keep.active ?: keep.tabs.firstOrNull()
+        if (next != null && keep.active == null) activate(next) else { for (x in groups) renderTabs(x); keep.active?.let { onActiveChanged(it); it.focus() } }
     }
 
     private fun groupMenu(g: Group, anchor: View) {
@@ -831,11 +856,17 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
 
     fun groupCount(): Int = groups.size
 
-    /** Ctrl 1 and Ctrl 2: the first or second editor group; the second is created when there is none. */
+    /** Ctrl 1 to Ctrl 8: that editor group; a group that does not exist yet is made by splitting the last one (as in
+     *  Cursor, the active file opens in it). */
     fun focusGroupAt(i: Int) {
-        if (i <= 0) { focusGroup(groups[0]); groups[0].active?.focus(); return }
-        if (groups.size < 2) { toggleSplit(); return }
-        focusGroup(groups[1]); groups[1].active?.focus()
+        val n = i.coerceIn(0, MAX_GROUPS - 1)
+        if (n >= groups.size) {
+            current = groups.last()
+            while (groups.size <= n) { val before = groups.size; toggleSplit(); if (groups.size == before) break }
+            return
+        }
+        val g = groups[n]
+        focusGroup(g); g.active?.focus()
     }
 
     /** Ctrl K Ctrl Left and Right: the group to the left or right. */
@@ -859,21 +890,17 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         if (t is NotebookTab && t.dirty) { Ui.toast(ctx, "Save the notebook first."); return }
         val i = groups.indexOf(current) + dir
         if (i < 0) return
-        if (i >= groups.size) { if (groups.size >= 2) return; openToSide(t.path); closeNow(t); return }
-        val target = groups[i]
+        val target = if (i >= groups.size) (addGroup(current) ?: return) else groups[i]
         open(t.path, target, activate = true) { }
         closeNow(t)
     }
 
-    /** Ctrl K Left and Right: the two groups change places. */
-    fun swapGroups() {
-        if (groups.size < 2) return
-        val a = groups[0]; val b = groups[1]
-        groupsRow.removeAllViews()
-        groups.clear(); groups.add(b); groups.add(a)
-        groupsRow.addView(b.view, Ui.lp(0, Ui.match, 1f))
-        groupSplitter?.let { groupsRow.addView(it) }
-        groupsRow.addView(a.view, Ui.lp(0, Ui.match, 1f))
+    /** Ctrl K Left and Right: the focused group changes places with its neighbour on that side. */
+    fun swapGroups(dir: Int = 1) {
+        val i = groups.indexOf(current); val j = i + dir
+        if (i < 0 || j < 0 || j >= groups.size) return
+        val g = groups[i]; groups[i] = groups[j]; groups[j] = g
+        layoutGroups()
         for (x in groups) renderTabs(x)
     }
 
@@ -968,7 +995,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
                 val target = input.text.toString().trim()
                 if (target.isEmpty()) return@setOnClickListener
                 val text = d.text()
-                Api.async("save-as", { Api.post("/api/file", JSONObject().put("path", target).put("content", text)) }) { r, e ->
+                Api.async("save-as", { Api.post("/api/file", JSONObject().put("path", target).put("content", text).put("encoding", d.encoding).put("eol", d.eol)) }) { r, e ->
                     if (r == null) { Ui.toast(ctx, "Not saved: " + (e?.message ?: "")); return@async }
                     dialog.dismiss()
                     host.flashStatus("Saved $target")
@@ -1061,6 +1088,103 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
 
     fun noteEdit(path: String, ed: CodeEditor) { lastEdit = Spot(path, ed.cursorOffset()) }
 
+    // ---------------------------------------------------------------- hot exit (unsaved files survive closing Forge)
+    /** Every unsaved text file: path, text, encoding and line ending. */
+    fun unsavedDocs(): JSONArray {
+        val out = JSONArray()
+        for (d in docs.values) if (d.dirty && d.tabs.isNotEmpty()) out.put(JSONObject().put("path", d.path).put("text", d.text()).put("encoding", d.encoding).put("encoding_name", d.encodingName).put("eol", d.eol))
+        return out
+    }
+
+    /** Opens the files kept by hot exit with their unsaved text (Untitled files come back as Untitled files). */
+    fun restoreUnsaved(list: JSONArray) {
+        for (i in 0 until list.length()) {
+            val o = list.optJSONObject(i) ?: continue
+            val path = o.optString("path"); val text = o.optString("text")
+            if (path.isEmpty()) continue
+            val apply = { t: Tab ->
+                if (t is TextTab) {
+                    t.doc.encoding = o.optString("encoding", t.doc.encoding); t.doc.encodingName = o.optString("encoding_name", t.doc.encodingName); t.doc.eol = o.optString("eol", t.doc.eol)
+                    for (x in t.doc.tabs) x.editor.replaceContent(text)
+                    t.doc.dirty = true
+                    for (g in groups) renderTabs(g)
+                }
+            }
+            if (isUntitled(path)) {
+                untitledCounter++
+                val p = "untitled:$untitledCounter"
+                val d = Doc(p); docs[p] = d
+                val t = makeTextTab(current, d, "")
+                addTab(t, true); apply(t)
+            } else open(path, current, activate = true) { t -> apply(t) }
+        }
+    }
+
+    // ---------------------------------------------------------------- encodings and line endings
+    /** Takes the encoding and line ending the server found in a file; a file that is not valid in its encoding gets
+     *  a warning, because saving it would change the bytes shown as replacement characters. */
+    private fun readCodec(d: Doc, r: JSONObject, warn: Boolean = true) {
+        d.encoding = r.optString("encoding", "utf8").ifEmpty { "utf8" }
+        d.encodingName = r.optString("encoding_name", "UTF-8").ifEmpty { "UTF-8" }
+        d.eol = r.optString("eol", "LF").ifEmpty { "LF" }
+        if (warn && !r.optBoolean("lossless", true)) Ui.toast(ctx, d.path.substringAfterLast('/') + " has bytes that are not valid " + d.encodingName + ". Use Reopen with Encoding to pick the right one before you save.")
+        if (current.active.let { it is TextTab && it.doc === d }) (current.active as? TextTab)?.let { host.onEditorState(it.editor, it.path) }
+    }
+
+    /** The active text file's encoding name, encoding id and line ending, or null. */
+    fun activeCodec(): Triple<String, String, String>? { val t = current.active as? TextTab ?: return null; return Triple(t.doc.encodingName, t.doc.encoding, t.doc.eol) }
+
+    /** Reopen with Encoding: the file is read again from disk in another encoding (unsaved changes are asked about). */
+    fun reopenWithEncoding(enc: String, name: String) {
+        val t = current.active as? TextTab ?: return
+        val d = t.doc
+        if (isUntitled(d.path)) { d.encoding = enc; d.encodingName = name; host.onEditorState(t.editor, t.path); return }
+        fun go() {
+            Api.async("file", { Api.get("/api/file", mapOf("path" to d.path, "encoding" to enc)) }) { r, e ->
+                if (r == null) { Ui.toast(ctx, "Not reopened: " + (e?.message ?: "")); return@async }
+                readCodec(d, r, warn = false)
+                val text = r.optString("content")
+                for (x in d.tabs) x.editor.replaceContent(text)
+                d.dirty = false; for (g in groups) renderTabs(g)
+                Lsp.change(d.path, text)
+                host.flashStatus("Reopened with " + d.encodingName + (if (!r.optBoolean("lossless", true)) ". Some bytes do not fit this encoding." else "."))
+                host.onEditorState(t.editor, t.path)
+            }
+        }
+        if (d.dirty) AlertDialog.Builder(ctx).setTitle("Reopen with " + name + "?").setMessage("The unsaved changes of " + d.path + " are lost when it is read again.")
+            .setPositiveButton("Reopen") { _, _ -> go() }.setNegativeButton("Cancel", null).show()
+        else go()
+    }
+
+    /** Save with Encoding: the file is written in another encoding from now on. */
+    fun saveWithEncoding(enc: String, name: String) {
+        val t = current.active as? TextTab ?: return
+        val old = t.doc.encoding to t.doc.encodingName
+        t.doc.encoding = enc; t.doc.encodingName = name
+        if (isUntitled(t.doc.path)) { host.onEditorState(t.editor, t.path); return }
+        val text = t.doc.text()
+        Api.async("save", { Api.post("/api/file", JSONObject().put("path", t.doc.path).put("content", text).put("encoding", enc).put("eol", t.doc.eol)) }) { r, e ->
+            if (r == null) {
+                t.doc.encoding = old.first; t.doc.encodingName = old.second
+                AlertDialog.Builder(ctx).setTitle("Not saved with " + name).setMessage(e?.message ?: "").setPositiveButton("OK", null).show()
+            } else {
+                t.doc.mtime = r.optDouble("mtime", t.doc.mtime)
+                if (t.doc.text() == text) { t.doc.dirty = false; for (g in groups) renderTabs(g) }
+                host.flashStatus("Saved " + t.doc.path + " with " + name + ".")
+            }
+            host.onEditorState(t.editor, t.path)
+        }
+    }
+
+    /** Change End of Line Sequence: LF or CRLF for the active file; the file counts as changed until it is saved. */
+    fun setEol(eol: String) {
+        val t = current.active as? TextTab ?: return
+        if (t.doc.eol == eol) return
+        t.doc.eol = eol
+        if (!t.doc.dirty) { t.doc.dirty = true; for (g in groups) renderTabs(g) }
+        host.onEditorState(t.editor, t.path)
+    }
+
     // ---------------------------------------------------------------- editor options for every open editor
     fun forEachEditor(f: (CodeEditor) -> Unit) { for (d in docs.values) for (t in d.tabs) f(t.editor) }
 
@@ -1097,6 +1221,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
                     if (again != null) { if (activate) activate(again); then(again); return@async }
                     val d = docs[path] ?: Doc(path).also { docs[path] = it }
                     d.mtime = r.optDouble("mtime", 0.0)
+                    readCodec(d, r)
                     val t = makeTextTab(g, d, r.optString("content"))
                     if (d.tabs.size == 1) Lsp.open(path, t.editor.text())
                     addTab(t, activate); then(t)
@@ -1234,7 +1359,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         menu.menu.add(0, 3, 2, "Close to the right")
         menu.menu.add(0, 4, 3, "Close saved")
         menu.menu.add(0, 5, 4, "Close all")
-        menu.menu.add(0, 6, 5, if (g === groups[0]) "Open to the side" else "Move to the left group")
+        menu.menu.add(0, 6, 5, if (g === groups.last()) "Open to the side" else "Move to the next group")
         menu.menu.add(0, 7, 6, "Reveal in the Explorer")
         menu.menu.add(0, 8, 7, "Add to the chat")
         menu.menu.add(0, 9, 8, "Copy the relative path")
@@ -1245,7 +1370,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
                 3 -> { val i = g.tabs.indexOf(t); for (x in g.tabs.toList().drop(i + 1)) close(x) }
                 4 -> for (x in g.tabs.toList()) if (!x.dirty) closeNow(x)
                 5 -> for (x in g.tabs.toList()) close(x)
-                6 -> if (g === groups[0]) openToSide(t.path) else { open(t.path, groups[0], true) { }; closeNow(t) }
+                6 -> if (g === groups.last()) { current = g; openToSide(t.path) } else { open(t.path, groups[groups.indexOf(g) + 1], true) { }; closeNow(t) }
                 7 -> revealInTree(t.path)
                 8 -> host.addToChat(JSONObject().put("kind", "file").put("path", t.path).put("name", t.path))
                 9 -> { host.copyToClipboard(t.path); Ui.toast(ctx, "Copied " + t.path) }
@@ -1299,16 +1424,9 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
             g.active = null
             val next = g.tabs.getOrNull(idx.coerceAtMost(g.tabs.size - 1)) ?: g.tabs.lastOrNull()
             if (next != null) activate(next)
-            else if (groups.size > 1 && g !== groups[0]) closeGroupNow(g)
-            else if (groups.size > 1) {
-                // The left group emptied: the right group becomes the only one.
-                val right = groups[1]
-                groups.remove(right); groupsRow.removeView(right.view); groupSplitter?.let { groupsRow.removeView(it) }; groupSplitter = null
-                for (x in right.tabs.toList()) { right.frame.removeView(x.content); x.group = g; g.tabs.add(x) }
-                right.tabs.clear()
-                current = g
-                g.tabs.firstOrNull()?.let { activate(it) } ?: renderTabs(g)
-            } else {
+            // An empty group closes, as in Cursor (the group with the welcome screen takes its neighbour's tabs instead).
+            else if (groups.size > 1) closeGroupNow(g)
+            else {
                 renderTabs(g)
                 host.setWindowTitle(""); selectedPath = ""; treeAdapter.notifyDataSetChanged()
                 host.onEditorState(null, ""); symbols = emptyList(); symbolsFor = ""; showOutline()
@@ -1340,7 +1458,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         if (isUntitled(d.path)) { saveAsDoc(d, done); return }
         val text = d.text()
         val path = d.path
-        Api.async("save", { Api.post("/api/file", JSONObject().put("path", path).put("content", text)) }) { r, e ->
+        Api.async("save", { Api.post("/api/file", JSONObject().put("path", path).put("content", text).put("encoding", d.encoding).put("eol", d.eol)) }) { r, e ->
             if (r == null) { Ui.toast(ctx, "Not saved: " + (e?.message ?: "")); return@async }
             d.mtime = r.optDouble("mtime", d.mtime)
             if (d.dirty && d.text() == text) { d.dirty = false; for (g in groups) renderTabs(g) }
@@ -1359,6 +1477,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
             Api.async("file", { Api.get("/api/file", mapOf("path" to path)) }) { r, _ ->
                 if (r == null || d.dirty) return@async
                 d.mtime = r.optDouble("mtime", 0.0)
+                readCodec(d, r, warn = false)
                 val text = r.optString("content")
                 if (text != d.text()) {
                     for (t in d.tabs) t.editor.replaceContent(text)

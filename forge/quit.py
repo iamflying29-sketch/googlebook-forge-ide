@@ -36,6 +36,21 @@ def _forge_user_units() -> List[str]:
     return units
 
 
+def _forge_system_units() -> List[str]:
+    """Running system units Forge started with sudo (image pulls and the virtual devices' network), all named forge-...,
+    except the guard, which is stopped last."""
+    try:
+        r = _run(["systemctl", "list-units", "--plain", "--no-legend", "--state=active,activating,deactivating", "forge-*"], timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        name = line.split()[0] if line.split() else ""
+        if name.startswith("forge-") and name != "forge-android-guard.service":
+            out.append(name)
+    return out
+
+
 def stop_everything(cancel_runs: Callable[[], int], unload_models: Callable[[], None]) -> List[str]:
     """Stops all of Forge in the VM except the server itself. Returns one line per step, for the app to show."""
     done: List[str] = []
@@ -69,6 +84,20 @@ def stop_everything(cancel_runs: Callable[[], int], unload_models: Callable[[], 
         return f"Stopped {len(names)} Forge helpers (language servers, kernels, builds and displays)." if names else "No Forge helpers were running."
     step("Helpers", units)
 
+    def system_units() -> str:
+        names = _forge_system_units()
+        if names:
+            _run(["sudo", "-n", "systemctl", "stop"] + names, timeout=90)
+        return f"Stopped {len(names)} system helpers (image pulls, device network)." if names else "No system helpers were running."
+    step("System helpers", system_units)
+
+    def adb_server() -> str:
+        # Forge's own adb server (port 5041, virtual devices and devices paired over Wi-Fi). The shared one on 5037 and
+        # the other apps' servers are not Forge's and stay.
+        r = _run(["adb", "-P", "5041", "kill-server"], timeout=15)
+        return "Forge's adb server stopped." if r.returncode == 0 else "Forge's adb server was not running."
+    step("adb", adb_server)
+
     def ollama() -> str:
         unload_models()
         r = _run(["sudo", "-n", "systemctl", "stop", "ollama.service"], timeout=60)
@@ -79,6 +108,15 @@ def stop_everything(cancel_runs: Callable[[], int], unload_models: Callable[[], 
         r = _run(["sudo", "-n", "systemctl", "stop", "forge-android-guard.service"], timeout=30)
         return "The Forge Android guard stopped." if r.returncode == 0 else "The Forge Android guard could not be stopped: " + r.stderr.strip()[-200:]
     step("Guard", guard)
+
+    def give_back() -> str:
+        # The VM's file cache is mostly what Forge read (projects, models, images); dropping it lets the VM hand that
+        # memory back to the Googlebook now instead of keeping it.
+        _run(["sync"], timeout=30)
+        _run(["sudo", "-n", "sysctl", "-q", "-w", "vm.drop_caches=3"], timeout=30)
+        _run(["sudo", "-n", "sysctl", "-q", "-w", "vm.compact_memory=1"], timeout=60)
+        return "The Linux VM dropped its file cache, so the memory goes back to the Googlebook."
+    step("Memory", give_back)
     return done
 
 

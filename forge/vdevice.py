@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import armvm, personas
@@ -961,13 +962,13 @@ def download(version: str, gate: Callable[[], Optional[str]]) -> dict:
         pass
     info = VERSIONS[version]
     if info["backend"] == "arm":
-        cmd = ["systemd-run", "--user", "--wait", "--quiet", "--pipe", "-p", "MemoryMax=1300M", "-p", "MemorySwapMax=0"] + armvm.download_command(version)
+        cmd = ["systemd-run", "--user", "--wait", "--quiet", "--pipe", "--unit=forge-download-" + uuid.uuid4().hex[:8], "-p", "MemoryMax=1300M", "-p", "MemorySwapMax=0"] + armvm.download_command(version)
     elif info["backend"] in EPHEMERAL:
-        cmd = ["systemd-run", "--user", "--wait", "--quiet", "--pipe", "-p", "MemoryMax=1300M", "-p", "MemorySwapMax=0",
+        cmd = ["systemd-run", "--user", "--wait", "--quiet", "--pipe", "--unit=forge-download-" + uuid.uuid4().hex[:8], "-p", "MemoryMax=1300M", "-p", "MemorySwapMax=0",
                os.path.join(BIN, "forge-vd-image"), version]
     else:
         # The download runs inside a memory cap, so the files it writes cannot fill the VM's memory with cache.
-        cmd = ["sudo", "-n", "systemd-run", "--scope", "--quiet", "-p", "MemoryMax=1G", "-p", "MemorySwapMax=0", "--",
+        cmd = ["sudo", "-n", "systemd-run", "--scope", "--quiet", "--unit=forge-pull-" + uuid.uuid4().hex[:8], "-p", "MemoryMax=1G", "-p", "MemorySwapMax=0", "--",
                "env", f"CONTAINERS_CONF_OVERRIDE={CONF}", "nice", "-n", "10", "podman", "pull", info["image"]]
     _jobs[version] = {"running": True, "lines": [], "ok": None, "started": time.time()}
     threading.Thread(target=_run_job, args=(version, cmd), name="vd-download", daemon=True).start()

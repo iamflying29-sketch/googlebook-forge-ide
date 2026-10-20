@@ -79,8 +79,11 @@ object GpuBudget {
         var best = now
         val base = p.getLong("baseline_mb", -1)
         val recent = System.currentTimeMillis() - p.getLong("last_active", 0) < SESSION_WINDOW_MS
-        if (base > 0 && recent && !anyRunning(p)) best = maxOf(best, base - MARGIN_MB)
         val pool = poolMb(c)
+        // The session baseline assumes the gap since the session began is the driver's pool. Credit only the part of
+        // the gap that the pool measurement can see (checked 2026-10-20: without this cap, memory taken by other apps
+        // after the GPU process stopped was counted as free too).
+        if (base > 0 && recent && !anyRunning(p) && now >= 0) best = maxOf(best, minOf(base - MARGIN_MB, now + pool))
         if (pool > 0 && now >= 0 && poolCreditPercent > 0) best = maxOf(best, now + pool * minOf(100L, poolCreditPercent) / 100)
         return best
     }

@@ -108,7 +108,13 @@ def tool_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
 
 
 SHELL_RC = """# Forge IDE terminal: start like a login shell (system profile, then yours), then add Forge's toolchains to PATH.
+# The VM's display script (/etc/profile.d/activate_display.sh) starts a day-long login unit (sudo systemd-run ...
+# sleep 1d) and weston for every login shell. The Terminal app's own shell has done that already, so Forge's shells
+# skip those two steps (they would outlive Quit Forge) and keep the rest of the setup.
+sudo() { case "$*" in *systemd-run*"sleep 1d"*) return 0 ;; *) command sudo "$@" ;; esac; }
+systemctl() { case "$*" in "--user start weston") return 0 ;; *) command systemctl "$@" ;; esac; }
 [ -f /etc/profile ] && . /etc/profile
+unset -f sudo systemctl
 if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile"
 elif [ -f "$HOME/.bash_login" ]; then . "$HOME/.bash_login"
 elif [ -f "$HOME/.profile" ]; then . "$HOME/.profile"

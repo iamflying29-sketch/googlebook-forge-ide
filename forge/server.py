@@ -45,7 +45,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "top_k": 40,
     "repeat_penalty": 1.05,
     "num_thread": 0,
-    "keep_alive": "20m",
+    "keep_alive": "5m",
     "thinking": True,
     "verbose": False,
     "tool_mode": "prompt",
@@ -75,7 +75,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "gpu_pool_credit": 0,
     # Minutes without a chat after which the Forge app unloads the GPU engine (0 keeps it loaded). The next message
     # starts it again by itself and waits for it, so an idle laptop does not keep 3 to 4 GB of graphics memory busy.
-    "gpu_idle_unload_min": 30,
+    "gpu_idle_unload_min": 10,
     # Extra llama-server flags for the vision model's server. Flash attention inside the image encoder is the slow
     # path on Vulkan (llama.cpp issue 17012: minutes instead of seconds on integrated GPUs), so it is off by default.
     "vision_extra_args": "-fa off",   # "--fit off" made the vision server fail to load its model (2026-10-19)
@@ -268,6 +268,23 @@ class State:
                 time.sleep(20)
             else:
                 low_since = 0.0
+            # When Ollama has just dropped its last model (its keep-alive ran out), the VM compacts its free memory once,
+            # so whole blocks go back to the Googlebook through free page reporting instead of staying with the VM.
+            now = time.time()
+            if now - getattr(self, "_ollama_seen", 0.0) > 30:
+                self._ollama_seen = now
+                try:
+                    loaded = bool(self.ollama.running())
+                except Exception:  # noqa: BLE001
+                    loaded = False
+                if getattr(self, "_ollama_had", False) and not loaded:
+                    try:
+                        import subprocess
+                        subprocess.run(["sudo", "-n", "sysctl", "-q", "-w", "vm.compact_memory=1"], timeout=60, capture_output=True)
+                        print("[memory] Ollama unloaded its model: compacted the VM's free memory so it goes back to the Googlebook", flush=True)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                self._ollama_had = loaded
             if self.active_engine() == "gpu" and time.time() - self.last_shrink > 180:
                 cached = 0
                 try:
@@ -484,7 +501,7 @@ class State:
                 msgs = [{"role": "system", "content": system}, {"role": "user", "content": "Reply with the single word ready."}]
                 for _ in client.chat_stream(settings["model"], msgs,
                                                  options={**agent._options(), "num_predict": 1},
-                                                 keep_alive=str(self.settings.get("keep_alive", "60m"))):
+                                                 keep_alive=str(self.settings.get("keep_alive", "5m"))):
                     pass
             except Exception:  # noqa: BLE001
                 pass
@@ -520,7 +537,9 @@ class State:
             host = float(report.get("host_mem_mb", -1))
         except (TypeError, ValueError):
             host = -1
-        if host < self.engine_need_mb():
+        # The engine starts without its vision projector when only that fits (EngineService), so the smaller need
+        # decides here; the app's own free-memory check still runs first.
+        if host < self.engine_need_min_mb():
             return False
         if self.gpu_client.alive():
             return False
@@ -555,6 +574,17 @@ class State:
                 pass
         return self._need_mb or self.ENGINE_START_NEED_MB
 
+    def engine_need_min_mb(self) -> int:
+        """The engine's need without the vision projector, which it leaves out when only that fits (EngineService)."""
+        full = self.engine_need_mb()
+        try:
+            pf = self.gpu_mmproj_file()
+            if pf:
+                return full - (int(pf["size"]) // (1024 * 1024) + 300)
+        except Exception:  # noqa: BLE001
+            pass
+        return full
+
     def engine_memory_note(self) -> str:
         """One sentence about the Googlebook's free memory against what the GPU engine needs, from the app's latest
         report. Empty when the app has not reported lately or when there is room (then memory is not the reason)."""
@@ -564,11 +594,12 @@ class State:
             host = -1
         if host < 0 or time.time() - self.vision.app_seen > 120:
             return ""
-        need = self.engine_need_mb()
+        need = self.engine_need_min_mb()
         if host >= need:
             return ""
-        return (f"The Googlebook has {host} MB free and the GPU engine needs about {need} MB, so the Forge app is waiting for "
-                f"memory. Closing other apps on the Googlebook (not the Terminal) makes room, and the engine then starts by itself.")
+        return (f"The Googlebook has {host} MB free and the GPU engine needs about {need} MB (more to see images), so the Forge "
+                f"app is waiting for memory. Closing other apps on the Googlebook (not the Terminal) makes room, and the engine "
+                f"then starts by itself.")
 
     def ask_engine_start(self) -> None:
         """Wake the app's control poll so it hears about the engine right away (a chat needs it)."""
@@ -583,7 +614,7 @@ class State:
         """Whether the app should unload the GPU engine now: it runs, no chat has used it for the idle time in the
         settings, nothing is running or waiting for the vision model, and it was not asked in the last ten minutes."""
         try:
-            idle_min = int(self.settings.get("gpu_idle_unload_min", 30) or 0)
+            idle_min = int(self.settings.get("gpu_idle_unload_min", 10) or 0)
         except (TypeError, ValueError):
             idle_min = 30
         if idle_min <= 0 or self.active_engine() != "gpu" or self.engine_idle_stopped:
@@ -900,6 +931,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"version": __version__, "ollama": alive, "workspace": ws.root, "engine": st.active_engine(),
                                     "gpu_engine": {"url": st.gpu_client.base_url, "health": gpu, "host_mem_mb": st.vision.app.get("host_mem_mb"),
                                                    "need_mb": st.engine_need_mb() if st.active_engine() == "gpu" else None,
+                                                   "need_min_mb": st.engine_need_min_mb() if st.active_engine() == "gpu" else None,
                                                    "note": st.engine_memory_note() if st.active_engine() == "gpu" and gpu.get("status") != "ok" else ""},
                                     "workspace_name": os.path.basename(ws.root) or ws.root,
                                     "model": st.resolve_model(st.effective_settings(ws.root).get("model")),
@@ -1030,10 +1062,23 @@ class Handler(BaseHTTPRequestHandler):
                 files.sort(key=lambda f: (needle not in os.path.basename(f).lower(), len(f)))
             return self._json(200, {"files": files[:300], "total": len(files)})
         if path == "/api/file":
+            # The editor's read: the file's own encoding and line ending are detected (or the encoding asked for is
+            # used, for Reopen with Encoding) and reported, so a save writes the file back the same way.
+            from . import textcodec, tools as _tools
             rel = arg("path")
-            text = ws.read_text(rel)
-            p = ws.resolve(rel)
-            return self._json(200, {"path": rel, "content": text, "mtime": os.path.getmtime(p), "size": len(text)})
+            p = ws.resolve(rel, must_exist=True)
+            if os.path.isdir(p):
+                raise ValueError(f"'{rel}' is a directory.")
+            if _tools._is_binary_path(p):
+                raise ValueError(f"'{rel}' is a binary file ({os.path.getsize(p):,} bytes) and cannot be read as text.")
+            with open(p, "rb") as fh:
+                data = fh.read()
+            text, enc, eol, lossless = textcodec.decode(data, arg("encoding") or None)
+            return self._json(200, {"path": rel, "content": text, "mtime": os.path.getmtime(p), "size": len(text),
+                                    "encoding": enc, "encoding_name": textcodec.name_of(enc), "eol": eol, "lossless": lossless})
+        if path == "/api/encodings":
+            from . import textcodec
+            return self._json(200, {"encodings": textcodec.choices()})
         if path == "/api/search":
             opts = {"ignore_case": arg("case") == "0", "whole_word": arg("word") == "1", "exclude": arg("exclude") or None}
             result = ws.search(arg("q"), arg("path", ".") or ".", arg("glob") or None, arg("regex") == "1", max_results=int(arg("max") or 400), **opts)
@@ -1282,11 +1327,27 @@ class Handler(BaseHTTPRequestHandler):
             w = st.set_workspace(p)
             return self._json(200, {"workspace": w.root})
         if path == "/api/file":
+            # The editor's save, in the file's encoding and line ending (given by the editor, or else those the file
+            # already has on disk, so a file Forge did not open itself keeps them too).
+            from . import textcodec
             rel = str(b["path"])
             content = str(b.get("content", ""))
-            msg = ws.write_file(rel, content, run_id=None)
-            check = msg.split("\n", 1)[1] if "\n" in msg else ""
-            return self._json(200, {"ok": True, "path": rel, "mtime": os.path.getmtime(ws.resolve(rel)), "check": check.strip()})
+            p = ws.resolve(rel)
+            enc, eol = b.get("encoding"), b.get("eol")
+            if not enc or not eol:
+                old_enc, old_eol = "utf8", "LF"
+                if os.path.isfile(p):
+                    with open(p, "rb") as fh:
+                        _, old_enc, old_eol, _ = textcodec.decode(fh.read())
+                enc, eol = enc or old_enc, eol or old_eol
+            data = textcodec.encode(content, str(enc), str(eol))
+            os.makedirs(os.path.dirname(p) or ws.root, exist_ok=True)
+            with open(p, "wb") as fh:
+                fh.write(data)
+            ws._file_cache = (0.0, [])
+            check = ws.verify(ws.relpath(p))
+            return self._json(200, {"ok": True, "path": rel, "mtime": os.path.getmtime(p), "check": check.strip(),
+                                    "encoding": enc, "eol": eol})
         if path == "/api/file/new":
             rel = str(b["path"])
             p = ws.resolve(rel)
@@ -1469,7 +1530,7 @@ class Handler(BaseHTTPRequestHandler):
                       "characters. Then a blank line and two to five short bullet points if the change has several parts. "
                       "Plain text only, no markdown fences, no quotes around it.\n\n```diff\n" + diff[:14000] + "\n```")
             r = st.client_for().generate(settings["model"], prompt, options={"num_ctx": 8192, "temperature": 0.2, "num_predict": 200},
-                                   keep_alive=str(settings.get("keep_alive", "20m")), timeout=600,
+                                   keep_alive=str(settings.get("keep_alive", "5m")), timeout=600,
                                    system="You are a senior engineer writing precise, conventional git commit messages.")
             text = str(r.get("response", "")).strip().strip("`").strip()
             return self._json(200, {"message": text})
@@ -1510,7 +1571,7 @@ class Handler(BaseHTTPRequestHandler):
                       f"no explanation, no markdown, no backticks.")
             r = st.client_for().generate(settings["model"], prompt, options={"num_ctx": 4096, "temperature": 0.1, "num_predict": 120,
                                                                       "stop": ["\n\n", "```"]},
-                                   keep_alive=str(settings.get("keep_alive", "20m")), timeout=300,
+                                   keep_alive=str(settings.get("keep_alive", "5m")), timeout=300,
                                    system="You are an expert Linux shell user. You answer with one command line only.")
             cmd = str(r.get("response", "")).strip().strip("`").strip()
             cmd = cmd.split("\n")[0].strip()
@@ -1838,7 +1899,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"stats": {k: v for k, v in st.engine_stats.items() if k != "log"},
                                     "log": str(st.engine_stats.get("log", ""))})
         if path == "/api/terminal/kill":
-            st.terminals.kill(str(b.get("id", "")))
+            st.terminals.kill(ws.root + "\0" + str(b.get("id", "")))
             return self._json(200, {"ok": True})
         if path == "/api/unload":
             st.unload_model()
@@ -2269,7 +2330,8 @@ class Handler(BaseHTTPRequestHandler):
         sock = handshake(self)
         if sock is None:
             return
-        term_id = q.get("id", ["main"])[0][:40]
+        # Every folder has its own shells (a window's "main" shell is not another window's), as in Cursor.
+        term_id = folder + "\0" + q.get("id", ["main"])[0][:40]
         cols = int(q.get("cols", ["120"])[0] or 120)
         rows = int(q.get("rows", ["30"])[0] or 30)
         st.terminals.serve(sock, term_id, folder, cols, rows)

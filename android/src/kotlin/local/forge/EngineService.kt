@@ -331,12 +331,21 @@ class EngineService : Service() {
             val bin = File(applicationInfo.nativeLibraryDir, "libllama-server.so")
             if (!bin.exists()) throw Exception("Engine binary missing from this build of the app.")
             // Weights + KV cache + compute buffers + margin, plus the projector and its image encoder when it sees.
-            val needMb = size / (1024 * 1024) + 1200 + (mmFile?.let { it.length() / (1024 * 1024) + 300 } ?: 0L)
+            var needMb = size / (1024 * 1024) + 1200 + (mmFile?.let { it.length() / (1024 * 1024) + 300 } ?: 0L)
+            val needPlain = size / (1024 * 1024) + 1200
             GpuBudget.poolCreditPercent = cfg.optLong("pool_credit_percent", 0)
             // The free-memory check (GpuBudget), never bypassed. Ask the VM to hand memory back while waiting.
             var why = GpuBudget.check(this, needMb)
             var attempt = 0
             while (why != null && attempt < 120 && !stopping) {
+                // After half a minute without room for the vision projector, the engine starts without it (about
+                // 0.9 GB less): it then reads text only, and images go to the separate vision model. A working engine
+                // beats one that waits.
+                if (mmFile != null && attempt >= 6 && GpuBudget.check(this, needPlain) == null) {
+                    log("not enough free memory for the vision projector ($why); starting without it, $needPlain MB needed")
+                    mmFile = null; needMb = needPlain; why = null
+                    break
+                }
                 if (attempt % 12 == 0) { try { httpPost("$FORGE/api/engine/prepare", "{}", 90000) } catch (e: Exception) { log("prepare: " + e.message) } }
                 state = "starting"
                 notifyText("Waiting for free memory ($why). Closing other apps helps.")
@@ -401,8 +410,14 @@ class EngineService : Service() {
                 while (true) {
                     val line = r.readLine() ?: break
                     log(line)
-                    if (line.contains("server is listening") || line.contains("all slots are idle") || line.contains("starting the main loop")) {
-                        if (state != "running") { state = "running"; notifyText("Running on the GPU · $host:$port"); postStats("running") }
+                    // Newer llama-server builds say "model loaded" and "listening on" (checked 2026-10-20); older ones
+                    // "server is listening" or "all slots are idle".
+                    if (line.contains("server is listening") || line.contains("listening on") || line.contains("model loaded") || line.contains("all slots are idle") || line.contains("starting the main loop")) {
+                        if (state != "running") {
+                            state = "running"; notifyText("Running on the GPU · $host:$port"); postStats("running")
+                            // What the loaded engine really takes, for checking the estimate above.
+                            log("memory after loading: visible " + memAvailableMb() + " MB, unaccounted " + GpuBudget.unaccountedMb() + " MB, estimate was $needMb MB")
+                        }
                     }
                 }
             }
