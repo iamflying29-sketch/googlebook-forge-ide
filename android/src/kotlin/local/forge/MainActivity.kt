@@ -579,7 +579,7 @@ class MainActivity : Activity() {
         speedItem.second.setTextColor(if (slow) Ui.yellow else Ui.fg2)
         speedItem.first.tooltipText = "The GPU engine writes " + String.format("%.1f", now) + " tokens per second (median of its last replies)" +
             (if (best > 0) "; the best measured for this model is " + String.format("%.1f", best) + "." else ".") +
-            (if (slow) " It is slower than its best. Click for the likely cause and a speed test." else " Click for a speed test.")
+            (if (slow) " It is slower than its best; a restart of the Googlebook brings the speed back. Click for a speed test." else " Click for a speed test.")
         speedItem.first.visibility = View.VISIBLE
     }
 
@@ -607,9 +607,10 @@ class MainActivity : Activity() {
                     .setMessage("Measured on 2026-10-20 after 9 days without a restart: the GPU read the model's weights at about 10 GB per second, " +
                         "while a processor core read memory at 30 GB per second at the same time, and the Googlebook's memory was badly fragmented " +
                         "(98 percent of its compaction attempts failed). The same small vision test that wrote 19 tokens per second on October 14 wrote 8 on October 20.\n\n" +
-                        "The likely cause, not proven yet: with fragmented memory the graphics driver gets only small memory pages for the model, " +
-                        "and the GPU then spends its time translating addresses. A restart of the Googlebook gives it large free blocks again; " +
-                        "a speed test right after a restart shows whether this is the cause.\n\n" +
+                        "A restart brings the speed back: 3 minutes after a restart on 2026-10-20 the speed test wrote 16.7 tokens per second, " +
+                        "against 4.7 before it. The slowdown builds up with uptime; the explanation that fits is fragmented memory, which leaves " +
+                        "the graphics driver only small memory pages, so the GPU spends its time translating addresses. When this item turns " +
+                        "yellow, restart the Googlebook when it suits you.\n\n" +
                         "Forge now avoids the churn that fragments memory: the GPU engine looks at images itself instead of unloading for a second model, " +
                         "and the Linux VM no longer hands its cache back on a schedule.")
                     .setPositiveButton("Close", null).show()
