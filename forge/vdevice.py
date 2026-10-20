@@ -87,9 +87,9 @@ VERSIONS: Dict[str, dict] = {
     "12": {"label": "Android 12", "detail": "AOSP, API 31", "image": "docker.io/redroid/redroid:12.0.0_64only-latest", "backend": "redroid", "cap_mb": 2560, "size": "0.6 GB download"},
     "11": {"label": "Android 11", "detail": "AOSP, API 30", "image": "docker.io/redroid/redroid:11.0.0-latest", "backend": "redroid", "cap_mb": 2560, "size": "0.9 GB download"},
 }
-# Device types: the screen profile a device starts with, and Android features for the type. A true watch type is
-# not possible: phone builds of Android crash when told they are a watch (the Wear OS services are missing), so
-# watches are watch-sized, round-masked screens.
+# Device types: the screen profile a device starts with, and Android features for the type. Phone builds of Android
+# cannot be a true watch (they crash when told they are a watch, because the Wear OS services are missing), so on them
+# a watch is a watch-sized screen; Wear OS 6, Google's own watch build, is the real watch system.
 VERSIONS.update(armvm.ARM_VERSIONS)   # the makers' own Android under ARM emulation (forge/armvm.py)
 
 
@@ -112,6 +112,10 @@ TYPES = {"phone": "phone", "small-phone": "small-phone", "foldable": "foldable",
 TYPE_NAMES = {"phone": "phone", "small-phone": "small phone", "foldable": "foldable", "tablet": "tablet",
               "watch-round": "round watch", "watch-square": "square watch", "tv": "TV", "desktop": "desktop",
               "car": "car", "xr": "XR headset"}
+# The types of phone and tablet Android, the versions without a list of their own. A car and an XR headset need
+# Google's own builds for them (Android Automotive and Android XR); on phone Android they would only be a screen size.
+GENERIC_TYPES = ["phone", "small-phone", "foldable", "tablet", "watch-round", "watch-square", "tv", "desktop"]
+WATCH_TYPES = ("watch-round", "watch-square")
 TV_FEATURES = """<?xml version="1.0" encoding="utf-8"?>
 <!-- Forge virtual device type: TV. Declares the TV features so Android uses its television UI mode. -->
 <permissions>
@@ -382,19 +386,115 @@ def save_look(dev_id: str, look: dict) -> None:
         _save(defs)
 
 
+def allowed_types(version: str) -> List[str]:
+    """The device types a version can be: its own list, or the types of phone and tablet Android."""
+    return [t for t in (VERSIONS[version].get("types") or GENERIC_TYPES) if t in TYPES]
+
+
+def _a(type_name: str) -> str:
+    return ("an " if type_name[:1].lower() in "aeiou" or type_name.startswith("XR") else "a ") + type_name
+
+
+def _or_list(items: List[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " or " + items[-1]
+
+
+def _builds_for(kinds: Tuple[str, ...]) -> List[str]:
+    """The labels of the versions made for exactly these device types (Google's watch, TV and desktop builds)."""
+    return [i["label"] for i in VERSIONS.values() if i.get("types") and set(i["types"]) <= set(kinds) and i.get("backend") != "arm"]
+
+
+def type_details(version: str) -> Dict[str, dict]:
+    """For each type of a version, the label the create form shows and, where the type is less than its name says on
+    this version, a note that says what it is. A type is the real thing on the versions made for it (Wear OS for
+    watches, the TV builds for TVs, and so on); on phone Android a watch or a desktop is a screen size, a TV is phone
+    Android with the TV features, and a foldable is the open screen on every version (none of them folds)."""
+    info = VERSIONS[version]
+    types = allowed_types(version)
+    own = info.get("types") or []
+    out: Dict[str, dict] = {}
+    for t in types:
+        label = PROFILES[TYPES[t]][0]
+        note = ""
+        if t in WATCH_TYPES and not (own and set(own) <= set(WATCH_TYPES)):
+            label = ("Round" if t == "watch-round" else "Square") + " watch-sized screen of phone Android"
+            alt = _builds_for(WATCH_TYPES)
+            note = ("Phone Android on a watch-sized screen" + (" that apps see as round" if t == "watch-round" else "") +
+                    ", not Wear OS." + (f" For Wear OS itself, choose {_or_list(alt)}." if alt else ""))
+        elif t == "tv" and own != ["tv"]:
+            label = "TV: phone Android with the TV features"
+            alt = _builds_for(("tv",))
+            note = ("Phone Android that declares Android's TV features, so Android reports a TV to apps (its TV interface "
+                    "mode); it is not Android TV's own interface." + (f" For that, choose {_or_list(alt)}." if alt else ""))
+        elif t == "desktop" and own != ["desktop"]:
+            label = "Desktop-sized screen of phone Android"
+            alt = _builds_for(("desktop",))
+            note = ("Phone Android on a 1920 by 1080 screen at desktop density, not a desktop build." +
+                    (f" For Google's desktop build, choose {_or_list(alt)}." if alt else ""))
+        elif t == "foldable":
+            label = "Foldable, open (screen only)"
+            note = "The open screen's size and density only: the device does not fold, and Android reports no hinge."
+        if info.get("backend") == "arm":
+            note = ("Forge applies this screen size and density inside the emulated display once Android has started "
+                    "(wm size and wm density). The device window's profile list changes it, or goes back to the emulated "
+                    "display's own size.")
+        out[t] = {"label": label, "note": note}
+    return out
+
+
+def persona_problem(version: str, persona: str) -> Optional[str]:
+    """Why a persona cannot be used with a version, or None."""
+    info = VERSIONS[version]
+    p = personas.PERSONAS.get(persona)
+    if not p:
+        return "Unknown persona."
+    if info.get("backend") == "arm":
+        return ("Personas are for container devices: Forge gives a persona its identity and features when the container "
+                "starts, and the emulated ARM machine has no such step. The maker's own Android keeps its own identity.")
+    allowed = allowed_types(version)
+    if p["kind"] not in allowed:
+        return (f"The {p['name']} persona is {_a(TYPE_NAMES[p['kind']])}, and {info['label']} can be "
+                f"{_or_list([_a(TYPE_NAMES[t]) for t in allowed])}.")
+    return None
+
+
+def about(version: str) -> str:
+    """Where a version comes from and what it is, for the create form."""
+    info = VERSIONS[version]
+    backend = info.get("backend")
+    if backend == "redroid":
+        return "AOSP Android from the open-source Redroid project, built to run in containers."
+    if backend == "waydroid":
+        return ("LineageOS from the WayDroid-ATV project, a community build made for containers; Forge checks the published "
+                "checksums of its downloads." + (" Its Google apps are the ones that project includes. Signing in to Google "
+                "Play may first need the device registered at google.com/android/uncertified." if "google" in version else ""))
+    if backend == "google":
+        return ("Google's official system image from Google's SDK repository, run in a container with the Redroid project's "
+                "vendor partition in place of the emulator's.")
+    if backend == "arm":
+        return ("The maker's own Android: a Mystic GSI community port, booted by a LineageOS virtual machine under QEMU's "
+                "ARM emulation. It is real but slow: 15 minutes to an hour to the first screen, with the clock at about a "
+                "third of real time.")
+    return ""
+
+
 def create(version: str, dev_type: str, name: str = "", persona: str = "") -> dict:
     if version not in VERSIONS:
         raise ValueError("Unknown Android version.")
+    label = VERSIONS[version]["label"]
     pers = personas.PERSONAS.get(persona) if persona else None
     if persona and not pers:
         raise ValueError("Unknown persona.")
     if pers:
+        why = persona_problem(version, persona)
+        if why:
+            raise ValueError(why)
         dev_type = pers["kind"]
     if dev_type not in TYPES:
         raise ValueError("Unknown device type.")
-    allowed = VERSIONS[version].get("types")
-    if allowed and dev_type not in allowed:
-        raise ValueError(f"{VERSIONS[version]['label']} is for " + ("TV devices." if allowed == ["tv"] else "phones, tablets, watches and desktops, not TVs."))
+    allowed = allowed_types(version)
+    if dev_type not in allowed:
+        raise ValueError(f"{label} can be {_or_list([_a(TYPE_NAMES[t]) for t in allowed])}, not {_a(TYPE_NAMES[dev_type])}.")
     with _lock:
         defs = definitions()
         base = f"android{version}-{persona or dev_type}"
@@ -505,9 +605,19 @@ def status() -> dict:
         devs.append({**d, "running": run, "phase": p.get("phase") or ("ready" if run else "stopped"), "message": p.get("message", ""),
                      "serial": f"127.0.0.1:{d['port']}", "version_label": VERSIONS[d["version"]]["label"],
                      "memory_mb": memory_mb(d) if run else None})
-    vers = [{"version": v, **{k: info[k] for k in ("label", "detail", "backend", "cap_mb", "size")},
-             "installed": armvm.installed(v) if info["backend"] == "arm" else info["image"] in present,
-             "job": _jobs.get(v), "types": info.get("types"), "maker": info.get("maker")} for v, info in VERSIONS.items()]
+    vers = []
+    for v, info in VERSIONS.items():
+        details = type_details(v)
+        vers.append({"version": v, **{k: info[k] for k in ("label", "detail", "backend", "cap_mb", "size")},
+                     "installed": armvm.installed(v) if info["backend"] == "arm" else info["image"] in present,
+                     "job": _jobs.get(v), "types": allowed_types(v), "maker": info.get("maker") or "",
+                     "type_labels": {t: x["label"] for t, x in details.items()},
+                     "type_notes": {t: x["note"] for t, x in details.items() if x["note"]},
+                     # Personas fit a version when their kind is one of its types; the makers' ARM systems take none.
+                     "personas_off": persona_problem(v, next(iter(personas.PERSONAS))) if info["backend"] == "arm" else "",
+                     "about": about(v),
+                     # The start check (memory_block): the cap plus the Googlebook's reserve, and the cap plus 300 MB in the VM.
+                     "host_need_mb": info["cap_mb"] + HOST_RESERVE_MB, "vm_need_mb": info["cap_mb"] + 300})
     notices = []
     for path in (os.path.join(VD_DIR, "notices.jsonl"),):
         try:
@@ -529,6 +639,8 @@ def status() -> dict:
         recent = [r for r in g.get("recent", []) if time.time() - r.get("time", 0) < 900]
         shield = {"fixed": len(recent), "fresh": time.time() - g.get("time", 0) < 60,
                   "hibernation_blocked": bool(g.get("hibernation_blocked")),
+                  # The guard names its wake lock; whether the kernel holds it is read here (a short sysfs file).
+                  "wake_lock_held": _wake_lock_held(str(g.get("wake_lock") or "")),
                   "warning": next((r["fix"] for r in recent if r["fix"].startswith("WARNING")), "")}
     except (OSError, ValueError, KeyError, TypeError):
         pass
@@ -548,6 +660,22 @@ def _guard_active() -> bool:
         return subprocess.run(["systemctl", "is-active", "--quiet", "forge-android-guard"], timeout=10).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def _wake_lock_held(name: str) -> bool:
+    """True while the kernel lists the guard's wake lock (Android's suspend service then waits instead of suspending)."""
+    if not name:
+        return False
+    try:
+        with open("/sys/power/wake_lock", "r") as fh:
+            return name in fh.read(65536).split()
+    except OSError:
+        return False
+
+
+def phase(dev_id: str) -> dict:
+    """A device's start phase and its message, as the boot threads set them."""
+    return dict(_progress.get(dev_id, {}))
 
 
 def reconnect_running() -> None:
@@ -764,6 +892,14 @@ def start(dev_id: str, on_ready: Optional[Callable[[dict], None]] = None) -> dic
         r = armvm.start(d, lambda phase, msg: _set(dev_id, phase, msg), on_ready)
         if not r["ok"]:
             _set(dev_id, "failed", r["message"])
+        elif r.get("started"):
+            # The same low-memory watchdog as a container device, watching QEMU's scope instead of a container.
+            touch_active(d)
+            why = _start_watchdog(d, ["--arm", d["id"], r["scope"]])
+            if why:
+                armvm.stop(d)
+                _set(dev_id, "failed", why)
+                return {"ok": False, "message": why}
         return r
     if not podman_available():
         return {"ok": False, "message": "Podman is not installed (or sudo needs a password), so virtual devices cannot run."}
@@ -822,9 +958,13 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
                 _stop_display(d)
                 return
         touch_active(d)
-        subprocess.run(["systemd-run", "--user", "--quiet", f"--unit=forge-vd-{d['id']}-watchdog", "-p", "MemoryMax=64M",
-                        "/usr/bin/python3", "-I", os.path.join(BIN, "forge-vd-watchdog"), container(d), d["id"], _display_unit(d)],
-                       capture_output=True, timeout=20)
+        why = _start_watchdog(d, [container(d), d["id"], _display_unit(d)])
+        if why:
+            pod(["kill", container(d)], timeout=40)
+            _stop_display(d)
+            stop_dhcp_if_idle(d["id"])
+            _set(d["id"], "failed", why)
+            return
         _set(d["id"], "booting", "Android is starting")
         serial = f"127.0.0.1:{d['port']}"
         ensure_forge_server()
@@ -869,11 +1009,15 @@ def _boot(d: dict, on_ready: Optional[Callable[[dict], None]]) -> None:
                                     "The Android view's notices or the Forge log say why.")
             return
         restore_vm_permissions(full=True)
-        look = dict(d.get("look") or {})
+        # Read again: a look chosen in the device window while Android was starting is saved and applied here.
+        look = dict((get(d["id"]) or d).get("look") or {})
         # The screen stays on: a test device should, and Android never starts its suspend logic (see VM_FILES).
         cmds = ["settings put global stay_on_while_plugged_in 7", "settings put system screen_off_timeout 2147483647", "svc power stayon true"]
         prof = PROFILES.get(look.get("profile") or TYPES[d["type"]])
-        if prof and info["backend"] == "waydroid":
+        # Android 17's display is sized by its own Weston and needs the size set; a Redroid or Google container keeps
+        # the size it was first started with, so a profile chosen later in the device window is set again here too
+        # (asking for the size the display already has changes nothing).
+        if prof and prof[1] > 0:
             cmds += [f"wm size {prof[1]}x{prof[2]}", f"wm density {prof[3]}"]
         if look.get("dark"):
             cmds.append("cmd uimode night yes")
@@ -914,6 +1058,29 @@ def _stop_display(d: dict) -> None:
     subprocess.run(["systemctl", "--user", "stop", _display_unit(d)], capture_output=True, timeout=20)
 
 
+def _watchdog_unit(d: dict) -> str:
+    return f"forge-vd-{d['id']}-watchdog"
+
+
+def _start_watchdog(d: dict, args: List[str]) -> Optional[str]:
+    """Starts the device's watchdog (bin/forge-vd-watchdog) in its own systemd unit, so it keeps working when Forge
+    restarts. A watchdog left from an earlier run of this device is stopped first (that run has ended, because the
+    device was not running when it was started). Returns why it did not start, or None; a device never runs without
+    its watchdog."""
+    unit = _watchdog_unit(d)
+    try:
+        subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True, timeout=20)
+        subprocess.run(["systemctl", "--user", "reset-failed", unit], capture_output=True, timeout=20)
+        r = subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}", "-p", "MemoryMax=64M",
+                            "/usr/bin/python3", "-I", os.path.join(BIN, "forge-vd-watchdog")] + args,
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"The device's memory watchdog did not start ({e}), so Forge stopped the device."
+    if r.returncode != 0:
+        return "The device's memory watchdog did not start (" + (r.stderr or r.stdout).strip()[-200:] + "), so Forge stopped the device."
+    return None
+
+
 def stop(dev_id: str) -> dict:
     """Stop a device from outside: flush Android's file writes, then end the container. Android's own power off is
     never used (see the module note about sysrq)."""
@@ -924,12 +1091,13 @@ def stop(dev_id: str) -> dict:
     serial = f"127.0.0.1:{d['port']}"
     if VERSIONS[d["version"]]["backend"] == "arm":
         r = armvm.stop(d)
+        subprocess.run(["systemctl", "--user", "stop", _watchdog_unit(d)], capture_output=True, timeout=20)
         _set(dev_id, "stopped", "")
         return r
     adb(["shell", "sync"], serial=serial, port=FORGE_PORT, timeout=15)
     r = pod(["kill", container(d)], timeout=40)
     adb(["disconnect", serial], port=FORGE_PORT, timeout=8)
-    subprocess.run(["systemctl", "--user", "stop", f"forge-vd-{d['id']}-watchdog"], capture_output=True, timeout=20)
+    subprocess.run(["systemctl", "--user", "stop", _watchdog_unit(d)], capture_output=True, timeout=20)
     _stop_display(d)
     if VERSIONS.get(d["version"], {}).get("dhcp"):
         stop_dhcp_if_idle(d["id"])

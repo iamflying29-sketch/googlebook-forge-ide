@@ -300,8 +300,12 @@ class ReviewPanel(private val ctx: Context, private val host: MainActivity) {
     private fun openInEditor(ch: Change) {
         val d = details[keptId(ch.runId, ch.path)]
         val line = d?.hunks?.firstOrNull()?.let { it.b0 + 1 } ?: 0
-        host.openFileAt(ch.path, line)
+        // A file of another folder's run opens by its full path, not as the same name in this window's folder.
+        host.openFileAt(if (isHere(ch) || ch.path.startsWith("/")) ch.path else ch.workspace.trimEnd('/') + "/" + ch.path, line)
     }
+
+    /** True when the change belongs to this window's folder (then its path is relative to this window's folder). */
+    private fun isHere(ch: Change): Boolean = ch.workspace.isEmpty() || ch.workspace.trimEnd('/') == host.windowFolder().trimEnd('/')
 
     // ---------------------------------------------------------------- the diff of one file
     private fun fillDetail(ch: Change, box: LinearLayout) {
@@ -321,7 +325,7 @@ class ReviewPanel(private val ctx: Context, private val host: MainActivity) {
             val after = if (found.isNull("after")) "" else found.optString("after")
             // The file as it is now (the user may have edited it since the run); the snapshot is the fallback.
             val now = if (ch.kind == "deleted" || ch.kind == "reverted") after else try {
-                Api.get("/api/file", mapOf("path" to ch.path)).optString("content")
+                Api.get("/api/file", mapOf("path" to ch.path, "run_id" to ch.runId)).optString("content")
             } catch (e: Exception) { after }
             Triple(before, now, found.optString("kind"))
         }) { r, e ->
@@ -360,11 +364,17 @@ class ReviewPanel(private val ctx: Context, private val host: MainActivity) {
         box.addView(diffView, Ui.lp(Ui.match, Ui.wrap))
     }
 
-    /** Accepts one hunk: the original moves forward over it, so the remaining hunks stay reviewable. */
+    /** Accepts one hunk: the original moves forward over it, so the remaining hunks stay reviewable. The server keeps
+     *  the new original too, so the kept part stays kept after a reload, in the editor's review and in a later Undo. */
     private fun keepHunk(d: Detail, i: Int) {
         val h = d.hunks.getOrNull(i) ?: return
         d.base = Diff.keepHunk(d.base, d.now, h)
         d.hunks = Diff.lines(d.base, d.now)
+        val ch = d.change
+        Api.async("keep-hunk", { Api.post("/api/changes/keep", JSONObject().put("run_id", ch.runId).put("path", ch.path).put("before", d.base.joinToString("\n"))) }) { _, e ->
+            if (e != null) Ui.toast(ctx, "The kept part is not saved: " + e.message)
+            else if (isHere(ch)) host.reviewBaseChanged(ch.path, d.base.joinToString("\n"))
+        }
         if (d.hunks.isEmpty()) { setKept(d.change, true); render() } else renderDetail(d)
     }
 
@@ -376,12 +386,12 @@ class ReviewPanel(private val ctx: Context, private val host: MainActivity) {
         val next = Diff.undoHunk(d.base, d.now, h)
         val content = next.joinToString("\n")
         val path = d.change.path
-        Api.async("undo-hunk", { Api.post("/api/file", JSONObject().put("path", path).put("content", content)) }) { r, e ->
+        Api.async("undo-hunk", { Api.post("/api/file", JSONObject().put("path", path).put("content", content).put("run_id", d.change.runId)) }) { r, e ->
             d.busy = false
             if (r == null) { Ui.toast(ctx, "Could not write " + path + ": " + (e?.message ?: "")); return@async }
             d.now = next
             d.hunks = Diff.lines(d.base, d.now)
-            host.fileChanged(path)
+            if (isHere(d.change)) host.fileChanged(path)
             if (d.hunks.isEmpty()) { Ui.toast(ctx, "Every change in " + path + " was undone."); setKept(d.change, true); render() }
             else renderDetail(d)
         }
@@ -394,7 +404,7 @@ class ReviewPanel(private val ctx: Context, private val host: MainActivity) {
             Ui.toast(ctx, r.optString("message", "Restored " + ch.path))
             ch.kind = "reverted"
             setKept(ch, false)
-            host.fileChanged(ch.path)
+            if (isHere(ch)) host.fileChanged(ch.path)
             host.refreshTree()
             load()
         }
@@ -421,7 +431,7 @@ class ReviewPanel(private val ctx: Context, private val host: MainActivity) {
             if (r == null) { Ui.toast(ctx, "Could not undo the run: " + (e?.message ?: "")); return@async }
             val msgs = r.optJSONArray("messages") ?: JSONArray()
             Ui.toast(ctx, msgs.length().toString() + (if (msgs.length() == 1) " file restored." else " files restored."))
-            for (ch in run.files) { host.fileChanged(ch.path); kept.remove(keptId(ch.runId, ch.path)) }
+            for (ch in run.files) { if (isHere(ch)) host.fileChanged(ch.path); kept.remove(keptId(ch.runId, ch.path)) }
             saveKept(ctx, Api.folder, kept)
             host.refreshTree()
             load()

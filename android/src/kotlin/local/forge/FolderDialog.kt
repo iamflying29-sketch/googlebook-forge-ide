@@ -65,11 +65,13 @@ internal fun glyphButton(ctx: Context, glyph: String, description: String, onCli
  */
 object FolderDialog {
     /** [onAdd], when given, adds an "Add to this window" button (several folders in one window, like Cursor). */
-    fun show(activity: Activity, onOpen: (String) -> Unit, onNewWindow: (String) -> Unit, onAdd: ((String) -> Unit)? = null) {
-        Browser(activity, onOpen, onNewWindow, onAdd).show()
+    /** [addMode]: the dialog is "Add a folder to this window": its main button (and Enter) adds the folder ([onOpen] is
+     *  the add then), and there is no button that would replace this window's folder. */
+    fun show(activity: Activity, onOpen: (String) -> Unit, onNewWindow: (String) -> Unit, onAdd: ((String) -> Unit)? = null, addMode: Boolean = false) {
+        Browser(activity, onOpen, onNewWindow, if (addMode) null else onAdd, addMode).show()
     }
 
-    private class Browser(val activity: Activity, val onOpen: (String) -> Unit, val onNewWindow: (String) -> Unit, val onAdd: ((String) -> Unit)?) {
+    private class Browser(val activity: Activity, val onOpen: (String) -> Unit, val onNewWindow: (String) -> Unit, val onAdd: ((String) -> Unit)?, val addMode: Boolean = false) {
         private val dialog: Dialog
         private val pathField: EditText = Ui.input(activity, "/path/to/folder", mono = true)
         private val crumbs = LinearLayout(activity)
@@ -89,7 +91,7 @@ object FolderDialog {
             root.layoutParams = ViewGroup.LayoutParams(Ui.match, Ui.wrap)
 
             // Header: title and the close glyph, like .dm-head.
-            val title = Ui.text(c, "Open folder", 14f, Ui.fg, bold = true)
+            val title = Ui.text(c, if (addMode) "Add a folder to this window" else "Open folder", 14f, Ui.fg, bold = true)
             title.layoutParams = Ui.lp(0, Ui.wrap, 1f)
             val head = Ui.row(c, title, glyphButton(c, "✕", "Close") { dialog.dismiss() })
             head.setPadding(Ui.dp(c, 12), Ui.dp(c, 8), Ui.dp(c, 8), Ui.dp(c, 8))
@@ -116,7 +118,7 @@ object FolderDialog {
                 val typed = pathField.text.toString().trim()
                 if (!has && typed.isNotEmpty() && typed != shownPath) load(typed)
             }
-            val openBtn = Ui.button(c, "Open this folder", primary = true) { openTyped(false) }
+            val openBtn = Ui.button(c, if (addMode) "Add to this window" else "Open this folder", primary = true) { openTyped(false) }
             val newBtn = Ui.button(c, "New window here") { openTyped(true) }
             newBtn.tooltipText = "Open this folder in a new window"
             val pathRow = Ui.row(c, pathField, gap(c, 8), openBtn, gap(c, 8), newBtn)
@@ -158,7 +160,7 @@ object FolderDialog {
                 foot.addView(add); foot.addView(gap(c, 8))
             }
             foot.addView(Ui.button(c, "New window here") { openTyped(true) }); foot.addView(gap(c, 8))
-            foot.addView(Ui.button(c, "Open this folder", primary = true) { openTyped(false) })
+            foot.addView(Ui.button(c, if (addMode) "Add to this window" else "Open this folder", primary = true) { openTyped(false) })
             foot.setPadding(Ui.dp(c, 12), Ui.dp(c, 8), Ui.dp(c, 12), Ui.dp(c, 10))
             root.addView(foot)
 

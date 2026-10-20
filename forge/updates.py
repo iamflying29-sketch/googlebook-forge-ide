@@ -129,6 +129,32 @@ def _overrides() -> Dict[str, dict]:
         return {}
 
 
+BUILD_KEYS = ("KIND", "SYS_FILE", "VEN_FILE", "SYS_SUM", "VEN_SUM", "SUM_ALGO", "ARCH_OVERRIDE", "SDK_OVERRIDE", "BASE_OVERRIDE",
+              "KEEP_ETC_OVERRIDE", "DESC_OVERRIDE", "IMG_SUFFIX", "GOOGLE_PKG_OVERRIDE", "VENDOR_IMAGE_OVERRIDE")
+
+
+def _save_build(version: str, env: Optional[Dict[str, str]]) -> None:
+    """Records how bin/forge-vd-image builds a version now (its "build" recipe in the overrides file), so the script
+    run by hand, or by Download, builds the same image Forge installed. FORCE is your choice, so it is not kept."""
+    rec = {k: str(v) for k, v in (env or {}).items() if k in BUILD_KEYS}
+    if not rec:
+        return
+    ov = _overrides()
+    ov.setdefault("build", {}).setdefault(version, {}).update(rec)
+    _save_overrides(ov)
+
+
+def _has_build(version: str) -> bool:
+    return bool((_overrides().get("build") or {}).get(version))
+
+
+def _listdir(path: str) -> List[str]:
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
 def _save_overrides(data: Dict[str, dict]) -> None:
     os.makedirs(VD_DIR, exist_ok=True)
     with open(OVERRIDES + ".new", "w", encoding="utf-8") as fh:
@@ -240,6 +266,7 @@ def _check_waydroid(present: set) -> Dict[str, dict]:
         systems = feeds[("system", rec["arch"])]
         vendors = feeds[("vendor", rec["arch"])]
         inst = _load()["installed"].get(v) or {}
+        by_forge = bool(inst)   # an update Forge installed (the first build of a version is the script's own recipe)
         if not inst and info["image"] in present:
             c = _podman_comment(info["image"])
             m = re.search(r"(VANILLA|GAPPS) (\d{8})", c); mv = re.search(r"vendor (\d{8})", c)
@@ -247,6 +274,13 @@ def _check_waydroid(present: set) -> Dict[str, dict]:
         major = rec["lineage"].split(".")[0]
         same = sorted([f for f in systems if f["major"] == major and f["variant"] == rec["variant"]], key=lambda f: f["date"])
         vsame = sorted([f for f in vendors if f["major"] == major and f["variant"] == "MAINLINE"], key=lambda f: f["date"])
+        if by_forge and not _has_build(v):
+            # Installed before Forge recorded build recipes: the feed's entries for the installed files give their
+            # names and MD5 sums, so bin/forge-vd-image builds what is installed.
+            s = next((f for f in same if f["date"] == str(inst.get("system"))), None)
+            vv = next((f for f in vsame if f["date"] == str(inst.get("vendor"))), None)
+            if s and vv:
+                _save_build(v, _waydroid_env(v, rec, s, vv))
         res: Dict[str, object] = {"installed": (f"system {inst.get('system')}, vendor {inst.get('vendor')}" if inst else "not downloaded"),
                                   "source": f"WayDroid-ATV LineageOS {rec['lineage']} {rec['variant']} for {rec['arch']}"}
         if inst and same and vsame and (same[-1]["date"] > str(inst.get("system", "")) or vsame[-1]["date"] > str(inst.get("vendor", ""))):
@@ -309,10 +343,16 @@ def _check_google(present: set, gate: Callable[[], Optional[str]], tags: Optiona
     for v, info in VERSIONS.items():
         if info.get("backend") != "google":
             continue
-        pkg = GOOGLE_PKG.get(v) or str(info.get("google_pkg", ""))
+        # The built-in versions' packages, or an upgraded version's own (kept in its "google" recipe).
+        pkg = GOOGLE_PKG.get(v) or str(info.get("google_pkg") or (info.get("google") or {}).get("pkg") or "")
         kind = pkg.split(";")[2] if pkg.count(";") >= 3 else ""
         api_m = re.search(r"android-(\d+)", pkg)
         api = int(api_m.group(1)) if api_m else 0
+        if v in GOOGLE_PKG and (_load()["installed"].get(v) or {}) and not _has_build(v):
+            # Updated before Forge recorded build recipes: each update unpacked into a dated folder next to the first.
+            dates = sorted(m.group(1) for m in (re.match(r"^img-\d{8}-(\d{8})$", n) for n in _listdir(os.path.join(VD_DIR, v))) if m)
+            if dates:
+                _save_build(v, {"IMG_SUFFIX": "-" + dates[-1]})
         res: Dict[str, object] = {"installed": (f"revision {installed[pkg]}" if pkg in installed else "not downloaded"), "source": "Google's SDK repository, " + pkg}
         if err:
             res["error"] = err
@@ -509,12 +549,14 @@ def _plan(version: str, kind: str) -> Tuple[Optional[List[str]], Optional[Dict[s
         if backend == "waydroid":
             w = entry["waydroid"]
             env = _waydroid_env(newid, w, item["system"], item["vendor"])
+            _save_build(newid, env)   # a new version: Download and the script need its recipe even if this build fails
             return [os.path.join(BIN, "forge-vd-image"), newid], env, target, lambda: _record(target, f"system {item['system']['date']}, vendor {item['vendor']['date']}",
                                                                                                    {"system": item["system"]["date"], "vendor": item["vendor"]["date"], "lineage": w["lineage"]}), ""
         if backend == "google":
             g = entry["google"]
             env = {"KIND": "google", "GOOGLE_PKG_OVERRIDE": g["pkg"], "SDK_OVERRIDE": str(g["sdk"]), "VENDOR_IMAGE_OVERRIDE": g["vendor_image"],
                    "BASE_OVERRIDE": os.path.join(VD_DIR, g["base"]), "IMG_SUFFIX": "-" + time.strftime("%Y%m%d"), "DESC_OVERRIDE": entry["detail"]}
+            _save_build(newid, env)
             return [os.path.join(BIN, "forge-vd-image"), newid], env, target, lambda: _record(target, g["pkg"]), ""
         if backend == "arm":
             return [os.path.join(BIN, "forge-arm-image"), newid], {}, target, lambda: _record(target, entry["zip"]), ""
@@ -527,13 +569,32 @@ def _plan(version: str, kind: str) -> Tuple[Optional[List[str]], Optional[Dict[s
         w = WAYDROID.get(version) or info.get("waydroid")
         env = _waydroid_env(version, w, item["system"], item["vendor"])
         env["FORCE"] = "1"
-        return [os.path.join(BIN, "forge-vd-image"), version], env, version, lambda: _record(version, f"system {item['system']['date']}, vendor {item['vendor']['date']}",
-                                                                                              {"system": item["system"]["date"], "vendor": item["vendor"]["date"], "lineage": w["lineage"]}), ""
+
+        def done_waydroid() -> None:
+            _record(version, f"system {item['system']['date']}, vendor {item['vendor']['date']}",
+                    {"system": item["system"]["date"], "vendor": item["vendor"]["date"], "lineage": w["lineage"]})
+            _save_build(version, env)
+        return [os.path.join(BIN, "forge-vd-image"), version], env, version, done_waydroid, ""
     if backend == "google":
         pkg = item["package"]
         env = {"FORCE": "1", "IMG_SUFFIX": "-" + time.strftime("%Y%m%d")}
-        cmd = ["bash", "-c", "set -e; JAVA_OPTS=-Xmx512m " + shlex.join([SDKMANAGER, f"--sdk_root={SDKROOT}", "--install", pkg]) + " </dev/null | tail -n 2; " + shlex.join([os.path.join(BIN, "forge-vd-image"), version])]
-        return cmd, env, version, lambda: _record(version, f"revision {item.get('revision', '?')}"), ""
+        # sdkmanager would replace the installed revision in place, so it is moved aside first and kept (nothing is
+        # deleted); when the install fails, it is put back.
+        pkg_dir = os.path.join(SDKROOT, *pkg.split(";"))
+        keep = os.path.join(VD_DIR, version, "sdk-kept-" + time.strftime("%Y%m%d%H%M%S"))
+        install = "JAVA_OPTS=-Xmx512m " + shlex.join([SDKMANAGER, f"--sdk_root={SDKROOT}", "--install", pkg]) + " </dev/null | tail -n 2"
+        script = (f"set -eo pipefail; moved=0; pkg={shlex.quote(pkg_dir)}; keep={shlex.quote(keep)}; "
+                  'if [ -d "$pkg" ]; then mkdir -p "$(dirname "$keep")"; mv -- "$pkg" "$keep"; moved=1; '
+                  'echo "Keeping the installed revision in $keep"; fi; '
+                  f"if ! {install}; then "
+                  'if [ "$moved" = 1 ] && [ ! -e "$pkg" ]; then mv -- "$keep" "$pkg"; echo "The installed revision was put back."; fi; '
+                  "echo 'sdkmanager could not install the new revision.'; exit 1; fi; "
+                  + shlex.join([os.path.join(BIN, "forge-vd-image"), version]))
+
+        def done_google() -> None:
+            _record(version, f"revision {item.get('revision', '?')}")
+            _save_build(version, env)
+        return ["bash", "-c", script], env, version, done_google, ""
     if backend == "arm":
         _set_arm_zip(version, item["zip"])
         return [os.path.join(BIN, "forge-arm-image"), version], {}, version, lambda: _record(version, item["zip"]), ""
@@ -677,16 +738,18 @@ def summary(present: Optional[set] = None) -> dict:
         present = vdevice.images() if vdevice.podman_available() else set()
     for v, r in res.items():
         label = (VERSIONS.get(v) or {}).get("label") or (armvm.BASE.get(v.split(":", 1)[1], {}).get("label", v) if v.startswith("base:") else v)
-        item = {"version": v, "label": label, "installed": r.get("installed", ""), "source": r.get("source", ""), "error": r.get("error", ""),
-                "upgrade_blocked": r.get("upgrade_blocked", "")}
+        # Texts are never null: the Android app reads them as text (Android's optString turns a null into "null").
+        item = {"version": v, "label": label or v, "installed": r.get("installed") or "", "source": r.get("source") or "",
+                "error": r.get("error") or "", "upgrade_blocked": r.get("upgrade_blocked") or ""}
         if r.get("update"):
-            item["update"] = {"label": r["update"]["label"], "size": r["update"].get("size", "")}
+            item["update"] = {"label": r["update"].get("label") or "", "size": r["update"].get("size") or ""}
         if r.get("upgrade"):
-            item["upgrade"] = {"label": r["upgrade"]["label"], "size": r["upgrade"].get("size", ""), "version": r["upgrade"]["version"],
+            item["upgrade"] = {"label": r["upgrade"].get("label") or "", "size": r["upgrade"].get("size") or "", "version": r["upgrade"]["version"],
                                "installed": _installed(r["upgrade"]["version"], present)}
         items.append(item)
-    return {"checked": st.get("checked", 0), "checking": _checking, "applying": _applying, "items": items, "errors": st.get("errors", []),
-            "log": (st.get("log") or [])[-6:], "available": sum(1 for i in items if i.get("update") or (i.get("upgrade") and not i["upgrade"]["installed"]))}
+    return {"checked": st.get("checked") or 0, "checking": _checking, "applying": _applying or "", "items": items,
+            "errors": [str(e) for e in (st.get("errors") or [])], "log": (st.get("log") or [])[-6:],
+            "available": sum(1 for i in items if i.get("update") or (i.get("upgrade") and not i["upgrade"]["installed"]))}
 
 
 def start_auto(settings: Callable[[], dict], gate: Callable[[], Optional[str]]) -> None:

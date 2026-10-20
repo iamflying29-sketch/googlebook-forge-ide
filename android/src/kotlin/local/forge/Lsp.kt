@@ -44,7 +44,9 @@ object Lsp {
                  val children: List<Symbol>, val path: String = "")
 
     /** A quick fix or refactoring offered by the server: either edits to apply, a command to run, or both. */
-    class CodeAction(val title: String, val kind: String, val preferred: Boolean, val edits: Map<String, List<TextEdit>>, val command: JSONObject?)
+    /** A quick fix. [raw] is kept for actions the server completes on demand (codeAction/resolve). */
+    class CodeAction(val title: String, val kind: String, val preferred: Boolean, val edits: Map<String, List<TextEdit>>, val command: JSONObject?,
+                     val raw: JSONObject? = null)
 
     /** The names of symbol kinds, by the protocol's numbers (index 0 is unused). */
     val symbolKindNames = arrayOf("", "file", "module", "namespace", "package", "class", "method", "property", "field", "constructor",
@@ -56,23 +58,29 @@ object Lsp {
         "unit", "value", "enum", "keyword", "snippet", "color", "file", "reference", "folder", "enum member", "constant", "struct", "event",
         "operator", "type parameter")
 
-    /** False when the "lsp" setting is off; then no server is ever started. */
-    @Volatile var enabled = true
+    /** False when the "lsp" setting is off for a folder; then no server of that folder is started or used. */
+    fun enabled(folder: String = root): Boolean = ForgeSettings.bool("lsp", true, folder)
 
-    /** The absolute path of the window's folder, resolved from GET /api/roots before the first server starts. */
-    @Volatile var root: String = ""
+    /** The folder of the window that is in front (each window sets Api.folder when it comes to the front). Every
+     *  folder has its own language servers, so two windows on two folders never share one. */
+    val root: String get() = Api.currentFolder()
 
-    /** The last diagnostics of every file (path to list), for the Problems panel and the editor decorations. */
-    val diagnostics = LinkedHashMap<String, List<Diagnostic>>()
+    /** The last diagnostics of every file, per folder (folder to path to list), for the Problems panel and the editor
+     *  decorations. */
+    private val diagByRoot = HashMap<String, LinkedHashMap<String, List<Diagnostic>>>()
+    fun diagnosticsOf(folder: String): LinkedHashMap<String, List<Diagnostic>> = diagByRoot.getOrPut(folder) { LinkedHashMap() }
+    /** The diagnostics of the window in front. */
+    val diagnostics: LinkedHashMap<String, List<Diagnostic>> get() = diagnosticsOf(root)
 
-    /** Called on the main thread with every diagnostics update of one file. */
-    val listeners = ArrayList<(String, List<Diagnostic>) -> Unit>()
+    /** Called on the main thread with every diagnostics update of one file: (folder, path, list). */
+    val listeners = ArrayList<(String, String, List<Diagnostic>) -> Unit>()
 
-    /** Applies a workspace edit sent by a server (a rename, a code action): path to its edits. Set by the editor panel. */
-    var applyEdit: ((Map<String, List<TextEdit>>) -> Boolean)? = null
+    /** Applies a workspace edit sent by a server (a rename, a code action): path to its edits. Each window's editor
+     *  panel registers one for its folder. */
+    val applyEdit = HashMap<String, (Map<String, List<TextEdit>>) -> Boolean>()
 
-    /** A short note for the user, for example that a server refused to start for lack of memory. */
-    var notify: ((String) -> Unit)? = null
+    /** A short note for the user (for example that a server refused to start for lack of memory), per folder. */
+    val notify = HashMap<String, (String) -> Unit>()
 
     private val clients = HashMap<String, LspClient>()
     private val unavailable = HashSet<String>()
@@ -99,53 +107,75 @@ object Lsp {
         return byExtension[ext]
     }
 
-    /** The client for a file's language, started when needed; null when there is none or it is not to be started now. */
-    fun clientFor(path: String): LspClient? {
-        if (!enabled) return null
+    private fun clientKey(folder: String, key: String) = folder + "\u0000" + key
+
+    /** The client for a file's language in a folder (the window in front by default), started when needed; null when
+     *  there is none or it is not to be started now. */
+    fun clientFor(path: String, folder: String = root): LspClient? {
+        if (folder.isEmpty() || !enabled(folder)) return null
         val (key, _) = serverFor(path) ?: return null
         if (key in unavailable) return null
-        val existing = clients[key]
+        val existing = clients[clientKey(folder, key)]
         if (existing != null && !existing.dead) return existing
         if ((retryAfter[key] ?: 0L) > System.currentTimeMillis()) return null
-        val c = LspClient(key)
-        clients[key] = c
+        val c = LspClient(key, folder)
+        clients[clientKey(folder, key)] = c
         c.start()
         return c
     }
 
+    private fun running(path: String, folder: String = root): LspClient? = if (!enabled(folder)) null else clients[clientKey(folder, serverFor(path)?.first ?: return null)]?.takeIf { !it.dead }
+
+    /** Starts the server of a language in a folder now (the Extensions view's Start); [ext] is an extension it serves. */
+    fun startServer(key: String, ext: String, folder: String = root) {
+        unavailable.remove(key); retryAfter.remove(key)
+        clientFor("forge-start.$ext", folder)
+    }
+
+    /** Stops the server of a language in a folder; it starts again when a file of that language is opened. */
+    fun stopServer(key: String, folder: String = root) { clients.remove(clientKey(folder, key))?.stop() }
+
+    /** Stops every server of a folder (no window shows that folder any more). */
+    fun shutdownFolder(folder: String) {
+        val gone = clients.filterKeys { it.startsWith(folder + "\u0000") }
+        for ((k, c) in gone) { c.stop(); clients.remove(k) }
+        diagByRoot.remove(folder)
+    }
+
     /** A line for the status display per running server. */
-    fun status(): List<String> = clients.values.filter { !it.dead }.map { it.key + ": " + (if (it.ready) "ready" else "starting") + (if (it.mode.isNotEmpty()) " (" + it.mode + ")" else "") }
+    fun status(folder: String = root): List<String> = clients.values.filter { !it.dead && it.folder == folder }.map { it.key + ": " + (if (it.ready) "ready" else "starting") + (if (it.mode.isNotEmpty()) " (" + it.mode + ")" else "") }
 
     /** Stops the server of a file's language; the next open of such a file starts a fresh one. */
-    fun restart(path: String) {
+    fun restart(path: String, folder: String = root) {
         val (key, _) = serverFor(path) ?: return
         unavailable.remove(key); retryAfter.remove(key)
-        clients.remove(key)?.stop()
+        clients.remove(clientKey(folder, key))?.stop()
     }
 
     fun shutdownAll() { for (c in clients.values) c.stop(); clients.clear() }
 
     // ---------------------------------------------------------------- documents
-    fun open(path: String, text: String) {
-        val c = clientFor(path) ?: return
+    fun open(path: String, text: String, folder: String = root) {
+        val c = clientFor(path, folder) ?: return
         val languageId = serverFor(path)?.second ?: return
         c.whenReady { c.didOpen(path, languageId, text) }
     }
 
     /** The whole text after a change; sent 250 ms after the last call, like the old page. */
-    fun change(path: String, text: String) { clients[serverFor(path)?.first ?: return]?.let { if (!it.dead) it.changed(path, text) } }
-    fun save(path: String) { clients[serverFor(path)?.first ?: return]?.let { if (!it.dead) it.didSave(path) } }
-    fun close(path: String) {
-        clients[serverFor(path)?.first ?: return]?.let { if (!it.dead) it.didClose(path) }
-        publish(path, emptyList())
+    fun change(path: String, text: String, folder: String = root) { running(path, folder)?.changed(path, text) }
+    fun save(path: String, folder: String = root) { running(path, folder)?.didSave(path) }
+    fun close(path: String, folder: String = root) {
+        running(path, folder)?.didClose(path)
+        publish(folder, path, emptyList())
     }
 
     /** A file that was renamed: the old document closes, the new one opens. */
-    fun moved(oldPath: String, newPath: String, text: String) { close(oldPath); open(newPath, text) }
+    fun moved(oldPath: String, newPath: String, text: String, folder: String = root) { close(oldPath, folder); open(newPath, text, folder) }
 
-    internal fun publish(path: String, list: List<Diagnostic>) {
-        if (list.isEmpty()) { if (diagnostics.remove(path) == null) return } else diagnostics[path] = list
-        for (l in listeners.toList()) try { l(path, list) } catch (e: Exception) { Log.w(TAG, "diagnostics listener", e) }
+    internal fun publish(folder: String, path: String, list: List<Diagnostic>) {
+        val m = diagnosticsOf(folder)
+        if (list.isEmpty()) { if (m.remove(path) == null) return } else m[path] = list
+        for (l in listeners.toList()) try { l(folder, path, list) } catch (e: Exception) { Log.w(TAG, "diagnostics listener", e) }
     }
 
     internal fun markUnavailable(key: String, memory: Boolean) {
@@ -157,13 +187,13 @@ object Lsp {
         if (seg.isEmpty()) seg else URLEncoder.encode(seg, "UTF-8").replace("+", "%20").replace("%7E", "~").replace("%2A", "*").replace("%40", "@").replace("%2B", "+")
     }
 
-    fun uriFor(path: String): String = "file://" + encodePath(if (path.startsWith("/")) path else root.trimEnd('/') + "/" + path)
+    fun uriFor(path: String, folder: String = root): String = "file://" + encodePath(if (path.startsWith("/")) path else folder.trimEnd('/') + "/" + path)
 
-    fun pathFor(uri: String): String {
+    fun pathFor(uri: String, folder: String = root): String {
         var p = uri
         if (p.startsWith("file://")) p = p.substring(7)
         p = try { URLDecoder.decode(p.replace("+", "%2B"), "UTF-8") } catch (e: Exception) { p }
-        val r = root.trimEnd('/')
+        val r = folder.trimEnd('/')
         if (r.isNotEmpty() && p.startsWith("$r/")) return p.substring(r.length + 1)
         return p
     }
@@ -199,9 +229,15 @@ object Lsp {
         return TextEdit(s.optInt("line"), s.optInt("character"), e.optInt("line"), e.optInt("character"), o.optString("newText"))
     }
 
-    /** A WorkspaceEdit as path to edits; file creations, renames and deletions inside it are not applied. */
+    /** A file operation of a workspace edit: "create", "rename" (to [newPath]) or "delete". */
+    class FileOp(val kind: String, val path: String, val newPath: String = "")
+
+    /** A workspace edit: path to text edits, plus the file operations it asks for first (a rename that moves a file). */
+    class EditMap : LinkedHashMap<String, MutableList<TextEdit>>() { val ops = ArrayList<FileOp>() }
+
+    /** A WorkspaceEdit as path to edits, with its file creations, renames and deletions in [EditMap.ops]. */
     fun parseWorkspaceEdit(we: JSONObject?): Map<String, List<TextEdit>> {
-        val out = LinkedHashMap<String, ArrayList<TextEdit>>()
+        val out = EditMap()
         we ?: return out
         fun add(uri: String, arr: JSONArray?) {
             arr ?: return
@@ -212,6 +248,11 @@ object Lsp {
         we.optJSONArray("documentChanges")?.let { dc ->
             for (i in 0 until dc.length()) {
                 val d = dc.optJSONObject(i) ?: continue
+                when (d.optString("kind")) {
+                    "create" -> { out.ops.add(FileOp("create", pathFor(d.optString("uri")))); continue }
+                    "rename" -> { out.ops.add(FileOp("rename", pathFor(d.optString("oldUri")), pathFor(d.optString("newUri")))); continue }
+                    "delete" -> { out.ops.add(FileOp("delete", pathFor(d.optString("uri")))); continue }
+                }
                 val td = d.optJSONObject("textDocument") ?: continue
                 add(td.optString("uri"), d.optJSONArray("edits"))
             }
@@ -236,6 +277,57 @@ object Lsp {
     }
 
     fun docOf(d: Any?): String = when (d) { is String -> d; is JSONObject -> d.optString("value"); else -> "" }
+
+    /** A tab stop of a snippet: its number (0 is the final cursor place) and where its text is in the plain text. */
+    class SnippetStop(val index: Int, val start: Int, val end: Int)
+
+    /**
+     * Snippet syntax to plain text and its tab stops, so the editor can move through them with Tab as Cursor does:
+     * `${1:name}` becomes name (stop 1 covers it), `$1` and `${2}` are empty stops, `${1|a,b|}` takes its first choice,
+     * variables like `$TM_FILENAME` are left empty, and `\$`, `\}` and `\\` are the characters themselves.
+     */
+    fun parseSnippet(s: String): Pair<String, List<SnippetStop>> {
+        val out = StringBuilder()
+        val stops = ArrayList<SnippetStop>()
+        fun parse(from: Int, inBraces: Boolean): Int {
+            var i = from
+            while (i < s.length) {
+                val c = s[i]
+                if (c == '\\' && i + 1 < s.length) { out.append(s[i + 1]); i += 2; continue }
+                if (inBraces && c == '}') return i + 1
+                if (c == '$' && i + 1 < s.length) {
+                    val n = s[i + 1]
+                    if (n.isDigit()) {
+                        var j = i + 1
+                        while (j < s.length && s[j].isDigit()) j++
+                        stops.add(SnippetStop(s.substring(i + 1, j).toInt(), out.length, out.length)); i = j; continue
+                    }
+                    if (n == '{') {
+                        var j = i + 2
+                        while (j < s.length && (s[j].isLetterOrDigit() || s[j] == '_')) j++
+                        val name = s.substring(i + 2, j)
+                        val number = if (name.isNotEmpty() && name.all { it.isDigit() }) name.toInt() else -1
+                        when (if (j < s.length) s[j] else ' ') {
+                            '}' -> { if (number >= 0) stops.add(SnippetStop(number, out.length, out.length)); i = j + 1; continue }
+                            ':' -> { val begin = out.length; i = parse(j + 1, true); if (number >= 0) stops.add(SnippetStop(number, begin, out.length)); continue }
+                            '|' -> {
+                                val close = s.indexOf("|}", j + 1).let { if (it < 0) s.length else it }
+                                val begin = out.length
+                                out.append(s.substring(j + 1, close).split(',').firstOrNull() ?: "")
+                                if (number >= 0) stops.add(SnippetStop(number, begin, out.length))
+                                i = (close + 2).coerceAtMost(s.length); continue
+                            }
+                        }
+                    }
+                    if (n.isLetter() || n == '_') { var j = i + 1; while (j < s.length && (s[j].isLetterOrDigit() || s[j] == '_')) j++; i = j; continue }
+                }
+                out.append(c); i++
+            }
+            return i
+        }
+        parse(0, false)
+        return out.toString() to stops
+    }
 
     /** Snippet syntax to plain text: `${1:name}` becomes name, `$1` and `${2}` vanish, `\$` becomes `$`. */
     fun plainSnippet(s: String): String {
@@ -272,7 +364,7 @@ object Lsp {
  * was told about, pull diagnostics for servers that only answer when asked (the Kotlin server), and the requests of
  * the editor (completion, hover, signature help, definition, references, rename).
  */
-class LspClient(val key: String) {
+class LspClient(val key: String, val folder: String) {
     private val TAG = "ForgeLsp"
     private class Pending(val cb: (Any?, String?) -> Unit, val timeout: Runnable)
     private class Doc(var version: Int) { var text = ""; var flush: Runnable? = null; var pull: Runnable? = null; var resultId = ""; var pulling = false; var pullAgain = false }
@@ -302,18 +394,12 @@ class LspClient(val key: String) {
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8").replace("+", "%20")
 
     fun start() {
-        if (Lsp.root.isNotEmpty()) { connect(); return }
-        Api.async("roots", { Api.get("/api/roots") }) { r, e ->
-            val primary = r?.optString("primary", "") ?: ""
-            if (primary.isNotEmpty()) Lsp.root = primary
-            else if (Api.folder.isNotEmpty()) Lsp.root = Api.folder
-            if (Lsp.root.isEmpty()) { fail("The window's folder is unknown (" + (e?.message ?: "no answer") + "), so no language server was started.", false); return@async }
-            connect()
-        }
+        if (folder.isEmpty()) { fail("The window's folder is unknown, so no language server was started.", false); return }
+        connect()
     }
 
     private fun connect() {
-        val path = "/ws/lsp?lang=" + enc(key) + "&folder=" + enc(Lsp.root)
+        val path = "/ws/lsp?lang=" + enc(key) + "&folder=" + enc(folder)
         val client = Api.WebSocketClient(path, { onText(it) }, { why -> onClosed(why) })
         ws = client
         client.connect()
@@ -322,7 +408,7 @@ class LspClient(val key: String) {
     private fun fail(message: String, memory: Boolean) {
         Log.w(TAG, "$key: $message")
         Lsp.markUnavailable(key, memory)
-        Lsp.notify?.invoke(if (memory) "$message Code intelligence for this language starts when you reopen the file with more memory free." else message)
+        Lsp.notify[folder]?.invoke(if (memory) "$message Code intelligence for this language starts when you reopen the file with more memory free." else message)
         dead = true
         ready = false
         finishAll("language server unavailable")
@@ -334,7 +420,7 @@ class LspClient(val key: String) {
         Log.w(TAG, "$key language server closed: $why")
         dead = true; ready = false
         finishAll("language server closed")
-        for (p in docs.keys.toList()) Lsp.publish(p, emptyList())
+        for (p in docs.keys.toList()) Lsp.publish(folder, p, emptyList())
         docs.clear()
     }
 
@@ -351,7 +437,7 @@ class LspClient(val key: String) {
         finishAll("language server stopped")
         try { send(JSONObject().put("id", ++seq).put("method", "shutdown")) } catch (e: Exception) { }
         ws?.close(); ws = null
-        for (p in docs.keys.toList()) Lsp.publish(p, emptyList())
+        for (p in docs.keys.toList()) Lsp.publish(folder, p, emptyList())
         docs.clear()
     }
 
@@ -398,7 +484,7 @@ class LspClient(val key: String) {
         when (method) {
             "textDocument/publishDiagnostics" -> msg.optJSONObject("params")?.let { onDiagnostics(it.optString("uri"), it.optJSONArray("diagnostics")) }
             "window/logMessage" -> msg.optJSONObject("params")?.let { if (it.optInt("type", 4) == 1) Log.w(TAG, key + ": " + it.optString("message")) }
-            "window/showMessage" -> msg.optJSONObject("params")?.let { if (it.optInt("type", 4) <= 2) Lsp.notify?.invoke(key + ": " + it.optString("message")) }
+            "window/showMessage" -> msg.optJSONObject("params")?.let { if (it.optInt("type", 4) <= 2) Lsp.notify[folder]?.invoke(key + ": " + it.optString("message")) }
         }
     }
 
@@ -410,7 +496,7 @@ class LspClient(val key: String) {
                 "workspace/workspaceFolders" -> result = JSONArray().put(folderObject())
                 "workspace/applyEdit" -> {
                     val edits = Lsp.parseWorkspaceEdit(params?.optJSONObject("edit"))
-                    val applied = Lsp.applyEdit?.invoke(edits) ?: false
+                    val applied = Lsp.applyEdit[folder]?.invoke(edits) ?: false
                     result = JSONObject().put("applied", applied)
                 }
                 "workspace/diagnostic/refresh" -> Api.main.postDelayed({ for ((p, _) in docs) pullSoon(p, 0) }, 300)
@@ -420,7 +506,7 @@ class LspClient(val key: String) {
         send(JSONObject().put("id", id).put("result", result))
     }
 
-    private fun folderObject(): JSONObject = JSONObject().put("uri", Lsp.uriFor(Lsp.root)).put("name", Lsp.root.trimEnd('/').substringAfterLast('/'))
+    private fun folderObject(): JSONObject = JSONObject().put("uri", Lsp.uriFor(folder, folder)).put("name", folder.trimEnd('/').substringAfterLast('/'))
 
     private fun initialize() {
         val formats = JSONArray().put("markdown").put("plaintext")
@@ -434,11 +520,12 @@ class LspClient(val key: String) {
             .put("references", JSONObject()).put("documentSymbol", JSONObject().put("hierarchicalDocumentSymbolSupport", true))
             .put("formatting", JSONObject()).put("rangeFormatting", JSONObject())
             .put("rename", JSONObject().put("prepareSupport", false))
-            .put("codeAction", JSONObject().put("codeActionLiteralSupport", JSONObject().put("codeActionKind", JSONObject().put("valueSet", JSONArray().put("quickfix").put("refactor").put("source")))))
+            .put("codeAction", JSONObject().put("codeActionLiteralSupport", JSONObject().put("codeActionKind", JSONObject().put("valueSet", JSONArray().put("quickfix").put("refactor").put("source"))))
+                .put("resolveSupport", JSONObject().put("properties", JSONArray().put("edit"))).put("dataSupport", true))
             .put("publishDiagnostics", JSONObject().put("relatedInformation", false))
             .put("diagnostic", JSONObject().put("dynamicRegistration", false).put("relatedDocumentSupport", false))
         val params = JSONObject()
-            .put("processId", JSONObject.NULL).put("rootUri", Lsp.uriFor(Lsp.root)).put("rootPath", Lsp.root)
+            .put("processId", JSONObject.NULL).put("rootUri", Lsp.uriFor(folder, folder)).put("rootPath", folder)
             .put("workspaceFolders", JSONArray().put(folderObject()))
             .put("clientInfo", JSONObject().put("name", "Forge IDE"))
             .put("capabilities", JSONObject().put("textDocument", td).put("workspace", JSONObject().put("applyEdit", true).put("workspaceFolders", true).put("configuration", true)
@@ -456,7 +543,7 @@ class LspClient(val key: String) {
     }
 
     // ---------------------------------------------------------------- documents
-    private fun textDocument(path: String): JSONObject = JSONObject().put("uri", Lsp.uriFor(path))
+    private fun textDocument(path: String): JSONObject = JSONObject().put("uri", Lsp.uriFor(path, folder))
 
     fun didOpen(path: String, languageId: String, text: String) {
         if (docs.containsKey(path)) { changed(path, text); return }
@@ -524,14 +611,14 @@ class LspClient(val key: String) {
             val o = r as? JSONObject
             if (o != null) {
                 o.optString("resultId", "").let { if (it.isNotEmpty()) d.resultId = it }
-                if (o.optString("kind") != "unchanged" && o.has("items")) onDiagnostics(Lsp.uriFor(path), o.optJSONArray("items"))
+                if (o.optString("kind") != "unchanged" && o.has("items")) onDiagnostics(Lsp.uriFor(path, folder), o.optJSONArray("items"))
             }
             if (d.pullAgain) { d.pullAgain = false; pullSoon(path, 300) }
         }
     }
 
     private fun onDiagnostics(uri: String, arr: JSONArray?) {
-        val path = Lsp.pathFor(uri)
+        val path = Lsp.pathFor(uri, folder)
         val out = ArrayList<Lsp.Diagnostic>()
         if (arr != null) for (i in 0 until arr.length()) {
             val d = arr.optJSONObject(i) ?: continue
@@ -542,7 +629,7 @@ class LspClient(val key: String) {
             out.add(Lsp.Diagnostic(s.optInt("line"), s.optInt("character"), e.optInt("line"), e.optInt("character"), d.optInt("severity", 1),
                 d.optString("message"), d.optString("source", key), if (code == null || code == JSONObject.NULL) "" else code.toString()))
         }
-        Lsp.publish(path, out)
+        Lsp.publish(folder, path, out)
     }
 
     // ---------------------------------------------------------------- the editor's requests (0-based positions)
@@ -595,7 +682,7 @@ class LspClient(val key: String) {
             if (o == null || !o.has("contents")) { cb(null); return@request }
             val md = Lsp.markdownOf(o.opt("contents"))
             if (md.isEmpty()) { cb(null); return@request }
-            val range = o.optJSONObject("range")?.let { Lsp.parseLocation(JSONObject().put("uri", Lsp.uriFor(path)).put("range", it)) }
+            val range = o.optJSONObject("range")?.let { Lsp.parseLocation(JSONObject().put("uri", Lsp.uriFor(path, folder)).put("range", it)) }
             cb(Lsp.Hover(md, range))
         }
     }
@@ -688,8 +775,10 @@ class LspClient(val key: String) {
                     val bare = x.opt("command") is String
                     val edits = if (bare) emptyMap() else Lsp.parseWorkspaceEdit(x.optJSONObject("edit"))
                     val cmd = if (bare) x else x.optJSONObject("command")
-                    if (edits.isEmpty() && cmd == null) continue
-                    out.add(Lsp.CodeAction(x.optString("title"), x.optString("kind", "quickfix"), x.optBoolean("isPreferred", false), edits, cmd))
+                    // An action without an edit or a command is completed by the server when chosen (codeAction/resolve).
+                    val lazy = edits.isEmpty() && cmd == null && !bare
+                    if (lazy && capability("codeActionProvider")?.optBoolean("resolveProvider") != true) continue
+                    out.add(Lsp.CodeAction(x.optString("title"), x.optString("kind", "quickfix"), x.optBoolean("isPreferred", false), edits, cmd, if (lazy) x else null))
                 }
             }
             cb(out.sortedByDescending { it.preferred }, null)
@@ -762,6 +851,16 @@ class LspClient(val key: String) {
                 }
             }
             cb(out, err)
+        }
+    }
+
+    /** Completes a quick fix the server sent without its edit (codeAction/resolve). */
+    fun resolveCodeAction(raw: JSONObject, cb: (Lsp.CodeAction?, String?) -> Unit) {
+        request("codeAction/resolve", raw, 10000) { r, err ->
+            val x = r as? JSONObject
+            if (err != null || x == null) { cb(null, err ?: "no answer"); return@request }
+            cb(Lsp.CodeAction(x.optString("title"), x.optString("kind", "quickfix"), x.optBoolean("isPreferred", false),
+                Lsp.parseWorkspaceEdit(x.optJSONObject("edit")), x.optJSONObject("command")), null)
         }
     }
 

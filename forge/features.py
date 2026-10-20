@@ -160,10 +160,22 @@ class Hooks:
 
     def __init__(self, data_dir: str):
         self.global_path = os.path.join(data_dir, "hooks.json")
+        # Decides whether a folder's own hooks may run (a cloned repository's hooks run only once you trust the folder).
+        self.trusted = lambda root: True
+
+    def project_hooks(self, root: str) -> Dict[str, list]:
+        """The hooks a folder's .forge/hooks.json asks for (whether or not they may run)."""
+        out: Dict[str, list] = {e: [] for e in self.EVENTS}
+        cfg = _load(os.path.join(root, ".forge", "hooks.json"), {})
+        if isinstance(cfg, dict):
+            for e in self.EVENTS:
+                out[e] = [h for h in cfg.get(e, []) or [] if isinstance(h, dict) and h.get("command")]
+        return out
 
     def config(self, root: str) -> Dict[str, list]:
         out: Dict[str, list] = {e: [] for e in self.EVENTS}
-        for path in (self.global_path, os.path.join(root, ".forge", "hooks.json")):
+        paths = [self.global_path] + ([os.path.join(root, ".forge", "hooks.json")] if self.trusted(root) else [])
+        for path in paths:
             cfg = _load(path, {})
             if isinstance(cfg, dict):
                 for e in self.EVENTS:
@@ -173,9 +185,16 @@ class Hooks:
         return out
 
     def run(self, root: str, event: str, payload: dict) -> dict:
-        """Run every hook for an event. The most restrictive answer wins: deny, then ask, then allow."""
+        """Run every hook for an event. The most restrictive answer wins: deny, then ask, then allow. Exit code 2 means
+        deny, whatever the hook printed (as in Cursor and Claude Code). A hook that fails or runs out of time counts as
+        "ask" before a command (you decide instead of the hook) and as allow elsewhere; output that is not JSON with
+        exit code 0 counts as allow."""
         result = {"permission": "allow", "messages": []}
         rank = {"allow": 0, "ask": 1, "deny": 2}
+
+        def at_least(p: str) -> None:
+            if rank[p] > rank[result["permission"]]:
+                result["permission"] = p
         for h in self.config(root).get(event, []):
             try:
                 env = dict(os.environ, FORGE_EVENT=event, FORGE_ROOT=root, FORGE_FILE=str(payload.get("path", "")),
@@ -184,12 +203,15 @@ class Hooks:
                                    capture_output=True, text=True, timeout=float(h.get("timeout", 10)), cwd=root, env=env)
             except (subprocess.TimeoutExpired, OSError) as e:
                 result["messages"].append(f"hook '{h['command'][:60]}' failed: {e}")
+                if event == "beforeShellExecution":
+                    at_least("ask")
                 continue
             out = (r.stdout or "").strip()
+            if r.returncode == 2:
+                at_least("deny")
+                result["messages"].append((r.stderr or out or "denied by a hook").strip()[:500])
+                continue
             if not out:
-                if r.returncode == 2:   # exit code 2 means deny, like Cursor and Claude Code hooks
-                    result["permission"] = "deny"
-                    result["messages"].append((r.stderr or "denied by a hook").strip()[:500])
                 continue
             try:
                 ans = json.loads(out.splitlines()[-1])
@@ -328,6 +350,12 @@ class Docs:
                 pages.append({"url": u, "title": title, "text": text[:60000]})
                 job["pages"] = len(pages)
                 time.sleep(0.3)   # be polite to the documentation site
+            if not pages:
+                # Nothing could be read (an address that answers with something else, a site that refuses bots):
+                # that is an error to show, not a ready index of nothing.
+                job["status"] = "error"
+                job["error"] = "No page could be read from this address. Check that it opens in a browser and shows HTML."
+                return
             chunks = []
             for i, pg in enumerate(pages):
                 t = pg["text"]
@@ -384,9 +412,68 @@ class Docs:
 
 
 # ====================================================================== @past chats and @folders
+def git_changes_context(root: str, max_chars: int = 12000) -> str:
+    """@git, as in Cursor: every uncommitted change of the folder's repository, staged or not (git diff HEAD), and the
+    new files git does not track yet with their text. Every git call has a time limit."""
+    def git(args: list, timeout: float = 20) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", root] + args, capture_output=True, text=True, timeout=timeout, errors="replace")
+    try:
+        inside = git(["rev-parse", "--is-inside-work-tree"], 10)
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return "(this folder is not inside a git repository)"
+        has_head = git(["rev-parse", "--verify", "-q", "HEAD"], 10).returncode == 0
+        # Without a first commit there is no HEAD to compare with: the staged files are the changes then.
+        diff = git(["diff", "HEAD" if has_head else "--cached", "--stat", "-p", "--no-color", "--", "."]).stdout
+        new = [f for f in git(["ls-files", "--others", "--exclude-standard", "--", "."]).stdout.splitlines() if f.strip()]
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return f"[git failed: {e}]"
+    out = ["```diff\n" + (diff.strip() or "(no changes to tracked files)") + "\n```"]
+    if new:
+        top = git(["rev-parse", "--show-toplevel"], 10).stdout.strip() or root
+        here = os.path.relpath(root, top)
+        shown = 0
+        out.append(f"New files that git does not track yet ({len(new)}):")
+        for f in new[:60]:
+            path = os.path.join(root, f if here == "." or not f.startswith(here + os.sep) else f[len(here) + 1:])
+            body = None
+            try:
+                if shown < 10 and os.path.getsize(path) <= 20000:
+                    with open(path, "rb") as fh:
+                        raw = fh.read(20001)
+                    if b"\x00" not in raw:
+                        body = raw.decode("utf-8", errors="replace")
+            except OSError:
+                body = None
+            if body is not None:
+                shown += 1
+                out.append(f"\n{f} (new file):\n```\n{body}\n```")
+            else:
+                out.append(f"- {f}")
+        if len(new) > 60:
+            out.append(f"... and {len(new) - 60} more new files")
+    text = "\n".join(out)
+    return text if len(text) <= max_chars else text[:max_chars] + "\n[... the rest of the changes is left out to fit the context ...]"
+
+
 def chat_context(session: dict, max_chars: int = 8000) -> str:
-    """The text of another chat: what was asked and answered, without tool output."""
+    """The text of another chat: what was asked and answered, without tool output. It comes from the chat's transcript
+    (what you saw), which a /reset, a model switch or trimming never shortens; chats without one use the model's
+    messages."""
     parts = [f"Chat '{session.get('title', '')}' (folder {session.get('workspace', '')}):"]
+    turns = session.get("transcript") or []
+    if turns:
+        for t in turns:
+            if not isinstance(t, dict):
+                continue
+            if t.get("role") == "user":
+                text = str(t.get("text", "")).strip()
+            elif t.get("role") == "assistant":
+                text = "\n".join(str(b.get("text", "")) for b in (t.get("blocks") or []) if isinstance(b, dict) and b.get("type") == "text").strip()
+            else:
+                continue
+            if text:
+                parts.append(f"{str(t.get('role')).upper()}: {text[:2000]}")
+        return "\n\n".join(parts)[-max_chars:]
     for m in session.get("messages", []):
         role = m.get("role")
         if role not in ("user", "assistant"):

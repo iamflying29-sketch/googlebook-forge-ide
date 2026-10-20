@@ -1,7 +1,8 @@
 """Forge IDE HTTP server (standard library only).
 
-Serves the web UI and a JSON API: files, search, agent runs streamed over Server-Sent Events,
-approvals, sessions, checkpoints, inline edit, completions, and a WebSocket terminal.
+Serves the native Forge app (and the forge-ide command) a JSON API: files, search, agent runs streamed over
+Server-Sent Events, approvals, sessions, checkpoints, inline edit, completions, and WebSockets for the terminal,
+the language servers, the debugger and the device screens. It answers only this VM's own loopback connections.
 """
 from __future__ import annotations
 
@@ -50,7 +51,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "verbose": False,
     "tool_mode": "prompt",
     "max_iterations": 30,
+    "render_whitespace": False,
     "auto_approve_commands": False,
+    "mcp_tool_protection": True,
     "external_file_protection": True,
     "semantic_index": True,
     "custom_modes": [],
@@ -82,7 +85,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "font_size": 13,
     "minimap": True,                     # the editor's minimap on the right of the code
     "preview_tabs": True,                # a single click in the Explorer opens a preview tab, as in Cursor
-    "theme": "forge-dark",
+    "skills_claude_codex": True,         # like Cursor, also load skills from Claude's and Codex's skill folders
     "workspace": os.path.expanduser("~/projects"),
     "recent_workspaces": [],
     # GPU engine: llama.cpp (Vulkan) running on the Android side inside the Forge app
@@ -108,8 +111,11 @@ GPU_MMPROJ = {
 # Machine-wide things (the engine, Ollama, the GPU engine, how long the model stays loaded) stay user settings.
 FOLDER_SETTING_KEYS = {"command_allowlist", "command_denylist", "vision", "model", "temperature", "top_p", "top_k", "repeat_penalty", "num_ctx", "num_predict", "thinking",
                        "verbose", "tool_mode", "max_iterations", "auto_approve_commands", "external_file_protection",
-                       "repo_map_chars", "tab_completions", "completion_delay_ms", "font_size", "minimap", "prewarm", "lsp",
-                       "semantic_index", "custom_modes", "kotlin_project_model"}
+                       "repo_map_chars", "tab_completions", "completion_delay_ms", "font_size", "minimap", "render_whitespace", "prewarm", "lsp",
+                       "semantic_index", "custom_modes", "kotlin_project_model", "mcp_tool_protection", "preview_tabs"}
+
+# Settings whose values must stay in a range (the memory checks count the context, but a huge one never fits).
+SETTING_RANGES = {"num_ctx": (2048, 32768), "gpu_ctx": (2048, 32768)}
 
 MODEL_LOAD_NEED_MB = 5800   # loading llama3.1 8B Q4_K_M needs about 5.2 GB plus headroom
 
@@ -188,6 +194,7 @@ class State:
         self.attachments = Attachments(os.path.join(DATA_DIR, "attachments"))
         self.memories = Memories(DATA_DIR)
         self.hooks = Hooks(DATA_DIR)
+        self.hooks.trusted = self.folder_trusted
         self.docs = Docs(DATA_DIR)
         from .semantic import EmbedServer, EMBED_MIN_VM_MB, EMBED_MIN_HOST_MB
         self.embed_server = EmbedServer(lambda: self.small_memory_block("the code index", EMBED_MIN_VM_MB, EMBED_MIN_HOST_MB),
@@ -230,18 +237,23 @@ class State:
         self.last_shrink = time.time()
         return out
 
-    def unload_model(self) -> None:
-        """Ask Ollama to drop every loaded model from memory right away (the main model frees about 5 GB)."""
+    def unload_model(self) -> List[str]:
+        """Ask Ollama to drop every loaded model from memory right away (the main model frees about 5 GB). Returns the
+        names it dropped."""
         names = []
         try:
             names = [m.get("name") for m in self.ollama.running() if m.get("name")]
         except OllamaError:
             pass
+        done = []
         for n in names or [self.resolve_model()]:
             try:
                 self.ollama._json("POST", "/api/generate", {"model": n, "keep_alive": 0}, timeout=30)
+                if n in names:
+                    done.append(n)
             except OllamaError:
                 pass
+        return done
 
     def _memory_watchdog(self) -> None:
         """If the VM runs out of memory the host kills it (seen 2026-10-14). Before that happens, stop runs and
@@ -320,6 +332,25 @@ class State:
 
     def active_engine(self) -> str:
         return "gpu" if self.settings.get("engine") == "gpu" else "ollama"
+
+    @staticmethod
+    def pretty_model_name(name: str) -> str:
+        """A model's name as people say it: "qwen3.5:4b" is "Qwen3.5 4B", forge-coder is the tuned Llama 3.1 8B."""
+        n = str(name or "").replace(":latest", "").strip()
+        known = {"forge-coder": "Llama 3.1 8B (forge-coder)", "llama3.1": "Llama 3.1 8B", "llama3.1:8b": "Llama 3.1 8B"}
+        if n in known:
+            return known[n]
+        base, _, size = n.partition(":")
+        base = base[:1].upper() + base[1:]
+        if re.fullmatch(r"\d+(\.\d+)?b", size):
+            size = size.upper()
+        return (base + " " + size).strip() or "the model"
+
+    def chat_model_label(self, engine: Optional[str] = None, model: Optional[str] = None) -> str:
+        """How the chat names the model that answers, with where it runs."""
+        if (engine or self.active_engine()) == "gpu":
+            return self.pretty_model_name(str(self.settings.get("gpu_model") or "forge-coder")) + " (Intel GPU)"
+        return self.pretty_model_name(model or self.resolve_model(self.settings.get("model"))) + " (CPU)"
 
     def client_for(self, engine: Optional[str] = None):
         engine = engine or self.active_engine()
@@ -423,6 +454,52 @@ class State:
     def folder_settings_path(root: str) -> str:
         return os.path.join(root, ".forge", "settings.json")
 
+    # ---------------------------------------------------------------- folder trust (Cursor and VS Code's workspace trust)
+    # A folder's own .forge/settings.json may make these safer, but it may loosen them only once you trust the folder:
+    # a cloned repository must not turn on Auto-run, allow commands, turn off a protection or run its own hooks.
+    TIGHTEN_ONLY = {"auto_approve_commands": False, "external_file_protection": True, "mcp_tool_protection": True}
+
+    def _trust_path(self) -> str:
+        return os.path.join(DATA_DIR, "trusted-folders.json")
+
+    def folder_trusted(self, root: Optional[str]) -> bool:
+        if not root:
+            return False
+        d = _load_json(self._trust_path(), {})
+        return isinstance(d, dict) and bool(d.get(os.path.realpath(root)))
+
+    def set_folder_trust(self, root: str, trusted: bool) -> None:
+        d = _load_json(self._trust_path(), {})
+        d = d if isinstance(d, dict) else {}
+        key = os.path.realpath(root)
+        if trusted:
+            d[key] = time.time()
+        else:
+            d.pop(key, None)
+        _save_json(self._trust_path(), d)
+
+    def untrusted_wants(self, root: Optional[str]) -> List[str]:
+        """What this folder's own settings and hooks ask for that is held back until you trust the folder, in words."""
+        if not root or self.folder_trusted(root):
+            return []
+        fo = self.folder_overrides(root)
+        out = []
+        if fo.get("auto_approve_commands") is True:
+            out.append("run the agent's commands without asking (Auto-run)")
+        if fo.get("command_allowlist"):
+            out.append("allow these commands without asking: " + ", ".join(str(x) for x in fo["command_allowlist"])[:300])
+        if fo.get("external_file_protection") is False:
+            out.append("turn off external-file protection")
+        if fo.get("mcp_tool_protection") is False:
+            out.append("turn off MCP tools protection")
+        if any(isinstance(m, dict) and m.get("auto_run") for m in (fo.get("custom_modes") or [])):
+            out.append("custom modes that run commands without asking")
+        hooks = self.hooks.project_hooks(root)
+        for ev, hs in hooks.items():
+            for h in hs:
+                out.append(f"run a hook on {ev}: {str(h.get('command'))[:120]}")
+        return out
+
     def folder_overrides(self, root: Optional[str]) -> Dict[str, Any]:
         if not root:
             return {}
@@ -431,16 +508,31 @@ class State:
 
     def effective_settings(self, root: Optional[str] = None) -> Dict[str, Any]:
         s = dict(self.settings)
-        s.update(self.folder_overrides(root))
+        trusted = self.folder_trusted(root)
+        for k, v in self.folder_overrides(root).items():
+            if k == "command_denylist":
+                # A folder adds to your denylist; it never shortens it.
+                s[k] = list(dict.fromkeys([str(x) for x in (self.settings.get(k) or [])] + [str(x) for x in (v or [])]))
+                continue
+            if not trusted:
+                if k in self.TIGHTEN_ONLY and bool(v) != self.TIGHTEN_ONLY[k]:
+                    continue
+                if k == "command_allowlist":
+                    continue
+                if k == "custom_modes" and isinstance(v, list):
+                    v = [{**m, "auto_run": False} for m in v if isinstance(m, dict)]
+            s[k] = v
         return s
 
     def settings_payload(self, root: str) -> Dict[str, Any]:
-        return {"effective": self.effective_settings(root), "user": self.settings, "folder": self.folder_overrides(root),
-                "folder_keys": sorted(FOLDER_SETTING_KEYS), "folder_path": root}
+        user = {k: v for k, v in self.settings.items() if k != "gpu_engine_key"}   # the engine's key never leaves the VM
+        return {"effective": {k: v for k, v in self.effective_settings(root).items() if k != "gpu_engine_key"}, "user": user,
+                "folder": self.folder_overrides(root), "folder_keys": sorted(FOLDER_SETTING_KEYS), "folder_path": root,
+                "trust": {"trusted": self.folder_trusted(root), "held_back": self.untrusted_wants(root)}}
 
     def new_session(self, title: str = "New chat", folder: Optional[str] = None, sid: str = "") -> dict:
         s = {"id": sid if re.fullmatch(r"[0-9a-f]{10}", sid or "") else uuid.uuid4().hex[:10], "title": title, "workspace": folder or self.workspace.root, "created": time.time(),
-             "updated": time.time(), "messages": [], "transcript": [], "auto_approve": False}
+             "updated": time.time(), "messages": [], "transcript": [], "allow": []}
         self.sessions[s["id"]] = s
         self.save_session(s)
         return s
@@ -467,8 +559,10 @@ class State:
             fb = self.settings.get("fallback_model", "llama3.1")
             if fb in names or (fb + ":latest") in names:
                 return fb
-            if names:
-                return sorted(n for n in names if n)[0]
+            # Neither is installed: the first model that can chat (vision and embedding models cannot).
+            chat = sorted(n for n in names if n and not re.search(r"vl|embed", n, re.I))
+            if chat:
+                return chat[0]
         except OllamaError:
             pass
         return want
@@ -490,13 +584,17 @@ class State:
         except ValueError:
             return
         settings = self.settings_for_run(ws.root)
-        if not settings.get("prewarm", True) or self.memory_block_reason(settings["model"]):
+        if not settings.get("prewarm", True) or self.memory_block_reason(settings["model"], ctx=settings.get("num_ctx")):
             return
 
         def go() -> None:
             try:
                 client = self.client_for()
                 agent = Agent(client, ws, settings, session)
+                # With the server state, so the warmed prompt is the one a message really sends (memories, skills,
+                # docs, toolchains and the window's other folders included); otherwise the cache would not match.
+                agent.state = self
+                agent.vision = self.vision
                 system = agent._system_prompt("agent")
                 msgs = [{"role": "system", "content": system}, {"role": "user", "content": "Reply with the single word ready."}]
                 for _ in client.chat_stream(settings["model"], msgs,
@@ -535,6 +633,8 @@ class State:
             return False
         try:
             host = float(report.get("host_mem_mb", -1))
+            # What the app's own check counts as free (the memory credit setting included); it never counts less.
+            host = max(host, float(report.get("effective_mb", -1)))
         except (TypeError, ValueError):
             host = -1
         # The engine starts without its vision projector when only that fits (EngineService), so the smaller need
@@ -565,7 +665,8 @@ class State:
                     # Kept only when it worked: right after Quit Forge, Ollama is still starting, and a failed look-up
                     # must not leave the 5.6 GB fallback in place for ten minutes (seen 2026-10-20).
                     self._need_mb_ts, self._need_mb_for = now, name
-                    self._need_mb = int(mf["size"]) // (1024 * 1024) + 1200
+                    # The KV cache grows with the engine's context (1200 MB was measured at 8192 tokens).
+                    self._need_mb = int(mf["size"]) // (1024 * 1024) + self.context_extra_mb(1200, self.settings.get("gpu_ctx", 8192))
                     # The vision projector and its image encoder, when the engine loads one (EngineService adds the same).
                     pf = self.gpu_mmproj_file()
                     if pf:
@@ -617,7 +718,8 @@ class State:
             idle_min = int(self.settings.get("gpu_idle_unload_min", 10) or 0)
         except (TypeError, ValueError):
             idle_min = 30
-        if idle_min <= 0 or self.active_engine() != "gpu" or self.engine_idle_stopped:
+        # Without autostart nothing would start the engine again for the next message, so it is not unloaded either.
+        if idle_min <= 0 or self.active_engine() != "gpu" or self.engine_idle_stopped or not self.settings.get("gpu_autostart", True):
             return False
         now = time.time()
         if now - self.engine_last_use < idle_min * 60 or now - self.engine_stop_sent < 600:
@@ -639,7 +741,7 @@ class State:
         print(f"[engine] idle for {idle_min} minutes: asking the Forge app to unload the GPU engine", flush=True)
         return True
 
-    def memory_block_reason(self, model: Optional[str] = None, engine: Optional[str] = None) -> Optional[str]:
+    def memory_block_reason(self, model: Optional[str] = None, engine: Optional[str] = None, ctx: Optional[int] = None) -> Optional[str]:
         """Refuse to load the model when the VM does not have room for it. Loading a 5 GB model into a VM
         that is already nearly full made the host kill the whole VM once (2026-10-14); never again."""
         if (engine or self.active_engine()) == "gpu":
@@ -653,24 +755,37 @@ class State:
                 return ("The GPU engine is not running. Start it from the Forge app (Engine card in Settings) or switch "
                         "the engine back to Ollama in Settings.")
             return None
-        return self.memory_block_reason_ollama(model)
+        return self.memory_block_reason_ollama(model, ctx)
 
-    def model_need_mb(self, model: Optional[str] = None) -> int:
-        """Free memory a CPU model needs to load: its file size plus 900 MB for the KV cache and buffers (the 4.9 GB
-        Llama 3.1 build comes out at the 5800 MB that was measured; a 3.3 GB Qwen3.5 4B needs about 4200 MB)."""
+    @staticmethod
+    def context_extra_mb(base_mb: int, ctx: Optional[int]) -> int:
+        """The KV cache and buffers grow with the context window: [base_mb] was measured at 8192 tokens, so a bigger
+        context reserves proportionally more (a smaller one keeps the measured amount as a margin)."""
+        try:
+            c = int(ctx or 8192)
+        except (TypeError, ValueError):
+            c = 8192
+        return base_mb * max(8192, c) // 8192
+
+    def model_need_mb(self, model: Optional[str] = None, ctx: Optional[int] = None) -> int:
+        """Free memory a CPU model needs to load: its file size plus 900 MB for the KV cache and buffers at 8192 tokens
+        of context, more for a bigger context (the 4.9 GB Llama 3.1 build comes out at the 5800 MB that was measured; a
+        3.3 GB Qwen3.5 4B needs about 4200 MB)."""
+        if ctx is None:
+            ctx = self.settings.get("num_ctx", 8192)
         name = self.resolve_model(model) if model else self.resolve_model(self.settings.get("model"))
         try:
             for mm in self.ollama.list_models():
                 if mm.get("name") in (name, f"{name}:latest") and mm.get("size"):
-                    return max(2500, int(mm["size"]) // (1024 * 1024) + 900)
+                    return max(2500, int(mm["size"]) // (1024 * 1024) + self.context_extra_mb(900, ctx))
         except Exception:  # noqa: BLE001  (Ollama not answering: assume the big model)
             pass
         return MODEL_LOAD_NEED_MB
 
-    def memory_block_reason_ollama(self, model: Optional[str] = None) -> Optional[str]:
+    def memory_block_reason_ollama(self, model: Optional[str] = None, ctx: Optional[int] = None) -> Optional[str]:
         if self.model_loaded(model):
             return None
-        need = self.model_need_mb(model)
+        need = self.model_need_mb(model, ctx)
         m = mem_info()
         # The VM's memory comes from the Googlebook: when the Forge app reports the host's free memory, check it too.
         host = self.vision.app.get("host_mem_mb") if time.time() - self.vision.app_seen < 60 else None
@@ -822,17 +937,27 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").split(":")[0].lower()
         allowed = {"localhost", "127.0.0.1", "::1", "[::1]", ""}
         allowed |= set(getattr(self.server, "allowed_hosts", set()))
-        if host in allowed or host.endswith(".localhost") or host.startswith(("10.", "192.168.", "172.", "100.")):
+        if host in allowed or host.endswith(".localhost"):
             return True
         self._error(403, "Forbidden host header")
         return False
 
     # ------------------------------------------------------------ routing
+    def _authorized(self, path: str) -> bool:
+        """Every request but the open ones carries the Forge app's key or the VM key (see key_ok)."""
+        if path in OPEN_PATHS or key_ok(self.headers.get("X-Forge-Key") or ""):
+            return True
+        self._json(401, {"error": "This request needs the Forge app's key. Open the Forge app (it pairs by itself); if the app "
+                                  "was reinstalled, run forge-ide pair-reset in the Linux terminal first.", "unpaired": True})
+        return False
+
     def do_GET(self) -> None:  # noqa: N802
         if not self._check_host():
             return
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
+        if not self._authorized(u.path):
+            return
         try:
             if u.path == "/ws/term":
                 return self._ws_terminal(q)
@@ -866,10 +991,14 @@ class Handler(BaseHTTPRequestHandler):
             if oh != hh:
                 return self._error(403, "Cross-origin request blocked")
         u = urllib.parse.urlparse(self.path)
+        if not self._authorized(u.path):
+            return
         try:
             body = self._body()
         except (ValueError, json.JSONDecodeError) as e:
             return self._error(400, f"bad JSON body: {e}")
+        if u.path == "/api/pair":
+            return self._pair(body)
         try:
             self._api_post(u.path, body)
         except (BrokenPipeError, ConnectionResetError):
@@ -881,6 +1010,34 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             self._error(500, str(e))
+
+    def _peer_alive(self) -> bool:
+        """False when the client closed its connection (its socket reads as ended without waiting)."""
+        import select as _select
+        try:
+            r, _, _ = _select.select([self.connection], [], [], 0)
+            if r:
+                return self.connection.recv(1, socket.MSG_PEEK) != b""
+            return True
+        except OSError:
+            return False
+
+    def _pair(self, b: dict) -> None:
+        """The Forge app tells the server its key. The first app to pair after a reset is the one the server trusts (the
+        Forge app pairs as soon as it starts); after that only the same key pairs again."""
+        import hashlib
+        given = str(b.get("key") or "")
+        if len(given) < 32:
+            return self._error(400, "a key of at least 32 characters is needed")
+        h = hashlib.sha256(given.encode()).hexdigest()
+        cur = app_key_hash()
+        if cur and cur != h:
+            return self._error(403, "This Forge server is paired with another install of the Forge app. If you reinstalled "
+                                    "the app, run forge-ide pair-reset in the Linux terminal, then reopen Forge.")
+        if not cur:
+            _save_json(APP_KEY_FILE, {"sha256": h, "paired": time.time()})
+            print("[keys] the Forge app paired with this server", flush=True)
+        return self._json(200, {"paired": True})
 
     # ------------------------------------------------------------ no web page
     def _static(self, path: str) -> None:
@@ -935,6 +1092,7 @@ class Handler(BaseHTTPRequestHandler):
                                                    "note": st.engine_memory_note() if st.active_engine() == "gpu" and gpu.get("status") != "ok" else ""},
                                     "workspace_name": os.path.basename(ws.root) or ws.root,
                                     "model": st.resolve_model(st.effective_settings(ws.root).get("model")),
+                                    "chat_model_label": st.chat_model_label(),
                                     "running": running, "pid": os.getpid(), "default_folder": st.workspace.root,
                                     "folder_missing": folder_missing,
                                     "host_mem_mb": (st.vision.app.get("host_mem_mb") if time.time() - st.vision.app_seen < 60 else None),
@@ -1008,15 +1166,20 @@ class Handler(BaseHTTPRequestHandler):
             serial, port = devices.resolve(arg("serial") or None, int(arg("port") or 0) or None)
             png = devices.screen_png(serial, port)
             vd = vdevice.by_serial(serial) if port == devices.FORGE_PORT else None
+            why = ""
             if png is None and vd and vdevice.VERSIONS[vd["version"]]["backend"] == "arm":
                 # An emulated ARM device shows its screen through QEMU until Android's adb is up (and if it never is).
                 from . import armvm
-                shot = os.path.join(armvm.ARM_DIR, "devices", vd["id"], "screen.png")
-                if armvm.screenshot(vd, shot):
-                    with open(shot, "rb") as fh:
-                        png = fh.read()
+                png, why = armvm.screen_png(vd)
             if png is None:
-                return self._error(503, "The device did not send a screenshot.")
+                # The device window shows this text in place of the picture, so it says why there is none.
+                if not why and vd:
+                    ph = vdevice.phase(vd["id"])
+                    if ph.get("phase") in ("starting", "booting"):
+                        why = f"{vd['name']} is still starting ({ph.get('message') or 'Android is starting'}). Its screen appears once Android answers adb."
+                    elif not vdevice.running(vd):
+                        why = f"{vd['name']} is not running."
+                return self._error(503, why or "The device did not send a screenshot (adb's screencap gave no picture).")
             if vd:
                 vdevice.touch_active(vd)
             self.send_response(200)
@@ -1066,6 +1229,8 @@ class Handler(BaseHTTPRequestHandler):
             # used, for Reopen with Encoding) and reported, so a save writes the file back the same way.
             from . import textcodec, tools as _tools
             rel = arg("path")
+            if arg("run_id"):
+                ws = self._run_ws(arg("run_id"), ws)   # a run of another folder: its files, not this window's
             p = ws.resolve(rel, must_exist=True)
             if os.path.isdir(p):
                 raise ValueError(f"'{rel}' is a directory.")
@@ -1080,14 +1245,22 @@ class Handler(BaseHTTPRequestHandler):
             from . import textcodec
             return self._json(200, {"encodings": textcodec.choices()})
         if path == "/api/search":
-            opts = {"ignore_case": arg("case") == "0", "whole_word": arg("word") == "1", "exclude": arg("exclude") or None}
-            result = ws.search(arg("q"), arg("path", ".") or ".", arg("glob") or None, arg("regex") == "1", max_results=int(arg("max") or 400), **opts)
-            if (arg("path", ".") or ".") == ".":
-                for extra in st.extra_roots(ws.root):
-                    more = ws.search(arg("q"), extra, arg("glob") or None, arg("regex") == "1", max_results=200, **opts)
-                    if more and not more.startswith("No matches"):
-                        result = (result + "\n" + more) if result and not result.startswith("No matches") else more
-            return self._json(200, {"result": result})
+            # The Search view: the same engine and globs as Replace, over this folder and the folders added to the
+            # window. With a replacement it also returns each line as Replace would write it.
+            from .tools import search_regex, search_files, regex_replacement
+            try:
+                rx = search_regex(arg("q"), arg("regex") == "1", arg("case") != "0", arg("word") == "1")
+            except re.error as e:
+                return self._error(400, f"This is not a valid regular expression: {e}")
+            rep = None
+            if arg("replacement") != "":
+                rep = regex_replacement(arg("replacement")) if arg("regex") == "1" else arg("replacement").replace("\\", "\\\\")
+            files = list(ws.all_files())
+            for extra in st.extra_roots(ws.root):
+                files += [extra + "/" + f for f in st.workspace_for(extra).all_files()]
+            limit = int(arg("max") or 400)
+            hits, total, cut = search_files(ws, files, rx, arg("glob") or None, arg("exclude") or None, limit, time.monotonic() + 25, rep)
+            return self._json(200, {"hits": hits, "total": total, "stopped_early": cut})
         if path == "/api/sessions":
             items = sorted(st.sessions.values(), key=lambda s: -s.get("updated", 0))
             if arg("all") != "1":
@@ -1100,7 +1273,9 @@ class Handler(BaseHTTPRequestHandler):
                 st.sessions.pop(s["id"], None)
             items = [s for s in items if s not in gone]
             return self._json(200, {"folder": ws.root, "sessions": [{"id": s["id"], "title": s["title"], "updated": s["updated"],
-                                    "workspace": s.get("workspace"), "messages": len(s.get("messages", []))}
+                                    "workspace": s.get("workspace"),
+                                    # The messages you see (your questions and the replies), not the model's working list.
+                                    "messages": sum(1 for t in (s.get("transcript") or []) if isinstance(t, dict) and t.get("role") in ("user", "assistant"))}
                                     for s in items[:300]]})
         if path == "/api/session":
             s = st.sessions.get(arg("id"))
@@ -1134,14 +1309,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/git":
             return self._json(200, _git_status(ws.root))
         if path == "/api/git/diff":
+            # As in Cursor's Source Control: a staged file compares HEAD with what is staged, an unstaged one compares
+            # what is staged (or HEAD) with the file as it is now.
             rel = arg("path")
+            head = _git_show_head(ws.root, rel)
+            index = _git_show_index(ws.root, rel)
+            if arg("staged") == "1":
+                return self._json(200, {"path": rel, "original": head, "modified": index if index is not None else ""})
             cur = ""
             try:
                 cur = ws.read_text(rel)
             except Exception:  # noqa: BLE001
                 cur = ""
-            head = _git_show_head(ws.root, rel)
-            return self._json(200, {"path": rel, "original": head, "modified": cur})
+            return self._json(200, {"path": rel, "original": index if index is not None else head, "modified": cur})
         if path == "/api/git/log":
             return self._json(200, {"log": _git(ws.root, ["log", "--oneline", "-n", "30"])[1]})
         if path == "/api/rules":
@@ -1175,11 +1355,32 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, st.vision.images.cached_analysis(arg("id")))
         if path == "/api/engine/control":
             report = {k: arg(k) for k in ("vstate", "vtier", "vdetail") if arg(k)}
+            for k in ("host_mem_mb", "effective_mb"):
+                try:
+                    report[k] = int(arg(k) or -1)
+                except ValueError:
+                    pass
+            answer = st.vision.control(report, float(arg("wait", "20") or 20))
+            if (answer.get("engine_start") or answer.get("engine_stop")) and not self._peer_alive():
+                # The app that asked is gone (its process ended while this answer waited, for example during an
+                # install): a request it never receives must not count, or the next app would wait 3 minutes.
+                if answer.get("engine_start"):
+                    st.engine_start_sent = 0.0
+                if answer.get("engine_stop"):
+                    st.engine_idle_stopped = False
+                    st.engine_stop_sent = 0.0
+                return None
             try:
-                report["host_mem_mb"] = int(arg("host_mem_mb") or -1)
-            except ValueError:
-                pass
-            return self._json(200, st.vision.control(report, float(arg("wait", "20") or 20)))
+                return self._json(200, answer)
+            except (BrokenPipeError, ConnectionResetError):
+                # The app that asked is gone (its process ended while this answer waited, for example during an
+                # install): a start request it never received must not count, or the next app would wait 3 minutes.
+                if answer.get("engine_start"):
+                    st.engine_start_sent = 0.0
+                if answer.get("engine_stop"):
+                    st.engine_idle_stopped = False
+                    st.engine_stop_sent = 0.0
+                raise
         if path == "/api/engine/vision_file":
             fp = st.vision.file_path(arg("name"))
             if not fp:
@@ -1199,7 +1400,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/memories":
             return self._json(200, st.memories.list(ws.root))
         if path == "/api/commands":
-            return self._json(200, {"commands": BUILTIN_COMMANDS + custom_commands(DATA_DIR, ws.root)})
+            from . import skills as _skills
+            sk = _skills.discover(ws.root, bool(st.settings.get("skills_claude_codex", True)))
+            return self._json(200, {"commands": BUILTIN_COMMANDS + custom_commands(DATA_DIR, ws.root),
+                                    "skills": [{k: s[k] for k in ("name", "description", "path", "scope", "manual_only", "files")} for s in sk]})
+        if path == "/api/skills":
+            from . import skills as _skills
+            return self._json(200, {"skills": _skills.discover(ws.root, bool(st.settings.get("skills_claude_codex", True)))})
         if path == "/api/docs":
             return self._json(200, {"docs": st.docs.list()})
         if path == "/api/hooks":
@@ -1208,12 +1415,23 @@ class Handler(BaseHTTPRequestHandler):
                                     "events": list(st.hooks.EVENTS)})
         if path == "/api/index/status":
             from .semantic import available
+            enabled = bool(st.effective_settings(ws.root).get("semantic_index", True))
             sem = st.semantic_for(ws.root)
-            return self._json(200, {"available": available(), "enabled": bool(st.effective_settings(ws.root).get("semantic_index", True)),
+            if not enabled:
+                # Turned off: an indexer still running for this folder pauses now.
+                old = st.semantic.get(ws.root)
+                if old is not None and old.worker and old.worker.is_alive():
+                    old.pause()
+            elif sem is not None and sem.status.get("state") in ("idle", "ready") and not (sem.worker and sem.worker.is_alive()) \
+                    and time.time() - max(float(sem.status.get("updated") or 0), getattr(sem, "checked_at", 0.0)) > 300 \
+                    and not any(not r.done for r in st.runs.values()):
+                # As in Cursor, the index keeps itself up to date: the window asks for the status every so often, and
+                # an index older than five minutes is brought up to date (only the changed files are read again; the
+                # indexer waits while a chat runs and checks memory before it loads its small model).
+                sem.checked_at = time.time()
+                sem.start()
+            return self._json(200, {"available": available(), "enabled": enabled,
                                     "status": dict(sem.status) if sem else None, "server_running": st.embed_server.running()})
-        if path == "/api/voice/status":
-            from . import voice
-            return self._json(200, voice.status())
         if path == "/api/lsp/status":
             from . import lsp
             return self._json(200, {"available": lsp.available()})
@@ -1300,6 +1518,14 @@ class Handler(BaseHTTPRequestHandler):
             ws = st.workspace
         if path == "/api/settings":
             scope = str(b.pop("_scope", "user"))
+            for k, (lo, hi) in SETTING_RANGES.items():
+                if k in b:
+                    try:
+                        v = int(b[k])
+                    except (TypeError, ValueError):
+                        return self._error(400, f"{k} must be a whole number from {lo} to {hi}.")
+                    if not lo <= v <= hi:
+                        return self._error(400, f"{k} must be from {lo} to {hi} (a bigger context needs more memory than this VM has).")
             unset = [str(k) for k in (b.pop("_unset", []) or [])]
             if scope == "folder":
                 fp = st.folder_settings_path(ws.root)
@@ -1332,7 +1558,12 @@ class Handler(BaseHTTPRequestHandler):
             from . import textcodec
             rel = str(b["path"])
             content = str(b.get("content", ""))
+            if b.get("run_id"):
+                ws = self._run_ws(str(b["run_id"]), ws)   # a run of another folder: its files, not this window's
             p = ws.resolve(rel)
+            if b.get("if_absent") and os.path.exists(p):
+                # Save As asks before it replaces a file; the app sends the save again without if_absent after a yes.
+                return self._error(409, f"{rel} already exists.")
             enc, eol = b.get("encoding"), b.get("eol")
             if not enc or not eol:
                 old_enc, old_eol = "utf8", "LF"
@@ -1352,13 +1583,17 @@ class Handler(BaseHTTPRequestHandler):
             rel = str(b["path"])
             p = ws.resolve(rel)
             if os.path.exists(p):
-                raise ValueError("already exists")
+                return self._error(409, f"{rel} already exists.")
             if b.get("dir"):
                 os.makedirs(p, exist_ok=True)
             else:
                 os.makedirs(os.path.dirname(p) or ws.root, exist_ok=True)
-                with open(p, "w", encoding="utf-8") as fh:
-                    fh.write("")
+                try:
+                    # "x": created only if it does not exist yet, so a file that appeared meanwhile is never emptied.
+                    with open(p, "x", encoding="utf-8") as fh:
+                        fh.write("")
+                except FileExistsError:
+                    return self._error(409, f"{rel} already exists.")
             ws._file_cache = (0.0, [])
             return self._json(200, {"ok": True, "path": ws.relpath(p)})
         if path == "/api/file/rename":
@@ -1406,6 +1641,17 @@ class Handler(BaseHTTPRequestHandler):
                 s["title"] = str(b["title"])[:120]
             st.save_session(s)
             return self._json(200, {"ok": True})
+        if path == "/api/session/allow":
+            # Takes back what "Always allow" granted in a chat: one grant ("run_command", "mcp:<tool>",
+            # "outside_changes") or all of them.
+            s = st.sessions.get(str(b.get("id")))
+            if not s:
+                return self._error(404, "no such session")
+            key = str(b.get("revoke", "all"))
+            s.pop("auto_approve", None)
+            s["allow"] = [] if key == "all" else [k for k in (s.get("allow") or []) if k != key]
+            st.save_session(s)
+            return self._json(200, {"allow": s["allow"]})
         if path == "/api/session/reset":
             s = st.sessions.get(str(b.get("id")))
             if not s:
@@ -1444,9 +1690,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"gen_tps": round(gen, 2), "prompt_tps": round(float(tm.get("prompt_per_second") or 0), 1),
                                     "tokens": tm.get("predicted_n"), "seconds": round(time.time() - t0, 1), "speed": st.gpu_speed()})
         if path == "/api/inline_edit":
+            settings = st.settings_for_run(ws.root)
+            # The same free-memory check as a chat message: Ctrl K must never load a model into a VM without room.
+            blocked = st.memory_block_reason(settings["model"], ctx=settings.get("num_ctx"))
+            if blocked:
+                return self._error(503, blocked)
             run = Run("inline:" + str(b.get("session_id") or ""), "edit")
             st.runs[run.id] = run
-            settings = st.settings_for_run(ws.root)
             t = threading.Thread(target=inline_edit_stream, name="inline-edit", daemon=True,
                                  args=(st.client_for(), settings, run, str(b.get("path", "")), str(b.get("language", "")),
                                        str(b.get("selection", "")), str(b.get("instruction", "")),
@@ -1455,9 +1705,23 @@ class Handler(BaseHTTPRequestHandler):
             t.start()
             return self._json(200, {"run_id": run.id})
         if path == "/api/complete":
-            text = complete(st.client_for(), st.settings_for_run(ws.root), str(b.get("path", "")), str(b.get("language", "")),
+            settings = st.settings_for_run(ws.root)
+            # Tab completions load the model too, so they pass the free-memory check first.
+            blocked = st.memory_block_reason(settings["model"], ctx=settings.get("num_ctx"))
+            if blocked:
+                return self._error(503, blocked)
+            text = complete(st.client_for(), settings, str(b.get("path", "")), str(b.get("language", "")),
                             str(b.get("prefix", "")), str(b.get("suffix", "")))
             return self._json(200, {"text": text})
+        if path == "/api/trust":
+            # Trust this folder (or take the trust back): its own settings and hooks may then loosen the safety keys.
+            st.set_folder_trust(ws.root, bool(b.get("trusted", True)))
+            return self._json(200, st.settings_payload(ws.root))
+        if path == "/api/changes/keep":
+            ok = st.checkpoints.keep_part(str(b.get("run_id", "")), str(b.get("path", "")), str(b.get("before", "")))
+            if not ok:
+                return self._error(404, "This change is no longer known.")
+            return self._json(200, {"ok": True})
         if path == "/api/revert":
             rid = str(b["run_id"])
             msg = self._run_ws(rid, ws).revert(rid, str(b["path"]))
@@ -1487,15 +1751,15 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("path required")
             # Keep a checkpoint copy so the discard can be undone from the AI Changes view.
             try:
-                before = ws.read_text(rel)
+                snap = ws._snapshot(None, ws.resolve(rel))      # text, encoding, line ending and the exact bytes
             except Exception:  # noqa: BLE001
-                before = None
+                snap = None
             code, out = _git(ws.root, ["checkout", "--", rel])
-            if code == 0 and before is not None:
+            if code == 0 and snap is not None:
                 after = ws.read_text(rel) if os.path.exists(ws.resolve(rel)) else None
                 did = "git-discard-" + uuid.uuid4().hex[:8]
                 st.checkpoints.begin(did, ws.root, "", f"Discarded with git: {rel}")
-                st.checkpoints.record(did, rel, before, after)
+                st.checkpoints.record(did, rel, snap[0], after, snap[3], snap[1], snap[2])
             return self._json(200, {"ok": code == 0, "output": out})
         if path == "/api/git/commit":
             msg = str(b.get("message", "")).strip()
@@ -1518,7 +1782,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": code == 0, "output": out})
         if path == "/api/git/commit_message":
             settings = st.settings_for_run(ws.root)
-            blocked = st.memory_block_reason(settings["model"])
+            blocked = st.memory_block_reason(settings["model"], ctx=settings.get("num_ctx"))
             if blocked:
                 return self._error(503, blocked)
             code, diff = _git(ws.root, ["diff", "--cached", "--no-color", "--stat", "-p"])
@@ -1529,7 +1793,7 @@ class Handler(BaseHTTPRequestHandler):
             prompt = ("Write a git commit message for the following diff. First line: a short imperative summary under 70 "
                       "characters. Then a blank line and two to five short bullet points if the change has several parts. "
                       "Plain text only, no markdown fences, no quotes around it.\n\n```diff\n" + diff[:14000] + "\n```")
-            r = st.client_for().generate(settings["model"], prompt, options={"num_ctx": 8192, "temperature": 0.2, "num_predict": 200},
+            r = st.client_for().generate(settings["model"], prompt, options={"num_ctx": int(settings.get("num_ctx", 8192)), "temperature": 0.2, "num_predict": 200},
                                    keep_alive=str(settings.get("keep_alive", "5m")), timeout=600,
                                    system="You are a senior engineer writing precise, conventional git commit messages.")
             text = str(r.get("response", "")).strip().strip("`").strip()
@@ -1560,16 +1824,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"servers": MCP.get().connect_all()})
         if path == "/api/terminal_command":
             settings = st.settings_for_run(ws.root)
-            blocked = st.memory_block_reason(settings["model"])
+            blocked = st.memory_block_reason(settings["model"], ctx=settings.get("num_ctx"))
             if blocked:
                 return self._error(503, blocked)
             instruction = str(b.get("instruction", "")).strip()
             if not instruction:
                 raise ValueError("instruction required")
-            prompt = (f"Operating system: Debian Linux in a VM, shell: bash, current folder: {b.get('cwd') or ws.root}.\n"
+            # The shell's own folder (where cd took it), read from the shell process; the window's folder otherwise.
+            cwd = ""
+            term = str(b.get("term") or "")[:40]
+            sess = st.terminals.sessions.get(ws.root + "\0" + term) if term else None
+            if sess is not None and sess.alive:
+                try:
+                    cwd = os.readlink(f"/proc/{sess.pid}/cwd")
+                except OSError:
+                    cwd = ""
+            prompt = (f"Operating system: Debian Linux in a VM, shell: bash, current folder: {cwd or b.get('cwd') or ws.root}.\n"
                       f"Task: {instruction}\n\nReply with exactly one shell command line that does this, and nothing else: "
                       f"no explanation, no markdown, no backticks.")
-            r = st.client_for().generate(settings["model"], prompt, options={"num_ctx": 4096, "temperature": 0.1, "num_predict": 120,
+            r = st.client_for().generate(settings["model"], prompt, options={"num_ctx": int(settings.get("num_ctx", 8192)), "temperature": 0.1, "num_predict": 120,
                                                                       "stop": ["\n\n", "```"]},
                                    keep_alive=str(settings.get("keep_alive", "5m")), timeout=300,
                                    system="You are an expert Linux shell user. You answer with one command line only.")
@@ -1611,11 +1884,17 @@ class Handler(BaseHTTPRequestHandler):
             serial, port = devices.resolve(b.get("serial"), b.get("port"))
             return self._json(200, devices.launch(str(b.get("app_id", "")), serial, port))
         if path == "/api/android/screenshot":
-            from . import devices
+            from . import devices, vdevice
             serial, port = devices.resolve(b.get("serial"), b.get("port"))
             png = devices.screen_png(serial, port)
+            vd = vdevice.by_serial(serial) if port == devices.FORGE_PORT else None
+            why = ""
+            if png is None and vd and vdevice.VERSIONS[vd["version"]]["backend"] == "arm":
+                # As in the device window: an emulated ARM device's screen comes through QEMU while adb is not up.
+                from . import armvm
+                png, why = armvm.screen_png(vd)
             if png is None:
-                return self._error(503, "The screenshot failed. Check that the device is connected (Android view).")
+                return self._error(503, why or "The screenshot failed. Check that the device is connected (Android view).")
             meta = st.vision.images.save(png, "device-screen.png")
             meta["url"] = "/api/image?id=" + meta["id"]
             return self._json(200, meta)
@@ -1650,26 +1929,24 @@ class Handler(BaseHTTPRequestHandler):
             q = str(b.get("q", ""))
             if not q:
                 return self._error(400, "nothing to search for")
+            from .tools import search_regex, regex_replacement, path_matches, split_globs
             rep = str(b.get("replacement", ""))
             try:
-                body = q if b.get("regex") else re.escape(q)
-                if b.get("word"):
-                    body = r"(?<![A-Za-z0-9_])(?:" + body + r")(?![A-Za-z0-9_])"
-                pat = re.compile(body, 0 if b.get("case", True) else re.IGNORECASE)
+                pat = search_regex(q, bool(b.get("regex")), bool(b.get("case", True)), bool(b.get("word")))
             except re.error as e:
                 return self._error(400, f"invalid regular expression: {e}")
+            if b.get("regex"):
+                rep = regex_replacement(rep)     # Cursor's $1 and ${name} work, as in the Search view's preview
             glob = str(b.get("glob") or "").strip()
-            exclude = [g.strip() for g in str(b.get("exclude") or "").split(",") if g.strip()]
+            exclude = split_globs(b.get("exclude"))
             dry = bool(b.get("dry_run"))
             files = list(ws.all_files(refresh=True))
             for extra in st.extra_roots(ws.root):
                 files += [extra + "/" + f for f in st.workspace_for(extra).all_files(refresh=True)]
             if glob:
-                pats = [g.strip() for g in glob.split(",") if g.strip()]
-                files = [f for f in files if any(fnmatch.fnmatch(f, g) or fnmatch.fnmatch(os.path.basename(f), g) for g in pats)]
+                files = [f for f in files if path_matches(f, split_globs(glob))]
             if exclude:
-                files = [f for f in files if not any(fnmatch.fnmatch(f, g) or fnmatch.fnmatch(os.path.basename(f), g) or
-                                                     f.startswith(g.rstrip("/") + "/") for g in exclude)]
+                files = [f for f in files if not path_matches(f, exclude)]
             only = b.get("paths")
             if isinstance(only, list) and only:
                 wanted = {str(x) for x in only}
@@ -1708,28 +1985,18 @@ class Handler(BaseHTTPRequestHandler):
             st.set_extra_roots(ws.root, roots)
             return self._json(200, {"primary": ws.root, "extra": st.extra_roots(ws.root)})
         if path == "/api/index":
+            if b.get("action") == "pause":
+                # Pause always works, also after the index was turned off while it ran.
+                old = st.semantic.get(ws.root)
+                if old is None:
+                    return self._json(200, {"status": None})
+                old.pause()
+                return self._json(200, {"status": dict(old.status)})
             sem = st.semantic_for(ws.root)
             if sem is None:
                 return self._error(400, "The code index is turned off in Settings or not installed.")
-            if b.get("action") == "pause":
-                sem.pause()
-            else:
-                sem.start()
+            sem.start()
             return self._json(200, {"status": dict(sem.status)})
-        if path == "/api/voice/transcribe":
-            import base64 as _b64
-            from . import voice
-            why = st.small_memory_block("speech recognition", voice.VOICE_MIN_VM_MB, voice.VOICE_MIN_HOST_MB)
-            if why:
-                return self._error(503, why)
-            data = str(b.get("data", ""))
-            if data.startswith("data:"):
-                data = data.split(",", 1)[-1]
-            try:
-                text = voice.transcribe(_b64.b64decode(data, validate=False), str(b.get("language", "en")))
-            except RuntimeError as e:
-                return self._error(503, str(e))
-            return self._json(200, {"text": text})
         if path == "/api/snapshot":
             # A picture of the native window that the Forge app rendered by itself (its snapshot mode), so its look
             # can be checked while the Googlebook's screen is off. Kept in ~/.forge-ide/snapshots, one file per name.
@@ -1755,7 +2022,9 @@ class Handler(BaseHTTPRequestHandler):
                 meta = st.vision.images.save(raw, name)
                 return self._json(200, {**meta, "kind": "image", "url": "/api/image?id=" + meta["id"]})
             meta = st.attachments.save(raw, name)
-            return self._json(200, meta)
+            # The chat sends the record back with the message; kind "upload" makes the agent read the stored file (its
+            # text, or a note that the type cannot be read), and file_kind says what the file is.
+            return self._json(200, {**meta, "kind": "upload", "file_kind": meta.get("kind", "")})
         if path == "/api/memories":
             action = str(b.get("action", "add"))
             if action == "add":
@@ -1796,13 +2065,14 @@ class Handler(BaseHTTPRequestHandler):
                             msgs.append(self._run_ws(rid, ws).revert(rid, ch.path))
                         except Exception as e:  # noqa: BLE001
                             msgs.append(f"{ch.path}: {e}")
-                # The model's context is cut where this message was sent: the user turn of the transcript that
-                # carries the run id gives the text, and its last copy in the model's messages marks the cut. A
-                # second restore finds no copy and cuts nothing.
+                # The model's context is cut where this message was sent: every message of a turn carries its run id,
+                # so the first one of this run marks the cut, even after older messages were trimmed away. Chats from
+                # before the run ids fall back to the text of the user turn in the transcript. A second restore finds
+                # nothing and cuts nothing.
                 text = next((str(t.get("text", "")) for t in s.get("transcript", []) if t.get("role") == "user" and t.get("run_id") == rid), "")
                 hist = s.get("messages", [])
-                cut = None
-                if text.strip():
+                cut = next((k for k, m in enumerate(hist) if m.get("run_id") == rid), None)
+                if cut is None and text.strip() and not any(m.get("run_id") for m in hist):
                     for k in range(len(hist) - 1, -1, -1):
                         m = hist[k]
                         c = m.get("content")
@@ -1811,8 +2081,9 @@ class Handler(BaseHTTPRequestHandler):
                             cut = k
                             break
                 if cut is not None:
+                    later = {m.get("run_id") for m in hist[cut:] if m.get("run_id")}
                     s["messages"] = hist[:cut]
-                    s["runs"] = [r for r in runs if int(r.get("msg_index", 0)) < cut]
+                    s["runs"] = [r for r in runs if r.get("run_id") not in later and (later or int(r.get("msg_index", 0)) < cut)]
                     st.save_session(s)
                 return self._json(200, {"ok": True, "messages": msgs})
             msgs = []
@@ -1824,7 +2095,15 @@ class Handler(BaseHTTPRequestHandler):
                             msgs.append(rws.revert(r["run_id"], ch.path))
                         except Exception as e:  # noqa: BLE001
                             msgs.append(f"{ch.path}: {e}")
-            s["messages"] = s.get("messages", [])[: runs[idx]["msg_index"]]
+            # The context is cut at the first message of the oldest restored turn (the run ids say which messages
+            # belong to which turn); chats from before the run ids use the index noted when the turn began.
+            gone = {str(r.get("run_id")) for r in runs[idx:]}
+            hist = s.get("messages", [])
+            if any(m.get("run_id") for m in hist):
+                cut = next((k for k, m in enumerate(hist) if m.get("run_id") in gone), len(hist))
+            else:
+                cut = min(int(runs[idx].get("msg_index", len(hist))), len(hist))
+            s["messages"] = hist[:cut]
             s["runs"] = runs[:idx]
             st.save_session(s)
             return self._json(200, {"ok": True, "messages": msgs})
@@ -1886,13 +2165,17 @@ class Handler(BaseHTTPRequestHandler):
             st.vision.wanted_until = 0.0
             if eng == "gpu":
                 st.unload_model()      # the VM must not hold a second copy of the model
-            for sess in st.sessions.values():
-                sess["messages"] = []  # a different engine means a different prompt cache; start the context fresh
             return self._json(200, {"engine": eng})
         if path == "/api/engine/stats":
             st.engine_stats = dict(b)
             if b.get("event") == "running":
                 st.engine_last_use = time.time()   # a fresh engine counts as used: the idle unload must not undo a start
+                st.engine_idle_stopped = False
+            elif b.get("event") == "stopped" and b.get("by_user"):
+                # You stopped the engine (Stop engine): autostart leaves it stopped until you start it or a chat needs
+                # it (ask_engine_start), exactly as after an idle unload.
+                st.engine_idle_stopped = True
+                print("[engine] stopped by the user: no autostart until it is started again or a chat needs it", flush=True)
             return self._json(200, {"ok": True})
         if path == "/api/engine/applog":
             # The Forge app's own engine and vision log, as last posted with an engine event (for diagnosis).
@@ -1902,8 +2185,7 @@ class Handler(BaseHTTPRequestHandler):
             st.terminals.kill(ws.root + "\0" + str(b.get("id", "")))
             return self._json(200, {"ok": True})
         if path == "/api/unload":
-            st.unload_model()
-            return self._json(200, {"ok": True})
+            return self._json(200, {"ok": True, "unloaded": st.unload_model()})
         if path == "/api/quit":
             # Quit Forge: everything Forge runs in the VM stops, and then the server itself.
             from . import quit as forge_quit
@@ -1959,6 +2241,9 @@ class Handler(BaseHTTPRequestHandler):
             # A custom mode (like Cursor's): your own instructions and tool access on top of Agent mode.
             modes = st.effective_settings(ws.root).get("custom_modes") or []
             custom_mode = next((m for m in modes if isinstance(m, dict) and str(m.get("name", "")).strip() == mode), None)
+            if custom_mode is None:
+                return self._error(400, f"The mode \"{mode}\" no longer exists in this folder (it was renamed or deleted in "
+                                        "Settings, Custom modes). Pick another mode in the chat's mode menu.")
             mode = "agent"
         active = [r for r in st.runs.values() if r.session_id == s["id"] and not r.done]
         if active:
@@ -1966,9 +2251,13 @@ class Handler(BaseHTTPRequestHandler):
         fallback_note = None
         # The chat's own model choice (composer picker): "__gpu" for the GPU engine, an Ollama model name, or empty
         # for the window's setting. It is remembered with the chat.
-        choice = str(b.get("model") or s.get("model_choice") or "")[:120]
-        if b.get("model"):
-            s["model_choice"] = choice
+        if b.get("model") == "__default":
+            s.pop("model_choice", None)
+            choice = ""
+        else:
+            choice = str(b.get("model") or s.get("model_choice") or "")[:120]
+            if b.get("model"):
+                s["model_choice"] = choice
         run_engine = "gpu" if choice == "__gpu" else ("ollama" if choice else st.active_engine())
         run_model = choice if choice and choice != "__gpu" else None
         if run_engine == "gpu" and not st.gpu_client.alive():
@@ -1987,12 +2276,16 @@ class Handler(BaseHTTPRequestHandler):
             blocked = st.memory_block_reason_ollama(settings["model"])
         else:
             settings = st.settings_for_run(ws.root, run_engine, run_model)
-            blocked = st.memory_block_reason(settings["model"], run_engine)
+            blocked = st.memory_block_reason(settings["model"], run_engine, ctx=settings.get("num_ctx"))
         if blocked:
             return self._error(503, blocked)
         hook = st.hooks.run(ws.root, "beforeSubmitPrompt", {"prompt": text, "session": s["id"]})
         if hook["permission"] == "deny":
             return self._error(400, "A hook blocked this message: " + ("; ".join(hook["messages"]) or "no reason given"))
+        if hook["permission"] == "ask" and not b.get("hook_confirmed"):
+            # A hook wants you to confirm this message first; the app asks and sends it again with hook_confirmed.
+            return self._json(409, {"error": "A hook asks you to confirm this message: " + ("; ".join(hook["messages"]) or "no reason given"),
+                                    "hook_ask": True, "messages": hook["messages"]})
         if s["title"] in ("New chat", "") and text:
             s["title"] = text[:60]
         run = Run(s["id"], mode)
@@ -2001,7 +2294,11 @@ class Handler(BaseHTTPRequestHandler):
         engine = "ollama" if fallback_note else run_engine
         used = f"{engine}:{settings.get('model')}"
         if s.get("engine_used") not in (None, engine, used):
-            s["messages"] = []          # different engine or model, different prompt cache: fresh context
+            # Another engine or model continues with the whole conversation, as in Cursor. Only what belongs to the
+            # old engine goes: native tool call records and image data.
+            for m in s.get("messages") or []:
+                m.pop("tool_calls", None)
+                m.pop("images", None)
         s["engine_used"] = used
         agent = Agent(st.ollama if fallback_note else st.client_for(engine), ws, settings, s)
         agent.vision = st.vision
@@ -2101,7 +2398,7 @@ class Handler(BaseHTTPRequestHandler):
                   host_free_mb=st.host_free_mb() if lang == "kotlin" else None)
 
     def _ws_dap(self, q: Dict[str, list]) -> None:
-        """The debugger for this window: the browser speaks the Debug Adapter Protocol to the adapter for the
+        """The debugger for this window: the app speaks the Debug Adapter Protocol to the adapter for the
         language (debugpy, GDB, rust-gdb, or the Kotlin server's debugger for Kotlin and Java)."""
         st = STATE
         assert st is not None
@@ -2149,10 +2446,19 @@ class Handler(BaseHTTPRequestHandler):
             import importlib.util
             cmd = [sys.executable, "-m", "debugpy.adapter"] if importlib.util.find_spec("debugpy") else None
             what = "debugger (debugpy)"
-        else:
+        elif lang in ("c", "cpp", "rust"):
             cmd = debugging.adapter_command(lang)
             what = "debugger (GDB)" if lang in ("c", "cpp") else "debugger (rust-gdb)"
-        lsp.serve(sock, lang, folder, gate, os.path.join(DATA_DIR, "logs"), cmd=cmd, what=what, cap="1G", needs=(700, 3300))
+        else:
+            cmd, what = None, "debugger"
+        if cmd is None:
+            # Said plainly at once, instead of starting something else that would never answer the debugger's requests.
+            sock.send_text(json.dumps({"forge": "error", "message": debugging.adapter_missing(lang)}))
+            sock.close()
+            return
+        # GDB replaces the program's whole environment with a launch's env; merged, it adds to it as in VS Code.
+        lsp.serve(sock, lang, folder, gate, os.path.join(DATA_DIR, "logs"), cmd=cmd, what=what, cap="1G", needs=(700, 3300),
+                  merge_launch_env=lang in ("c", "cpp", "rust"))
 
     def _ws_kernel(self, q: Dict[str, list]) -> None:
         """A notebook window's connection to its Python kernel."""
@@ -2296,7 +2602,8 @@ class Handler(BaseHTTPRequestHandler):
             sock.send_text(json.dumps({"type": "end"}))
             sock.close()
             return
-        lc = Logcat(sock.send_text, q.get("app_id", [""])[0][:200], q.get("level", ["V"])[0][:1], serial, port)
+        lc = Logcat(sock.send_text, q.get("app_id", [""])[0][:200], q.get("level", ["V"])[0][:1], serial, port,
+                    devices.display_name(serial, port))
         try:
             lc.run()
             while True:
@@ -2377,25 +2684,48 @@ def _git(root: str, args: list, timeout: float = 30.0) -> tuple:
 
 
 def _git_show_head(root: str, rel: str) -> str:
-    code, out = _git(root, ["show", "HEAD:" + rel])
+    # "./" makes the path relative to the folder, which may be a subfolder of the repository.
+    code, out = _git(root, ["show", "HEAD:./" + rel])
     return out if code == 0 else ""
 
 
+def _git_show_index(root: str, rel: str) -> Optional[str]:
+    """A file as it is staged (the index); None when it is not in the index."""
+    code, out = _git(root, ["show", ":./" + rel])
+    return out if code == 0 else None
+
+
 def _git_status(root: str) -> dict:
+    """The folder's git state. The folder may be the repository, a subfolder of one, a worktree or a submodule; paths are
+    relative to the folder (git reports them relative to the repository, with -z so spaces, quotes and other characters
+    come through as they are, and renames as their new name)."""
     import subprocess
-    if not os.path.isdir(os.path.join(root, ".git")):
-        return {"repo": False}
     try:
+        inside = subprocess.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True, timeout=10)
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return {"repo": False}
+        prefix = subprocess.run(["git", "-C", root, "rev-parse", "--show-prefix"], capture_output=True, text=True, timeout=10).stdout.strip()
         branch = subprocess.run(["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
-        status = subprocess.run(["git", "-C", root, "status", "--porcelain=v1"], capture_output=True, text=True, timeout=15).stdout
+        status = subprocess.run(["git", "-C", root, "status", "--porcelain=v1", "-z", "-uall"], capture_output=True, timeout=15).stdout
     except (subprocess.TimeoutExpired, OSError) as e:
         return {"repo": True, "error": str(e)}
     files = []
-    for line in status.splitlines():
-        if len(line) > 3:
-            x, y = line[0], line[1]
-            files.append({"status": (line[:2].strip() or "M"), "path": line[3:], "staged": x not in (" ", "?"),
-                          "unstaged": y != " " or x == "?"})
+    parts = status.decode("utf-8", errors="replace").split("\0")
+    i = 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        x, y, path = entry[0], entry[1], entry[3:]
+        if x in "RC":
+            i += 1        # the next field is the old name of a rename or copy
+        if prefix:
+            if not path.startswith(prefix):
+                continue  # a change elsewhere in the repository, outside this folder
+            path = path[len(prefix):]
+        files.append({"status": (entry[:2].strip() or "M"), "path": path, "staged": x not in (" ", "?"),
+                      "unstaged": y != " " or x == "?"})
     ahead = ""
     try:
         ahead = subprocess.run(["git", "-C", root, "status", "-sb"], capture_output=True, text=True, timeout=10).stdout.splitlines()[0]
@@ -2404,11 +2734,62 @@ def _git_status(root: str) -> dict:
     return {"repo": True, "branch": branch, "files": files, "summary": ahead}
 
 
+# ---------------------------------------------------------------- keys (only the Forge app and Forge's own tools)
+# The Terminal app forwards the server's port to the Googlebook's localhost, where every Android app can reach it.
+# So every request carries a key: the Forge app's own (made by the app, kept in its private storage; the server keeps
+# only its SHA-256, learned when the app pairs), or the VM key that Forge's tools in the Linux VM read from a file.
+APP_KEY_FILE = os.path.join(DATA_DIR, "app-key.json")
+VM_KEY_FILE = os.path.join(DATA_DIR, "vm-key")
+OPEN_PATHS = {"", "/", "/api/pair", "/api/memcheck"}     # the plain sentence, pairing, and the build tools' memory check
+
+
+def vm_key() -> str:
+    """The key for Forge's own tools in the VM (forge-ide, scripts); made once, readable only by this user."""
+    try:
+        with open(VM_KEY_FILE, "r", encoding="utf-8") as fh:
+            k = fh.read().strip()
+        if len(k) >= 32:
+            return k
+    except OSError:
+        pass
+    import secrets
+    k = secrets.token_hex(24)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    fd = os.open(VM_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(k)
+    return k
+
+
+def app_key_hash() -> str:
+    d = _load_json(APP_KEY_FILE, {})
+    return str(d.get("sha256") or "") if isinstance(d, dict) else ""
+
+
+def key_ok(given: str) -> bool:
+    import hashlib
+    import hmac
+    if not given:
+        return False
+    if hmac.compare_digest(given, vm_key()):
+        return True
+    h = app_key_hash()
+    return bool(h) and hmac.compare_digest(hashlib.sha256(given.encode()).hexdigest(), h)
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     request_queue_size = 64
     allowed_hosts: set = set()
+
+    def verify_request(self, request, client_address) -> bool:  # noqa: ANN001
+        """Only connections from the VM's own loopback are served. The Forge app reaches the server through the Terminal
+        app's port forwarding, which connects from 127.0.0.1 inside the VM; everything else (the VM's network address,
+        the containers of virtual devices and WayDroid, other machines) is closed at once, because the server offers a
+        shell and access to files."""
+        host = str(client_address[0] if client_address else "")
+        return host.startswith("127.") or host == "::1" or host.startswith("::ffff:127.")
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -2434,6 +2815,7 @@ def main(argv: Optional[list] = None) -> int:
         srv.server_address = srv.socket.getsockname()
     else:
         srv = Server((args.host, args.port), Handler)
+    vm_key()   # made now, so Forge's tools in the VM can read it before their first request
     # Ollama and the Forge Android guard are stopped by Quit Forge and come back with the server.
     from . import quit as forge_quit
     threading.Thread(target=lambda: [print("Forge:", m, flush=True) for m in forge_quit.start_companions()],
@@ -2443,7 +2825,7 @@ def main(argv: Optional[list] = None) -> int:
     except OSError:
         srv.allowed_hosts = set()
     print(f"Forge IDE {__version__} listening on http://{args.host}:{args.port}  workspace={STATE.workspace.root}", flush=True)
-    print("Open http://localhost:%d in Chrome (allow the port in the Terminal app's port forwarding if asked)." % args.port, flush=True)
+    print("Open the Forge app on the Googlebook; it connects through the Terminal app's port forwarding (allow port %d if asked)." % args.port, flush=True)
     try:
         srv.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

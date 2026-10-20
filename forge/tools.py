@@ -41,6 +41,102 @@ def is_dangerous_command(cmd: str) -> bool:
     return bool(DANGEROUS_COMMAND.search(cmd))
 
 
+def search_regex(pattern: str, regex: bool, case: bool, word: bool) -> "re.Pattern[str]":
+    """The pattern the Search view, Replace and the agent's search share: Python's regular expressions."""
+    body = pattern if regex else re.escape(pattern)
+    if word:
+        body = r"(?<![A-Za-z0-9_])(?:" + body + r")(?![A-Za-z0-9_])"
+    return re.compile(body, 0 if case else re.IGNORECASE)
+
+
+def regex_replacement(rep: str) -> str:
+    """Cursor's replacement syntax in Python's: $1 and ${name} become \\g<1> and \\g<name>, $& is the whole match and
+    $$ a dollar sign. Python's own \\1 and \\g<name> keep working."""
+    out: List[str] = []
+    i = 0
+    while i < len(rep):
+        c = rep[i]
+        if c == "$" and i + 1 < len(rep):
+            n = rep[i + 1]
+            if n == "$":
+                out.append("$"); i += 2; continue
+            if n == "&":
+                out.append(r"\g<0>"); i += 2; continue
+            if n.isdigit():
+                j = i + 1
+                while j < len(rep) and rep[j].isdigit():
+                    j += 1
+                out.append(r"\g<" + rep[i + 1:j] + ">"); i = j; continue
+            if n == "{":
+                j = rep.find("}", i)
+                if j > i + 2:
+                    out.append(r"\g<" + rep[i + 2:j] + ">"); i = j + 1; continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def path_matches(f: str, globs: List[str]) -> bool:
+    """A file matches one of the Search view's include or exclude globs the way Cursor reads them: "*.kt" anywhere,
+    "src/**" everything under src, a plain name like "build" that folder anywhere, absolute paths for folders added to
+    the window."""
+    base = os.path.basename(f)
+    for g in globs:
+        g = g[2:] if g.startswith("./") else g
+        if fnmatch.fnmatch(f, g) or fnmatch.fnmatch(base, g):
+            return True
+        d = g[:-3] if g.endswith("/**") else g.rstrip("/")
+        if d and not any(ch in d for ch in "*?[") and (f == d or f.startswith(d + "/") or ("/" + d + "/") in ("/" + f)):
+            return True
+    return False
+
+
+def split_globs(text: Optional[str]) -> List[str]:
+    return [g.strip() for g in str(text or "").split(",") if g.strip()]
+
+
+def search_files(ws: "Workspace", files: List[str], rx: "re.Pattern[str]", include: Optional[str], exclude: Optional[str],
+                 max_results: int, deadline: float, replacement: Optional[str] = None) -> Tuple[List[dict], int, bool]:
+    """Every matching line of the files (2 MB at most each, text only), until [deadline]: (hits, total matches,
+    stopped early). A hit is {path, line, text, spans} and, with a [replacement] (Python syntax), what each match becomes
+    ("reps"), so the Search view shows exactly what Replace does."""
+    inc, exc = split_globs(include), split_globs(exclude)
+    hits: List[dict] = []
+    total = 0
+    for rel in files:
+        if time.monotonic() > deadline:
+            return hits, total, True
+        if (inc and not path_matches(rel, inc)) or (exc and path_matches(rel, exc)) or _is_binary_path(rel):
+            continue
+        try:
+            fp = ws.resolve(rel, must_exist=True)
+            if os.path.getsize(fp) > 2_000_000:
+                continue
+            with open(fp, "rb") as fh:
+                raw = fh.read()
+        except (ValueError, OSError):
+            continue
+        if b"\x00" in raw[:8192]:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        for no, line in enumerate(text.split("\n"), 1):
+            if not rx.search(line):
+                continue
+            total += 1
+            if len(hits) < max_results:
+                found = list(rx.finditer(line[:300]))[:20]
+                h = {"path": rel, "line": no, "text": line[:300] + (" ..." if len(line) > 300 else ""),
+                     "spans": [[m.start(), m.end()] for m in found]}
+                if replacement is not None:
+                    # What each match becomes, exactly as Replace writes it (the view shows it next to the match).
+                    try:
+                        h["reps"] = [m.expand(replacement) for m in found]
+                    except (re.error, IndexError) as e:
+                        h["preview_error"] = str(e)
+                hits.append(h)
+    return hits, total, False
+
+
 def _clip(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     if len(text) <= limit:
         return text
@@ -60,6 +156,13 @@ class FileChange:
     after: Optional[str]           # new content (None when deleted)
     ts: float = field(default_factory=time.time)
     revertable: bool = True        # False when the snapshot was too large to keep on disk
+    # The file's exact bytes before the run (base64) when its text alone would not give them back (mixed line endings,
+    # bytes that are not valid in its encoding), and the encoding and line ending to write its text with.
+    before_raw: Optional[str] = None
+    enc: str = "utf8"
+    eol: str = "LF"
+    # Where a deleted file or folder went in the trash, so Undo moves it back (also folders and binary files).
+    trash: Optional[str] = None
 
 
 MAX_SNAPSHOT_CHARS = 2_000_000     # larger files are still edited, but their snapshot is not stored on disk
@@ -88,17 +191,48 @@ class Checkpoints:
                 self.meta[run_id] = {"workspace": workspace, "session_id": session_id,
                                      "title": (title or "").strip()[:160], "ts": time.time()}
 
-    def record(self, run_id: str, rel: str, before: Optional[str], after: Optional[str]) -> None:
+    def record(self, run_id: str, rel: str, before: Optional[str], after: Optional[str], before_raw: Optional[bytes] = None,
+               enc: str = "utf8", eol: str = "LF", trash: Optional[str] = None, existed: Optional[bool] = None) -> None:
+        """[before_raw]: the file's bytes before the run, kept when its text does not give them back exactly.
+        [existed]: the path existed before the run even if it had no text (a folder or a binary file)."""
+        import base64
+        from . import textcodec
         with self.lock:
             run = self.runs.setdefault(run_id, {})
             if rel in run:
                 run[rel].after = after
+                if trash:
+                    run[rel].trash = trash
                 if run[rel].kind == "created" and after is None:
                     run[rel].kind = "deleted"
             else:
-                kind = "created" if before is None else ("deleted" if after is None else "modified")
-                run[rel] = FileChange(rel, kind, before, after)
+                was = existed if existed is not None else before is not None
+                kind = "created" if not was else ("deleted" if after is None else "modified")
+                ch = FileChange(rel, kind, before, after, enc=enc, eol=eol, trash=trash)
+                if before_raw is not None and len(before_raw) <= MAX_SNAPSHOT_CHARS:
+                    try:
+                        exact = before is not None and textcodec.encode(before, enc, eol) == before_raw
+                    except ValueError:
+                        exact = False
+                    if not exact:
+                        ch.before_raw = base64.b64encode(before_raw).decode("ascii")
+                run[rel] = ch
             self.save(run_id)
+
+    def keep_part(self, run_id: str, rel: str, before: str) -> bool:
+        """Part of a run's change to a file was kept in a review: the kept text becomes the file's state before the run,
+        so the remaining review, Undo and Restore checkpoint leave the kept part in place. A file the run created
+        becomes a modified one, because the kept part now existed "before"."""
+        with self.lock:
+            ch = self.runs.get(run_id, {}).get(rel)
+            if ch is None:
+                return False
+            ch.before = before
+            ch.before_raw = None     # the kept text is the new original; it is written with the file's encoding
+            if ch.kind == "created":
+                ch.kind = "modified"
+            self.save(run_id)
+            return True
 
     def changes(self, run_id: str) -> List[FileChange]:
         with self.lock:
@@ -135,7 +269,8 @@ class Checkpoints:
             files = []
             for ch in self.runs.get(run_id, {}).values():
                 d = {"path": ch.path, "kind": ch.kind, "ts": ch.ts, "revertable": ch.revertable,
-                     "before": ch.before, "after": ch.after}
+                     "before": ch.before, "after": ch.after, "before_raw": ch.before_raw, "enc": ch.enc, "eol": ch.eol,
+                     "trash": ch.trash}
                 if (ch.before is not None and len(ch.before) > MAX_SNAPSHOT_CHARS) or \
                         (ch.after is not None and len(ch.after) > MAX_SNAPSHOT_CHARS):
                     d["before"] = None if ch.before is None else ""
@@ -169,7 +304,8 @@ class Checkpoints:
             run = self.runs.setdefault(rid, {})
             for f in d.get("files", []):
                 run[f["path"]] = FileChange(f["path"], f.get("kind", "modified"), f.get("before"), f.get("after"),
-                                            f.get("ts", time.time()), bool(f.get("revertable", True)) and not f.get("omitted"))
+                                            f.get("ts", time.time()), bool(f.get("revertable", True)) and not f.get("omitted"),
+                                            f.get("before_raw"), f.get("enc") or "utf8", f.get("eol") or "LF", f.get("trash"))
 
 
 # Places outside a project where a change always needs the user's approval, even with protection turned off.
@@ -369,8 +505,25 @@ class Workspace:
             raise ValueError(f"'{rel}' is a directory. Use list_dir.")
         if _is_binary_path(p):
             raise ValueError(f"'{rel}' is a binary file ({os.path.getsize(p):,} bytes) and cannot be read as text.")
-        with open(p, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read()
+        return self._read_codec(p)[0]
+
+    @staticmethod
+    def _read_codec(p: str) -> Tuple[str, str, str, bytes]:
+        """A file's text (with "\\n" line ends), its encoding, its line ending and its bytes (see textcodec)."""
+        from . import textcodec
+        with open(p, "rb") as fh:
+            raw = fh.read()
+        text, enc, eol, _lossless = textcodec.decode(raw)
+        return text, enc, eol, raw
+
+    @staticmethod
+    def _write_codec(p: str, text: str, enc: str, eol: str) -> None:
+        """Writes text in the file's own encoding and line ending; a character the encoding cannot hold is an error that
+        says which (nothing is written then)."""
+        from . import textcodec
+        data = textcodec.encode(text, enc, eol)
+        with open(p, "wb") as fh:
+            fh.write(data)
 
     def read_file(self, rel: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
         text = self.read_text(rel)
@@ -389,12 +542,12 @@ class Workspace:
         return header + numbered
 
     # ------------------------------------------------------------------ writing
-    def _snapshot(self, run_id: Optional[str], rel: str) -> Optional[str]:
-        p = os.path.join(self.root, rel)
+    def _snapshot(self, run_id: Optional[str], rel: str) -> Optional[Tuple[str, str, str, bytes]]:
+        """A text file as it is now: (text, encoding, line ending, bytes), or None for folders and binary files."""
+        p = os.path.join(self.root, rel) if not os.path.isabs(rel) else rel
         if os.path.exists(p) and not os.path.isdir(p) and not _is_binary_path(p):
             try:
-                with open(p, "r", encoding="utf-8", errors="replace") as fh:
-                    return fh.read()
+                return self._read_codec(p)
             except OSError:
                 return None
         return None
@@ -402,12 +555,15 @@ class Workspace:
     def write_file(self, rel: str, content: str, run_id: Optional[str] = None) -> str:
         p = self.resolve(rel)
         rel = self.relpath(p)
-        before = self._snapshot(run_id, rel) if os.path.exists(p) else None
+        snap = self._snapshot(run_id, p) if os.path.exists(p) else None
+        before = snap[0] if snap else None
+        # An existing file keeps its encoding and line ending; a new one is UTF-8 with LF.
+        enc, eol = (snap[1], snap[2]) if snap else ("utf8", "LF")
+        content = content.replace("\r\n", "\n")
         os.makedirs(os.path.dirname(p) or self.root, exist_ok=True)
-        with open(p, "w", encoding="utf-8", newline="") as fh:
-            fh.write(content)
+        self._write_codec(p, content, enc, eol)
         if run_id:
-            self.checkpoints.record(run_id, rel, before, content)
+            self.checkpoints.record(run_id, rel, before, content, snap[3] if snap else None, enc, eol)
         self._file_cache = (0.0, [])
         n = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
         verb = "Created" if before is None else "Wrote"
@@ -435,10 +591,10 @@ class Workspace:
                              f"or set replace_all to true.")
         new_src = src.replace(used, new_text) if replace_all else src.replace(used, new_text, 1)
         before = src
-        with open(p, "w", encoding="utf-8", newline="") as fh:
-            fh.write(new_src)
+        _t, enc, eol, raw = self._read_codec(p)
+        self._write_codec(p, new_src, enc, eol)     # the file keeps its encoding and line ending
         if run_id:
-            self.checkpoints.record(run_id, rel, before, new_src)
+            self.checkpoints.record(run_id, rel, before, new_src, raw, enc, eol)
         # Show the model the edited region so it can confirm the result.
         idx = new_src.find(new_text)
         line_no = new_src.count("\n", 0, max(idx, 0)) + 1
@@ -490,10 +646,12 @@ class Workspace:
                                  time.strftime("%Y%m%d-%H%M%S"))
         os.makedirs(trash, exist_ok=True)
         dest = os.path.join(trash, rel.strip("/").replace("/", "__"))
-        before = self._snapshot(run_id, rel)
+        snap = self._snapshot(run_id, p)
         shutil.move(p, dest)
-        if run_id and before is not None:
-            self.checkpoints.record(run_id, rel, before, None)
+        if run_id:
+            # Recorded for every deletion, folders and binary files too: Undo moves it back from the trash.
+            self.checkpoints.record(run_id, rel, snap[0] if snap else None, None, snap[3] if snap else None,
+                                    snap[1] if snap else "utf8", snap[2] if snap else "LF", trash=dest, existed=True)
         self._file_cache = (0.0, [])
         return f"Moved {rel} to {self.relpath(dest)} (a trash folder; nothing is permanently deleted)."
 
@@ -504,14 +662,26 @@ class Workspace:
         if not ch.revertable:
             raise ValueError(f"{rel} was too large to keep a snapshot, so it cannot be reverted automatically.")
         p = self.resolve(rel)
-        if ch.before is None:
+        if ch.after is None and ch.trash and os.path.exists(ch.trash) and not os.path.exists(p):
+            # Something the run moved to the trash (a file, a folder or a binary file) moves back, exactly as it was.
+            os.makedirs(os.path.dirname(p) or self.root, exist_ok=True)
+            shutil.move(ch.trash, p)
+            msg = f"Moved {rel} back from the trash."
+        elif ch.before is None and ch.trash:
+            where = "it exists again" if os.path.exists(p) else f"it is no longer in the trash ({ch.trash})"
+            raise ValueError(f"{rel} cannot be moved back, because {where}.")
+        elif ch.before is None:
             if os.path.exists(p):
                 self.delete_path(rel)
             msg = f"Removed {rel} (it did not exist before the run)."
         else:
             os.makedirs(os.path.dirname(p) or self.root, exist_ok=True)
-            with open(p, "w", encoding="utf-8", newline="") as fh:
-                fh.write(ch.before)
+            if ch.before_raw:
+                import base64
+                with open(p, "wb") as fh:
+                    fh.write(base64.b64decode(ch.before_raw))     # exactly the bytes it had
+            else:
+                self._write_codec(p, ch.before, ch.enc, ch.eol)
             msg = f"Restored {rel} to its content before the run."
         ch.after = ch.before
         ch.kind = "reverted"
@@ -555,51 +725,38 @@ class Workspace:
     def search(self, pattern: str, rel: str = ".", glob: Optional[str] = None, regex: bool = False,
                max_results: int = 200, timeout: float = 25.0, ignore_case: bool = False, whole_word: bool = False,
                exclude: Optional[str] = None) -> str:
-        p = self.resolve(rel, must_exist=True)
-        # -D skip: never open devices, FIFOs or sockets (reading one could block forever).
-        cmd = ["grep", "-rnI", "-D", "skip", "--color=never", "-m", "50"]
-        if ignore_case:
-            cmd.append("-i")
-        if whole_word:
-            cmd.append("-w")
-        if exclude:
-            for g in str(exclude).split(","):
-                g = g.strip()
-                if g:
-                    cmd += ["--exclude", g, "--exclude-dir", g.rstrip("/")]
-        for d in IGNORED_DIRS:
-            cmd += ["--exclude-dir", d]
-        if p == "/":
-            for d in ("proc", "sys", "dev", "run"):
-                cmd += ["--exclude-dir", d]
-        if glob:
-            for g in str(glob).split(","):
-                g = g.strip()
-                if g:
-                    cmd += ["--include", g]
-        cmd += ["-E" if regex else "-F", "--", pattern, p]
+        """Text search, the same engine as the Search view and Replace (Python regular expressions, so \\d, \\w and
+        lookarounds work; include and exclude globs as Cursor reads them). Inside the project it searches the project's
+        file list; elsewhere it walks the folder with a time limit."""
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, errors="replace")
-        except subprocess.TimeoutExpired:
-            return "Search timed out after 25 seconds. Narrow the path or pattern."
-        if r.returncode == 2 and r.stderr:
-            return "grep error: " + _clip(r.stderr, 1000)
-        lines = r.stdout.splitlines()
-        out = []
-        for l in lines[:max_results]:
-            if l.startswith(self.root + os.sep):
-                l = l[len(self.root) + 1:]
-            if len(l) > 300:
-                l = l[:300] + " ..."
-            out.append(l)
-        if not out:
-            return f"No matches for '{pattern}' under {self.relpath(p)}."
-        more = f"\n... {len(lines) - max_results} more matches not shown (narrow the search)." if len(lines) > max_results else ""
-        return _clip(f"{len(lines)} matches for '{pattern}':\n" + "\n".join(out) + more)
+            rx = search_regex(pattern, regex, not ignore_case, whole_word)
+        except re.error as e:
+            return f"Invalid regular expression: {e}"
+        p = self.resolve(rel, must_exist=True)
+        if os.path.isfile(p):
+            files = [self.relpath(p)]
+        elif p == self.root:
+            files = self.all_files()
+        elif p.startswith(self.root + os.sep):
+            prefix = self.relpath(p).rstrip("/") + "/"
+            files = [f for f in self.all_files() if f.startswith(prefix)]
+        else:
+            files = self._walk_files(p, seconds=min(10.0, timeout / 2))
+        hits, total, cut = search_files(self, files, rx, glob, exclude, max_results, time.monotonic() + timeout)
+        if not hits:
+            where = "the project folder" if p == self.root else self.relpath(p)
+            return f"No matches for '{pattern}' in {where}." + (" (The search ran out of time.)" if cut else "")
+        lines = [f"{h['path']}:{h['line']}:{h['text']}" for h in hits]
+        more = f"\n... {total - len(hits)} more matches not shown (narrow the search)." if total > len(hits) else ""
+        if cut:
+            more += "\n(The search ran out of time; narrow the folder or the files to include.)"
+        return _clip(f"{total} matches for '{pattern}':\n" + "\n".join(lines) + more)
 
     # ------------------------------------------------------------------ commands
     def run_command(self, command: str, timeout: float = 90.0, cwd: Optional[str] = None,
-                    memory_cap_mb: Optional[int] = None) -> Tuple[str, int]:
+                    memory_cap_mb: Optional[int] = None, cancel: Optional[threading.Event] = None) -> Tuple[str, int]:
+        """Runs a command and returns its output and exit code. [cancel] is the reply's stop signal: Stop, Escape and Send
+        now set it, and the command's whole process group is killed within a quarter of a second."""
         timeout = max(1.0, min(float(timeout or 90.0), 900.0 if (memory_cap_mb or "forge-gradle" in command) else 600.0))
         wd = self.resolve(cwd, must_exist=True) if cwd else self.root
         from .toolchains import tool_env
@@ -633,6 +790,10 @@ class Workspace:
                 if time.monotonic() - start > timeout:
                     self._kill(proc)
                     chunks.append(f"\n[command killed after {timeout:.0f} s timeout]".encode())
+                    break
+                if cancel is not None and cancel.is_set():
+                    self._kill(proc)
+                    chunks.append(b"\n[command stopped: the user stopped the reply]")
                     break
                 ready, _, _ = select.select([fd], [], [], 0.25)
                 if ready:
@@ -711,7 +872,12 @@ class Workspace:
             if len(results) >= limit:
                 break
         if not results:
-            return f"No web results for '{query}'."
+            # A page without results is either DuckDuckGo's own "no results" page or something else (a check that asks
+            # to prove a human is searching, an error page); the second is not "nothing found" and is said as such.
+            if re.search(r'class="no-results"|No results\.|No more results', page):
+                return f"No web results for '{query}'."
+            return (f"The search engine did not return a results page for '{query}' (it may be asking to check that a "
+                    "person is searching). Try again later, or use web_fetch on an address you know.")
         out = [f"Web results for '{query}':"]
         for i, (t, u, sn) in enumerate(results, 1):
             out.append(f"{i}. {t}\n   {u}\n   {sn}")
@@ -748,6 +914,8 @@ TOOL_SPECS: List[dict] = [
      "parameters": {"todos": "array of {\"content\": string, \"status\": \"pending\" | \"in_progress\" | \"completed\"}"}},
     {"name": "remember", "description": "Save a durable memory: a preference, convention or fact the user will want you to know in future chats (for example 'Use tabs in this project' or 'The user prefers pytest'). The user approves each memory. Do not save one-off details.",
      "parameters": {"memory": "string, one sentence", "scope": "string, optional: 'project' (default) or 'global'"}},
+    {"name": "use_skill", "description": "Load a skill from the Skills list in the prompt: returns its SKILL.md instructions and where its other files are. Use it when the user's request clearly fits a skill, then follow the instructions.",
+     "parameters": {"name": "string, the skill's name from the Skills list"}},
     {"name": "docs_search", "description": "Search documentation the user has indexed with @Docs (see the Docs list in the prompt).",
      "parameters": {"name": "string, the documentation name", "query": "string"}},
     {"name": "ask_user", "description": "Stop and ask the user a question when a decision is genuinely theirs (requirements, which option to pick). Do not use it for things you can find out with the other tools.",

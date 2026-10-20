@@ -4,9 +4,9 @@ import android.content.Context
 import android.graphics.Typeface
 import android.text.SpannableStringBuilder
 import android.text.Spanned
+import android.text.TextUtils
 import android.text.style.ForegroundColorSpan
 import android.util.TypedValue
-import android.view.Gravity
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.PopupMenu
@@ -16,9 +16,12 @@ import org.json.JSONObject
 import java.net.URLEncoder
 
 /**
- * The LOGCAT tab: the Googlebook's own log, streamed by the Forge server over adb (the server picks the connected
- * Googlebook). An app id narrows it to one app, the level drops quieter lines, the filter hides lines that do not
- * contain the text. Warnings are yellow and errors red, as on the old page. At most 2,000 lines are kept.
+ * The LOGCAT tab: the log of the target device (the one chosen with Use in the Android view: this Googlebook, a
+ * virtual device or a paired device), streamed by the Forge server over adb; the header names the device once the
+ * stream has started. An app id narrows it to that app's process, and the server follows the app when its process
+ * starts again (a crash, a new install); while the app does not run, the log says so and waits for it. The level
+ * drops quieter lines, the filter hides lines that do not contain the text. Warnings are yellow and errors red, as
+ * on the old page. At most 2,000 lines are kept, and the chat button attaches the last 400 shown lines.
  */
 class LogcatPanel(private val ctx: Context, private val host: MainActivity) {
     val view: LinearLayout = LinearLayout(ctx)
@@ -29,6 +32,9 @@ class LogcatPanel(private val ctx: Context, private val host: MainActivity) {
     private val levelPill: TextView
     private val toggle = Ui.miniButton(ctx, R.drawable.ic_run, "Start the log") { if (ws == null) start() else stop() }
     private val state = Ui.text(ctx, "stopped", 11f, Ui.fg3)
+    /** The device the stream reads, as the server named it. */
+    private val deviceLabel = Ui.text(ctx, "", 11f, Ui.fg2)
+    private var deviceName = ""
     private var level = "V"
     private var ws: Api.WebSocketClient? = null
     private val lines = ArrayList<String>()
@@ -48,12 +54,17 @@ class LogcatPanel(private val ctx: Context, private val host: MainActivity) {
             m.show()
         }
         val clear = Ui.miniButton(ctx, R.drawable.ic_trash, "Clear") { lines.clear(); render() }
-        val head = Ui.row(ctx, appId, levelPill, filter, toggle, clear, state)
+        val chat = Ui.miniButton(ctx, R.drawable.ic_chat, "Add the shown log lines to the chat (the last 400)") { addToChat() }
+        deviceLabel.isSingleLine = true
+        deviceLabel.ellipsize = TextUtils.TruncateAt.END
+        val head = Ui.row(ctx, appId, levelPill, filter, toggle, chat, clear, state, deviceLabel)
         appId.layoutParams = Ui.lp(Ui.dp(ctx, 200), Ui.wrap)
         levelPill.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = Ui.dp(ctx, 6) }
         filter.layoutParams = Ui.lp(0, Ui.wrap, 1f).also { it.leftMargin = Ui.dp(ctx, 6) }
-        for (b in listOf(toggle, clear)) b.layoutParams = Ui.lp(Ui.dp(ctx, 24), Ui.dp(ctx, 24)).also { it.leftMargin = Ui.dp(ctx, 6) }
+        for (b in listOf(toggle, chat, clear)) b.layoutParams = Ui.lp(Ui.dp(ctx, 24), Ui.dp(ctx, 24)).also { it.leftMargin = Ui.dp(ctx, 6) }
         state.setPadding(Ui.dp(ctx, 8), 0, 0, 0)
+        deviceLabel.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = Ui.dp(ctx, 8) }
+        deviceLabel.maxWidth = Ui.dp(ctx, 260)
         head.setPadding(pad, Ui.dp(ctx, 4), pad, Ui.dp(ctx, 4))
         head.setBackgroundColor(Ui.bg2)
         view.addView(head, Ui.lp(Ui.match, Ui.wrap))
@@ -63,7 +74,7 @@ class LogcatPanel(private val ctx: Context, private val host: MainActivity) {
         out.setTextColor(Ui.fg2)
         out.setTextIsSelectable(true)
         out.setPadding(pad, Ui.dp(ctx, 4), pad, Ui.dp(ctx, 4))
-        out.text = "Press the start button to stream the Googlebook's log here."
+        out.text = "Press the start button to stream the target device's log here. That is the device chosen with Use in the Android view. When it is not chosen or not online, it is a running virtual device, then this Googlebook, then any other connected device."
         scroll.addView(out, android.widget.FrameLayout.LayoutParams(Ui.match, Ui.wrap))
         scroll.viewTreeObserver.addOnScrollChangedListener { val c = scroll.getChildAt(0); stick = c == null || c.bottom - (scroll.height + scroll.scrollY) < Ui.dp(ctx, 60) }
         view.addView(scroll, Ui.lp(Ui.match, 0, 1f))
@@ -75,10 +86,17 @@ class LogcatPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     private fun start() {
-        val q = "/ws/logcat?app_id=" + URLEncoder.encode(appId.text.toString().trim(), "UTF-8") + "&level=" + level
-        lines.add("[Logcat started" + (if (appId.text.isNotBlank()) " for " + appId.text.toString().trim() else "") + "]")
+        val app = appId.text.toString().trim()
+        val q = "/ws/logcat?app_id=" + URLEncoder.encode(app, "UTF-8") + "&level=" + level
+        lines.add("[Logcat started" + (if (app.isNotEmpty()) " for $app" else "") + "]")
         render()
-        val client = Api.WebSocketClient(q, { text -> onMessage(text) }, { why -> ws = null; lines.add("[The log stream ended: $why]"); render(); state.text = "stopped"; toggle.setImageDrawable(Ui.icon(ctx, R.drawable.ic_run, 0)) })
+        lateinit var client: Api.WebSocketClient
+        client = Api.WebSocketClient(q, { text -> if (ws === client) onMessage(text) }, { why ->
+            if (ws !== client) return@WebSocketClient
+            lines.add("[The log stream ended: $why]")
+            render()
+            stopped()
+        })
         ws = client
         client.connect()
         state.text = "streaming"
@@ -87,7 +105,13 @@ class LogcatPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     private fun stop() {
-        ws?.close(); ws = null
+        ws?.close()
+        stopped()
+    }
+
+    /** The stream is over, whoever ended it: the state and the button say so. */
+    private fun stopped() {
+        ws = null
         state.text = "stopped"
         toggle.setImageDrawable(Ui.icon(ctx, R.drawable.ic_run, 0))
         toggle.tooltipText = "Start the log"
@@ -95,21 +119,36 @@ class LogcatPanel(private val ctx: Context, private val host: MainActivity) {
 
     private fun onMessage(text: String) {
         val msg = try { JSONObject(text) } catch (e: Exception) { return }
-        when (msg.optString("type")) {
-            "info" -> lines.add("[" + msg.optString("text") + "]")
-            "end" -> lines.add("[The log stream ended.]")
-            "lines" -> { val arr = msg.optJSONArray("lines") ?: return; for (i in 0 until arr.length()) lines.add(arr.getString(i)) }
+        when (msg.optText("type")) {
+            "device" -> {
+                deviceName = msg.optText("name").ifEmpty { msg.optText("serial") }
+                deviceLabel.text = deviceName
+                deviceLabel.tooltipText = "The log comes from $deviceName (" + msg.optText("serial") + ")"
+                lines.add("[Streaming the log of $deviceName]")
+            }
+            "info" -> lines.add("[" + msg.optText("text") + "]")
+            "end" -> {
+                // The server ended the stream (its time or size limit, or the device went away): nothing streams now.
+                lines.add("[The log stream ended.]")
+                ws?.close()
+                stopped()
+            }
+            "lines" -> { val arr = msg.optJSONArray("lines") ?: return; for (i in 0 until arr.length()) lines.add(arr.optText(i)) }
             else -> return
         }
         while (lines.size > 2000) lines.removeAt(0)
         render()
     }
 
-    private fun render() {
+    /** The lines the filter lets through (Forge's own bracketed notes always show). */
+    private fun shownLines(): List<String> {
         val f = filter.text.toString().trim().lowercase()
+        return if (f.isEmpty()) lines else lines.filter { it.startsWith("[") || it.lowercase().contains(f) }
+    }
+
+    private fun render() {
         val sb = SpannableStringBuilder()
-        for (line in lines) {
-            if (f.isNotEmpty() && !line.lowercase().contains(f) && !line.startsWith("[")) continue
+        for (line in shownLines()) {
             val start = sb.length
             sb.append(line).append('\n')
             val color = when {
@@ -123,6 +162,25 @@ class LogcatPanel(private val ctx: Context, private val host: MainActivity) {
         }
         out.text = sb
         if (stick) scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    /** The last 400 shown log lines (at most 12,000 characters, the newest kept) go to the chat as context. */
+    private fun addToChat() {
+        val shown = shownLines().filter { !it.startsWith("[") }
+        if (shown.isEmpty()) { Ui.toast(ctx, "The log has no lines to add."); return }
+        val picked = ArrayList<String>()
+        var size = 0
+        for (line in shown.takeLast(400).asReversed()) {
+            if (size + line.length + 1 > 12000) break
+            picked.add(line); size += line.length + 1
+        }
+        picked.reverse()
+        val app = appId.text.toString().trim()
+        val f = filter.text.toString().trim()
+        val title = "Logcat" + (if (deviceName.isNotEmpty()) " of $deviceName" else "") + (if (app.isNotEmpty()) " for $app" else "") +
+            ", level $level and up" + (if (f.isNotEmpty()) ", lines containing \"$f\"" else "") + " (the last ${picked.size} lines)"
+        host.addToChat(JSONObject().put("kind", "text").put("title", title).put("name", "Logcat")
+            .put("text", "```\n" + picked.joinToString("\n") + "\n```"))
     }
 
     fun close() { stop() }

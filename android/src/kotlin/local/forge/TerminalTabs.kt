@@ -4,6 +4,7 @@ import android.content.Context
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.FrameLayout
@@ -121,6 +122,21 @@ class TerminalTabs(private val ctx: Context, private val host: MainActivity) {
         Api.main.postDelayed({ p.pasteText(command + "\n") }, 900)
     }
 
+    /**
+     * Runs a command in a new shell tab named [label], in a subshell (so its cd and exit stay inside it), and reports
+     * its exit code to [onDone]: the line ends by printing an OSC 7737 with a one-time token and the code, which the
+     * emulator passes on. Killing the tab first reports -1. The Android view's builds and the debugger's
+     * preLaunchTask use it. [cwd] is a folder to run in (empty: the window's folder).
+     */
+    fun runTask(command: String, label: String, cwd: String = "", onDone: (Int) -> Unit) {
+        val p = addTerminal(label.take(28))
+        val token = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
+        val dir = if (cwd.isEmpty()) "" else "cd -- '" + cwd.replace("'", "'\\''") + "' || exit 1; "
+        // The leading space keeps the line out of bash's history when HISTCONTROL ignores such lines.
+        val line = " ( $dir$command ); printf '\\033]7737;forge-done;%s;%s\\007' $token \"\$?\"\n"
+        Api.main.postDelayed({ p.runTask(line, token, onDone) }, 900)
+    }
+
     /** A new shell that starts in a folder of the project (the Explorer's Open a terminal here). */
     fun openIn(dir: String) {
         val p = addTerminal(dir.trimEnd('/').substringAfterLast('/').ifEmpty { "" })
@@ -153,6 +169,10 @@ class TerminalTabs(private val ctx: Context, private val host: MainActivity) {
             t.setPadding(Ui.dp(ctx, 9), Ui.dp(ctx, 4), Ui.dp(ctx, 10), Ui.dp(ctx, 4))
             t.background = if (p === active) Ui.rounded(Ui.bg3, 6, Ui.border) else null
             t.setOnClickListener { activate(p); p.focusInput() }
+            // A middle click on a tab kills that shell, as on Cursor's terminal tabs (and Forge's editor tabs).
+            t.setOnTouchListener { _, ev ->
+                if (ev.actionMasked == MotionEvent.ACTION_DOWN && (ev.buttonState and MotionEvent.BUTTON_TERTIARY) != 0) { kill(p); true } else false
+            }
             t.tooltipText = "Shell " + (i + 1) + ". Middle-click kills it."
             tabRow.addView(t, Ui.lp(Ui.wrap, Ui.wrap).also { it.rightMargin = Ui.dp(ctx, 4) })
         }
@@ -177,16 +197,24 @@ class TerminalTabs(private val ctx: Context, private val host: MainActivity) {
     }
 
     /** Ends the shown shell on the server; the last shell is replaced by a fresh one instead of leaving nothing. */
-    fun killActive() {
-        val p = active ?: return
+    fun killActive() { active?.let { kill(it) } }
+
+    /**
+     * Ends one shell on the server. The last shell is replaced by a fresh one, connected only once the server has
+     * answered the kill, so it never attaches to the dying shell.
+     */
+    fun kill(p: TerminalPanel) {
+        if (!panels.contains(p)) return
         if (splitWith === p) splitWith = null
+        if (panels.size == 1) {
+            p.kill { if (online && panels.contains(p)) p.connect() }
+            return
+        }
         p.kill()
-        if (panels.size == 1) { if (online) p.connect(); return }
         panels.remove(p)
         titles.remove(p)
         content.removeView(p.view)
-        activate(panels.last())
-        panels.last().focusInput()
+        if (active === p || active == null) { activate(panels.last()); panels.last().focusInput() } else activate(active!!)
     }
 
     /** The text size of every shell (Settings, Editor font size). */
@@ -230,12 +258,14 @@ class TerminalTabs(private val ctx: Context, private val host: MainActivity) {
         aiInput.isEnabled = false
         aiStatus.setTextColor(Ui.fg3)
         aiStatus.text = "Asking the model…"
-        val body = JSONObject().put("instruction", instruction).put("cwd", Api.folder)
+        // The shell's id lets the server tell the model the folder the shell is in now (where cd took it); the
+        // window's folder is the fallback.
+        val body = JSONObject().put("instruction", instruction).put("cwd", Api.folder).put("term", active?.id ?: "")
         Api.async("terminal-command", { Api.post("/api/terminal_command", body, 620000) }) { r, e ->
             aiBusy = false
             aiInput.isEnabled = true
             if (r == null) { aiStatus.setTextColor(Ui.red); aiStatus.text = "Not written: " + (e?.message ?: "no answer"); return@async }
-            val cmd = r.optString("command").trim()
+            val cmd = r.optText("command").trim()
             if (cmd.isEmpty()) { aiStatus.setTextColor(Ui.red); aiStatus.text = "The model returned no command."; return@async }
             val dangerous = r.optBoolean("dangerous", false)
             if (run && !dangerous) { active?.pasteText(cmd + "\n"); closeAi(); return@async }

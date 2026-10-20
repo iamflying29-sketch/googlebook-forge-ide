@@ -163,7 +163,7 @@ class NotebookPanel(private val ctx: Context, private val host: MainActivity) {
         val interrupt = Ui.button(ctx, R.drawable.ic_stop, "Interrupt", "Stop the running cell") { interrupt() }
         val restart = Ui.button(ctx, R.drawable.ic_refresh, "Restart", "Restart the kernel (variables are cleared)") { restart() }
         val clear = Ui.button(ctx, "Clear outputs") { clearOutputs() }
-        val json = Ui.button(ctx, "{ } JSON") { if (path.isNotEmpty()) host.openFileAt(path, 0) }
+        val json = Ui.button(ctx, "{ } JSON") { if (path.isNotEmpty()) host.openFileAsText(path) }
         val save = Ui.button(ctx, "Save", primary = true) { save() }
         kernelChip = Ui.chip(ctx, "Kernel", Ui.fg3) { v -> showKernelMenu(v) }
         statusDot = Ui.dot(ctx, Ui.fg3)
@@ -225,7 +225,7 @@ class NotebookPanel(private val ctx: Context, private val host: MainActivity) {
             val t = Ui.text(ctx, "This file is not a valid notebook. Open it as JSON to see and fix it.", 12.5f, Ui.fg2)
             t.setPadding(Ui.dp(ctx, 8), Ui.dp(ctx, 8), Ui.dp(ctx, 8), Ui.dp(ctx, 8))
             cellsCol.addView(t, Ui.lp(Ui.match, Ui.wrap))
-            val b = Ui.button(ctx, "Open as JSON") { host.openFileAt(path, 0) }
+            val b = Ui.button(ctx, "Open as JSON") { host.openFileAsText(path) }
             cellsCol.addView(b, Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = Ui.dp(ctx, 8) })
             return
         }
@@ -272,6 +272,13 @@ class NotebookPanel(private val ctx: Context, private val host: MainActivity) {
             Ui.toast(ctx, "Saved " + p)
             done?.invoke()
         }
+    }
+
+    /** The file was renamed (Explorer Rename): saves go to the new name, and the kernel connects again under it. */
+    fun renameTo(p: String) {
+        close()
+        path = p
+        fileLabel.text = p
     }
 
     /** Closes the kernel connection (the server stops a kernel nobody is attached to after ten minutes). */
@@ -369,7 +376,7 @@ class NotebookPanel(private val ctx: Context, private val host: MainActivity) {
         kernelState = "starting"
         renderStatus()
         attached = false
-        val client = Api.WebSocketClient("/ws/kernel?folder=" + enc(Api.folder) + "&path=" + enc(path), { onText(it) }, { why -> onClosed(why) })
+        val client = Api.WebSocketClient("/ws/kernel?folder=" + enc(host.windowFolder()) + "&path=" + enc(path), { onText(it) }, { why -> onClosed(why) })
         ws = client
         client.connect()
     }

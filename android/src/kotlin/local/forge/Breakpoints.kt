@@ -99,6 +99,37 @@ object Breakpoints {
         notify(p)
     }
 
+    /** True when the file has at least one breakpoint (the editor's quick check before it works out an edit's lines). */
+    fun has(path: String): Boolean = synchronized(this) { ensureLoaded(); lines[normalize(path)]?.isNotEmpty() == true }
+
+    /**
+     * An edit moved a file's lines, and its breakpoints move with the text, as in Cursor. [first] is the 1-based line
+     * where the edit starts, [atLineStart] is true when it starts at that line's first column, and [removed] and [added]
+     * are the line breaks the edit took out and put in. Removed breaks join their lines into [first]; added breaks push
+     * the lines after the edit point down (the edit's own line too when the edit starts at its first column).
+     */
+    fun shiftForEdit(path: String, first: Int, atLineStart: Boolean, removed: Int, added: Int) {
+        val p = normalize(path)
+        synchronized(this) {
+            ensureLoaded()
+            val set = lines[p] ?: return
+            val off = disabled[p] ?: emptySet<Int>()
+            val out = java.util.TreeSet<Int>(); val outOff = HashSet<Int>()
+            for (b in set) {
+                var nb = b
+                if (removed > 0) { if (nb > first + removed) nb -= removed else if (nb > first) nb = first }
+                if (added > 0 && (nb > first || (nb == first && atLineStart))) nb += added
+                out.add(nb)
+                if (b in off) outOff.add(nb)
+            }
+            if (out == set) return
+            lines[p] = out
+            if (outOff.isEmpty()) disabled.remove(p) else disabled[p] = outOff
+            persist()
+        }
+        notify(p)
+    }
+
     /** Removes every breakpoint and returns the files that had one, so the caller can tell the adapter. */
     fun clear(): List<String> {
         val had: List<String>

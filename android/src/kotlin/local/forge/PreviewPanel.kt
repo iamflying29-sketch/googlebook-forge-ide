@@ -96,6 +96,7 @@ object PreviewPanel {
                 return t
             }
             val dir = if (path.contains('/')) path.substringBeforeLast('/') + "/" else ""
+            // "/x.png" means the project's root, as on GitHub; anything else is next to the Markdown file.
             val rel = normalize(if (src.startsWith("/")) src.trimStart('/') else dir + src)
             val iv = ImageView(ctx)
             iv.adjustViewBounds = true
@@ -111,7 +112,8 @@ object PreviewPanel {
         private fun normalize(p: String): String {
             val out = ArrayList<String>()
             for (seg in p.split('/')) when (seg) { "", "." -> {}; ".." -> if (out.isNotEmpty()) out.removeAt(out.size - 1); else -> out.add(seg) }
-            return out.joinToString("/")
+            // A file in a folder added to the window has an absolute path; its images keep the leading slash.
+            return (if (p.startsWith("/")) "/" else "") + out.joinToString("/")
         }
     }
 

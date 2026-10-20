@@ -37,13 +37,35 @@ def adapter_command(lang: str) -> Optional[list]:
     return None
 
 
-def _gdb_has_dap(gdb: str) -> bool:
+def _gdb_version(gdb: str) -> str:
     try:
         out = subprocess.run([gdb, "--version"], capture_output=True, text=True, timeout=10).stdout
-        m = re.search(r"(\d+)\.(\d+)", out)
-        return bool(m) and int(m.group(1)) >= 14
     except (OSError, subprocess.TimeoutExpired):
-        return False
+        return ""
+    m = re.search(r"(\d+)\.(\d+)", out)
+    return m.group(0) if m else ""
+
+
+def _gdb_has_dap(gdb: str) -> bool:
+    v = _gdb_version(gdb)
+    return bool(v) and int(v.split(".")[0]) >= 14
+
+
+def adapter_missing(lang: str) -> str:
+    """Why there is no debug adapter for a language, in words for the Debug console."""
+    if lang == "python":
+        return "The Python debugger (debugpy) is not installed. Install it with install-extras.sh debug, which runs sudo apt install python3-debugpy."
+    if lang in ("c", "cpp", "rust"):
+        gdb = shutil.which("gdb")
+        if not gdb:
+            return "GDB is not installed. Install it with install-extras.sh debug, which runs sudo apt install gdb."
+        v = _gdb_version(gdb)
+        if not v or int(v.split(".")[0]) < 14:
+            return (f"GDB {v or 'of an unknown version'} is installed, and Forge debugs C, C++ and Rust through GDB's Debug "
+                    "Adapter Protocol mode, which needs GDB 14 or newer.")
+        if lang == "rust":
+            return "rust-gdb was not found on Forge's PATH. It comes with every Rust toolchain that rustup installs (install-extras.sh rust installs one)."
+    return f"Forge has no debugger for {lang}."
 
 
 def _run(cmd: list, cwd: str, timeout: int) -> tuple:
@@ -105,6 +127,10 @@ def prepare(path: str, root: str) -> dict:
         ok = code == 0 and bool(program)
         return {"ok": ok, "lang": lang, "program": program, "cwd": crate, "build": "forge-cargo build", "output": "\n".join(text)[-6000:],
                 "message": "" if ok else ("The crate did not build. The build output is in the Debug console." if code else "The crate has no program to run (it is a library).")}
+    # Code of an Android module runs on a device, against Android's classes: it cannot run as a plain JVM program.
+    android = _android_module(path, root)
+    if android:
+        return {"ok": False, "message": android}
     # Kotlin and Java: the main class, from the package line and the file name, then a build with the Kotlin
     # compiler (and javac for Java files) into Forge's own build folder, because the Kotlin server compiles nothing
     # in Forge's light project model.
@@ -125,6 +151,45 @@ def prepare(path: str, root: str) -> dict:
         cls = base
     main = (pkg.group(1) + "." if pkg else "") + cls
     return _build_jvm(path, root, lang, main)
+
+
+def _android_module(path: str, root: str) -> str:
+    """When a Kotlin or Java file belongs to an Android module, what to use instead of F5; otherwise "". The module
+    is the nearest folder with a Gradle build file; it is an Android module when that file applies an Android
+    plugin or has an android { } block. In a Kotlin Multiplatform module only the android source sets count."""
+    from .kotlin_workspace import is_kmp_module
+    root = os.path.abspath(root)
+    d = os.path.dirname(os.path.abspath(path))
+    gradle = ""
+    while d.startswith(root):
+        gradle = next((os.path.join(d, n) for n in ("build.gradle.kts", "build.gradle") if os.path.isfile(os.path.join(d, n))), "")
+        if gradle or d == root:
+            break
+        d = os.path.dirname(d)
+    if not gradle:
+        return ""
+    try:
+        with open(gradle, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read(300000)
+    except OSError:
+        return ""
+    if not (re.search(r"(^|\n)\s*android\s*\{", text) or re.search(r"com\.android\.(application|library|dynamic-feature|test)|plugins\.android\.(application|library)", text)):
+        return ""
+    parts = os.path.relpath(path, d).split(os.sep)
+    source_set = parts[1] if len(parts) > 2 and parts[0] == "src" else "main"
+    if is_kmp_module(d) and not source_set.startswith("android"):
+        return ""   # shared and JVM code of a multiplatform module runs on the JVM
+    mod = os.path.relpath(d, root)
+    mod = "at the project's top" if mod == "." else mod
+    if source_set == "test" or source_set.startswith("test") or source_set == "androidUnitTest":
+        return (f"This is a local unit test of the Android module {mod}. Run it with Unit tests in the Android view "
+                "(forge-gradle test); Forge's debugger does not attach to Gradle's test runs.")
+    if source_set.startswith("androidTest") or source_set == "androidInstrumentedTest":
+        return (f"This is an instrumented test of the Android module {mod}. It runs on a device through Gradle "
+                "(forge-gradle connectedAndroidTest in a terminal); Forge's debugger does not attach to it.")
+    return (f"This file belongs to the Android module {mod}, which runs on an Android device, not as a plain JVM program. "
+            "Build and install the app with Build, install and run in the Android view, then use Debug on device there: "
+            "your breakpoints in this file then stop the app on the device.")
 
 
 def _source_root(path: str, root: str) -> str:

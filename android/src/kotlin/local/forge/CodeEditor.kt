@@ -211,7 +211,9 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
             }
             when (code) {
                 KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
-                    if (ev.isCtrlPressed && ev.isAltPressed) replaceAll() else if (v === replaceInput) replaceOne() else findNext(!ev.isShiftPressed); true
+                    // Alt Enter in the find field selects every match (a cursor on each), as in Cursor.
+                    if (ev.isCtrlPressed && ev.isAltPressed) replaceAll() else if (ev.isAltPressed && v !== replaceInput) selectAllFindMatches()
+                    else if (v === replaceInput) replaceOne() else findNext(!ev.isShiftPressed); true
                 }
                 KeyEvent.KEYCODE_ESCAPE -> { hideFind(); true }
                 else -> false
@@ -265,8 +267,19 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
         edit.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence, start: Int, count: Int, after: Int) {
                 if (!muteHistory) pendingRemoved = s.subSequence(start, start + count).toString()
+                bpRemovedBreaks = if (wholeText || mirroring || path.isEmpty()) 0 else (start until start + count).count { s[it] == '\n' }
             }
             override fun onTextChanged(s: CharSequence, start: Int, before: Int, count: Int) {
+                // Breakpoints move with the text when an edit adds or removes line breaks (once per document: the
+                // other editors of the same file only mirror the edit).
+                if (!wholeText && !mirroring && path.isNotEmpty()) {
+                    val addedBreaks = (start until start + count).count { s[it] == '\n' }
+                    if ((bpRemovedBreaks > 0 || addedBreaks > 0) && Breakpoints.has(path)) {
+                        var line = 0
+                        for (i in 0 until start.coerceAtMost(s.length)) if (s[i] == '\n') line++
+                        Breakpoints.shiftForEdit(path, line + 1, start == 0 || s[start - 1] == '\n', bpRemovedBreaks, addedBreaks)
+                    }
+                }
                 val added = s.subSequence(start, start + count).toString()
                 if (!muteHistory) record(Edit(start, pendingRemoved, added, System.currentTimeMillis()))
                 if (!mirroring) changeHook?.invoke(start, before, added)
@@ -319,6 +332,10 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
 
     // ------------------------------------------------------------------ content
     /** Loads a file's text. The language comes from the path. Undo history and the dirty state start fresh. */
+    /** True while the whole text is replaced (a file loaded or reloaded): breakpoints keep their lines then. */
+    private var wholeText = false
+    private var bpRemovedBreaks = 0
+
     fun setContent(text: String, path: String) {
         this.path = path
         diagnostics = emptyList()
@@ -326,9 +343,9 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
         executionLine = -1
         ghost = null; ghostOffset = -1
         dropFoldsForNewText(); extra.clear(); cursorUndo.clear(); expandStack.clear()
-        muteHistory = true
+        muteHistory = true; wholeText = true
         edit.setText(text)
-        muteHistory = false
+        muteHistory = false; wholeText = false
         undoStack.clear(); redoStack.clear()
         edit.setSelection(0)
         edit.scrollTo(0, 0)
@@ -342,9 +359,9 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
         val sel = edit.selectionStart.coerceAtLeast(0)
         val sx = edit.scrollX; val sy = edit.scrollY
         dropFoldsForNewText(); extra.clear(); cursorUndo.clear(); expandStack.clear()
-        muteHistory = true
+        muteHistory = true; wholeText = true
         edit.setText(text)
-        muteHistory = false
+        muteHistory = false; wholeText = false
         undoStack.clear(); redoStack.clear()
         edit.setSelection(sel.coerceAtMost(text.length))
         post { edit.scrollTo(sx, sy.coerceAtMost(maxScrollY())) }
@@ -1993,6 +2010,8 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
     inner class Fold {
         val height = FoldHeightSpan()
         val hides = ArrayList<FoldHideSpan>()
+        /** Made by Fold Recursively: opening it leaves the regions inside folded (each of them recursive too). */
+        var recursive = false
         fun start(): Int = edit.text.getSpanStart(height)
         fun end(): Int = edit.text.getSpanEnd(height)
     }
@@ -2126,22 +2145,42 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
     fun unfoldAtCursor() {
         val line = logicalLineAt(cursorOffset())
         val f = foldAtHeader(line) ?: folds.filter { logicalLineAt(it.start()) - 1 <= line && logicalLineAt((it.end() - 1).coerceAtLeast(0)) >= line }.maxByOrNull { it.start() } ?: return
-        removeFold(f); afterFoldChange()
+        openFold(f)
     }
 
     /** Ctrl K Ctrl L: folds or opens the region at the cursor. */
     fun toggleFold() {
         val line = logicalLineAt(cursorOffset())
         val f = foldAtHeader(line)
-        if (f != null) { removeFold(f); afterFoldChange() } else foldAtCursor()
+        if (f != null) openFold(f) else foldAtCursor()
     }
 
-    /** Ctrl K Ctrl [ and Ctrl K Ctrl ]: the region at the cursor and every region inside it. */
+    /** Ctrl K Ctrl [ and Ctrl K Ctrl ]: the region at the cursor and every region inside it. Folds here hide the text
+     *  of the regions inside them, so a recursive fold remembers that its inner regions are folded too: opening it
+     *  shows them folded (see openFold). */
     fun foldRecursively(fold: Boolean) {
         val regions = foldRegions()
         val r = regionAtCursor(regions) ?: return
         if (!fold) { for (f in folds.filter { logicalLineAt(it.start()) - 1 >= r.first && logicalLineAt(it.start()) - 1 <= r.second }) removeFold(f); afterFoldChange(); return }
         addFold(r.first, r.second)
+        foldAtHeader(r.first)?.recursive = true
+    }
+
+    /** Opens one fold (a click, Ctrl Shift ], Ctrl K Ctrl L). A recursive fold leaves the regions directly inside it
+     *  folded, recursively, as Cursor's Fold Recursively does. */
+    private fun openFold(f: Fold) {
+        val header = logicalLineAt(f.start()) - 1
+        val last = logicalLineAt((f.end() - 1).coerceAtLeast(0))
+        removeFold(f)
+        if (f.recursive) {
+            val inner = foldRegions().filter { it.first > header && it.second <= last }
+            var coveredUntil = -1
+            for ((h, l) in inner.sortedWith(compareBy({ it.first }, { -it.second }))) {
+                if (h <= coveredUntil) continue
+                addFold(h, l); foldAtHeader(h)?.recursive = true; coveredUntil = l
+            }
+        }
+        afterFoldChange()
     }
 
     /** Ctrl K Ctrl 0 folds every region from the outside in; Ctrl K Ctrl J opens all of them. */
@@ -2186,7 +2225,7 @@ class CodeEditor(ctx: Context) : LinearLayout(ctx) {
     /** A gutter click on a header line folds or opens its region. */
     fun toggleFoldAtLine(line: Int): Boolean {
         val f = foldAtHeader(line)
-        if (f != null) { removeFold(f); afterFoldChange(); return true }
+        if (f != null) { openFold(f); return true }
         val r = foldRegions().filter { it.first == line }.maxByOrNull { it.second - it.first } ?: return false
         addFold(r.first, r.second)
         return true

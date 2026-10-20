@@ -30,7 +30,7 @@ import org.json.JSONObject
  * your own). Up and Down move, Enter or Tab picks, Escape closes; the typed @word or /word is removed on a pick.
  */
 class ChatMentions(private val ctx: Context, private val host: MainActivity, private val prompt: EditText, private val anchor: View,
-                   private val onPick: (Item) -> Unit) {
+                   private val onPick: (Item, Int) -> Unit) {
     class Item(val label: String, val hint: String, val icon: Int, val kind: String, val data: JSONObject = JSONObject())
 
     private fun dp(v: Int) = Ui.dp(ctx, v)
@@ -45,6 +45,7 @@ class ChatMentions(private val ctx: Context, private val host: MainActivity, pri
     private var docs = JSONArray()
     private var chats = JSONArray()
     private var commands = JSONArray()
+    private var skills = JSONArray()
     private var notepads = JSONArray()
     private val updateTask = Runnable { update() }
 
@@ -57,7 +58,7 @@ class ChatMentions(private val ctx: Context, private val host: MainActivity, pri
             val it = items[position]
             val icon = row.getChildAt(0) as ImageView
             if (it.kind == "file") icon.setImageDrawable(FileIcons.file(ctx, it.label.substringAfterLast('/')))
-            else icon.setImageDrawable(Ui.icon(ctx, it.icon, if (it.kind == "command") Ui.accent2 else Ui.fg3))
+            else icon.setImageDrawable(Ui.icon(ctx, it.icon, when (it.kind) { "command" -> Ui.accent2; "skill" -> 0xffd7b4ff.toInt(); else -> Ui.fg3 }))
             (row.getChildAt(1) as TextView).text = if (it.kind == "file") it.label.substringAfterLast('/') else it.label
             (row.getChildAt(2) as TextView).text = if (it.kind == "file") (if (it.label.contains('/')) it.label.substringBeforeLast('/') else "") + (if (it.hint.isNotEmpty()) "  " + it.hint else "") else it.hint
             row.background = if (position == selected) Ui.rounded(0x33ff8a3d, 4) else null
@@ -117,6 +118,7 @@ class ChatMentions(private val ctx: Context, private val host: MainActivity, pri
                 docs = r[0].optJSONArray("docs") ?: JSONArray()
                 chats = r[1].optJSONArray("sessions") ?: JSONArray()
                 commands = r[2].optJSONArray("commands") ?: JSONArray()
+                skills = r[2].optJSONArray("skills") ?: JSONArray()
                 notepads = r[3].optJSONArray("notepads") ?: JSONArray()
                 cacheAt = System.currentTimeMillis()
                 commandsTried = true
@@ -136,15 +138,20 @@ class ChatMentions(private val ctx: Context, private val host: MainActivity, pri
         for (i in 0 until commands.length()) { val c = commands.optJSONObject(i) ?: continue; if (c.optString("name") == name) return c }
         return null
     }
+    fun skill(name: String): JSONObject? {
+        for (i in 0 until skills.length()) { val c = skills.optJSONObject(i) ?: continue; if (c.optString("name") == name) return c }
+        return null
+    }
 
     private fun update() {
         val text = prompt.text.toString()
         val pos = prompt.selectionStart.coerceIn(0, text.length)
         val before = text.substring(0, pos)
         val g = ++generation
-        // "/" commands: only at the very start, before any space.
-        if (before.startsWith("/") && !before.contains(' ') && !before.contains('\n')) {
-            val q = before.substring(1).lowercase()
+        // "/" commands and skills: at the start of a word (as in Cursor), until a space ends the word.
+        val sl = before.lastIndexOf('/')
+        if (sl >= 0 && (sl == 0 || before[sl - 1].isWhitespace()) && before.substring(sl + 1).none { it.isWhitespace() || it == '/' }) {
+            val q = before.substring(sl + 1).lowercase()
             refreshCache {
                 if (g != generation) return@refreshCache
                 val out = ArrayList<Item>()
@@ -153,7 +160,13 @@ class ChatMentions(private val ctx: Context, private val host: MainActivity, pri
                     val name = c.optString("name")
                     if (q.isEmpty() || name.startsWith(q) || name.contains(q)) out.add(Item("/" + name, c.optString("description"), R.drawable.ic_command, "command", c))
                 }
-                slash = true; start = 0
+                for (i in 0 until skills.length()) {
+                    val c = skills.optJSONObject(i) ?: continue
+                    val name = c.optString("name")
+                    if (q.isEmpty() || name.startsWith(q) || name.contains(q))
+                        out.add(Item("/" + name, "skill" + (if (c.optBoolean("manual_only")) ", only when you ask" else "") + ": " + c.optString("description").replace('\n', ' '), R.drawable.ic_sparkle, "skill", c))
+                }
+                slash = true; start = sl
                 show(out)
             }
             return
@@ -240,11 +253,11 @@ class ChatMentions(private val ctx: Context, private val host: MainActivity, pri
         val it = items.getOrNull(selected) ?: return
         val text = prompt.text.toString()
         val pos = prompt.selectionStart.coerceIn(0, text.length)
-        val from = if (slash) 0 else start.coerceIn(0, pos)
-        val rest = text.substring(0, from) + text.substring(pos)
+        val from = start.coerceIn(0, pos)
         dismiss()
-        prompt.setText(rest)
-        prompt.setSelection(from.coerceAtMost(rest.length))
-        onPick(it)
+        // The typed @word or /word goes; the pick puts its token in that place (or runs at once, for actions).
+        prompt.text.delete(from, pos)
+        prompt.setSelection(from.coerceAtMost(prompt.text.length))
+        onPick(it, from)
     }
 }

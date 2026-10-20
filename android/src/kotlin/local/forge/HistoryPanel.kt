@@ -21,6 +21,10 @@ class HistoryPanel(private val ctx: Context, private val host: MainActivity) {
     private val search = Ui.input(ctx, "Search chats")
     private var sessions = ArrayList<JSONObject>()
     private var error: String? = null
+    /** The switch the manual describes: this window's folder only, or every folder. */
+    private var allFolders = false
+    private lateinit var hereChip: LinearLayout
+    private lateinit var allChip: LinearLayout
 
     init {
         view.orientation = LinearLayout.VERTICAL
@@ -30,6 +34,13 @@ class HistoryPanel(private val ctx: Context, private val host: MainActivity) {
         val sLp = Ui.lp(Ui.match, Ui.wrap); sLp.setMargins(Ui.dp(ctx, 12), Ui.dp(ctx, 8), Ui.dp(ctx, 12), Ui.dp(ctx, 6))
         search.setPadding(Ui.dp(ctx, 10), Ui.dp(ctx, 6), Ui.dp(ctx, 10), Ui.dp(ctx, 6))
         view.addView(search, sLp)
+        hereChip = Ui.chip(ctx, "This folder") { allFolders = false; paintChips(); render() }
+        allChip = Ui.chip(ctx, "All folders") { allFolders = true; paintChips(); render() }
+        val chips = Ui.row(ctx, hereChip, allChip)
+        (allChip.layoutParams as? LinearLayout.LayoutParams)?.leftMargin = Ui.dp(ctx, 6)
+        chips.setPadding(Ui.dp(ctx, 12), 0, Ui.dp(ctx, 12), Ui.dp(ctx, 4))
+        view.addView(chips, Ui.lp(Ui.match, Ui.wrap))
+        paintChips()
         search.addTextChangedListener(object : android.text.TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, n: Int) {}
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, n: Int) {}
@@ -60,20 +71,26 @@ class HistoryPanel(private val ctx: Context, private val host: MainActivity) {
         }
     }
 
+    private fun paintChips() {
+        Ui.setChip(hereChip, "This folder", 0, if (!allFolders) Ui.accent else Ui.fg2)
+        Ui.setChip(allChip, "All folders", 0, if (allFolders) Ui.accent else Ui.fg2)
+    }
+
     private fun render() {
         body.removeAllViews()
         val err = error
         if (err != null) { body.addView(SideKit.muted(ctx, err)); return }
         val q = search.text.toString().trim().lowercase()
+        val here = host.windowFolder()
         val shown = sessions.filter { s ->
-            q.isEmpty() || s.optString("title").lowercase().contains(q) || s.optString("workspace").lowercase().contains(q)
+            (allFolders || s.optString("workspace").trimEnd('/') == here.trimEnd('/')) &&
+                (q.isEmpty() || s.optString("title").lowercase().contains(q) || s.optString("workspace").lowercase().contains(q))
         }
         if (shown.isEmpty()) {
-            body.addView(SideKit.muted(ctx, if (sessions.isEmpty()) "No chats yet." else "No chat matches \"$q\"."))
+            body.addView(SideKit.muted(ctx, if (sessions.isEmpty()) "No chats yet." else if (q.isNotEmpty()) "No chat matches \"$q\"." else "No chats in this folder yet. All folders shows the others."))
             return
         }
         // Group by folder, this window's folder first; the server already sorts by last update.
-        val here = Api.folder
         val groups = LinkedHashMap<String, ArrayList<JSONObject>>()
         for (s in shown) groups.getOrPut(s.optString("workspace")) { ArrayList() }.add(s)
         val keys = groups.keys.sortedWith(compareBy { if (it == here) 0 else 1 })

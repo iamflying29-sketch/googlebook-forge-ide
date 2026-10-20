@@ -1,10 +1,9 @@
 #!/bin/bash
-# Installs the optional parts of Forge IDE 1.4. Each part is independent; Forge works without any of them and
+# Installs the optional parts of Forge IDE. Each part is independent; Forge works without any of them and
 # turns the matching feature off when a part is missing.
 #
 #   ./install-extras.sh lsp        language servers (suggestions, hover, go to definition, live errors)
 #   ./install-extras.sh debug      the Python debugger (debugpy)
-#   ./install-extras.sh voice      voice input in a browser (whisper.cpp and its base.en speech model)
 #   ./install-extras.sh index      the meaning-based codebase index (a small llama.cpp server and nomic-embed-text)
 #   ./install-extras.sh docs       PDF reading for attachments (pdftotext) and text recognition (tesseract)
 #   ./install-extras.sh android    Android SDK packages, Kotlin, Gradle, bundletool, and the Kotlin, Java and XML
@@ -76,20 +75,6 @@ do_debug() {
 do_docs() {
   echo "== PDF reading and text recognition"
   sudo apt-get install -y poppler-utils tesseract-ocr tesseract-ocr-eng
-}
-
-do_voice() {
-  echo "== Voice input (whisper.cpp v1.9.5)"
-  sudo apt-get install -y git cmake g++ curl
-  mkdir -p ~/.local/lib/forge-voice
-  if [ ! -d ~/.local/lib/forge-voice/src ]; then
-    git clone --depth 1 --branch v1.9.5 https://github.com/ggml-org/whisper.cpp.git ~/.local/lib/forge-voice/src
-  fi
-  cd ~/.local/lib/forge-voice/src
-  need_mem 1500
-  capped 1200 bash -c 'cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DGGML_NATIVE=ON >/dev/null && cmake --build build -j3 --target whisper-cli'
-  fetch_checked https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin \
-    a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002 ~/.forge-ide/models/ggml-base.en.bin
 }
 
 do_index() {
@@ -199,13 +184,12 @@ case "$WANT" in
   lsp) do_lsp ;;
   debug) do_debug ;;
   docs) do_docs ;;
-  voice) do_voice ;;
   index) do_index ;;
   android) do_android ;;
   rust) do_rust ;;
   devices) do_devices ;;
   kernels) do_kernels ;;
-  all) do_docs; do_debug; do_lsp; do_voice; do_index; do_android; do_rust; do_kernels; do_devices ;;
-  *) echo "Usage: $0 [lsp|debug|docs|voice|index|android|rust|kernels|devices|all]"; exit 2 ;;
+  all) do_docs; do_debug; do_lsp; do_index; do_android; do_rust; do_kernels; do_devices ;;
+  *) echo "Usage: $0 [lsp|debug|docs|index|android|rust|kernels|devices|all]"; exit 2 ;;
 esac
 echo "Done. Restart Forge with: forge-ide restart"

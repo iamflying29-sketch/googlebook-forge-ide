@@ -21,6 +21,9 @@ import android.text.style.StyleSpan
 import android.text.style.ForegroundColorSpan
 import android.text.style.TypefaceSpan
 import android.util.TypedValue
+import android.view.ActionMode
+import android.view.Menu
+import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.View
 import android.widget.HorizontalScrollView
@@ -375,7 +378,56 @@ object Markdown {
         t.setLinkTextColor(linkColor)
         t.setTextIsSelectable(true)
         t.movementMethod = LinkArrowMovement.instance
+        addQuoteActions(t)
         return t
+    }
+
+    // ------------------------------------------------------------------ replying to selected text
+    private const val ID_REPLY = 0x5101
+    private const val ID_ADD = 0x5102
+
+    /** The selected text of a view, or an empty string. */
+    fun selectionOf(t: TextView): String {
+        val a = minOf(t.selectionStart, t.selectionEnd); val b = maxOf(t.selectionStart, t.selectionEnd)
+        return if (a in 0 until b && b <= t.text.length) t.text.subSequence(a, b).toString() else ""
+    }
+
+    /**
+     * Selected text in a chat message (or any rendered Markdown) can be answered: "Reply to this" quotes it into the
+     * chat input with the cursor under the quote, "Add to prompt" puts it in as plain text. Both appear in the
+     * selection toolbar and in the right-click menu; the window binds them to Ctrl Shift L and Ctrl L too.
+     */
+    private fun addQuoteActions(t: TextView) {
+        fun act(id: Int, sel: String): Boolean {
+            val host = t.context as? MainActivity ?: return false
+            if (sel.isBlank()) return false
+            host.quoteToChat(sel, reply = id == ID_REPLY)
+            return true
+        }
+        t.customSelectionActionModeCallback = object : ActionMode.Callback {
+            override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
+                if (t.context !is MainActivity) return true
+                menu.add(Menu.NONE, ID_REPLY, 0, "Reply to this")
+                menu.add(Menu.NONE, ID_ADD, 1, "Add to prompt")
+                return true
+            }
+            override fun onPrepareActionMode(mode: ActionMode, menu: Menu): Boolean = false
+            override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
+                if (item.itemId != ID_REPLY && item.itemId != ID_ADD) return false
+                val done = act(item.itemId, selectionOf(t))
+                mode.finish()
+                return done
+            }
+            override fun onDestroyActionMode(mode: ActionMode) {}
+        }
+        // A right-click shows the context menu instead of the toolbar; it gets the same two items.
+        t.setOnCreateContextMenuListener { menu, _, _ ->
+            if (t.context !is MainActivity) return@setOnCreateContextMenuListener
+            val sel = selectionOf(t)
+            if (sel.isBlank()) return@setOnCreateContextMenuListener
+            menu.add(Menu.NONE, ID_REPLY, 0, "Reply to this").setOnMenuItemClickListener { act(ID_REPLY, sel) }
+            menu.add(Menu.NONE, ID_ADD, 1, "Add to prompt").setOnMenuItemClickListener { act(ID_ADD, sel) }
+        }
     }
 
     private fun margins(c: Context, top: Int, bottom: Int): LinearLayout.LayoutParams {

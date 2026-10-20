@@ -40,21 +40,62 @@ internal class SettingsExtras(private val a: SettingsActivity, private val scope
 
     private fun dp(v: Int) = Ui.dp(a, v)
     private fun hint(s: String): TextView = Ui.text(a, s, 11f, Ui.fg3)
+
+    /** Under Folder: where a card's list comes from, "(from User)" or this folder's own list with a Reset. */
+    private fun folderNote(key: String, label: String): View? {
+        if (scope != "folder") return null
+        if (!a.hasFolderOverride(key)) return Ui.text(a, "(from User; a change here makes this folder's own list)", 11f, Ui.fg3)
+        val reset = Ui.text(a, "This folder has its own list. Reset to the User list", 11f, Ui.accent2)
+        reset.isClickable = true
+        reset.setOnClickListener { a.resetFolderCard(key, label) }
+        return reset
+    }
+
+    /** Folder trust (Folder tab): whether this folder's own settings and hooks may loosen the safety settings. */
+    private fun trustCard(): View {
+        val state = Ui.text(a, "Checking the folder.", 12.5f, Ui.fg)
+        val held = Ui.text(a, "", 11.5f, Ui.fg2)
+        val button = Ui.button(a, "Trust this folder") { }
+        val card = Ui.card(a, hint("As in Cursor and VS Code: a folder's own settings may make Forge safer, but they may turn on Auto-run, allow commands, turn off a protection or run hooks only once you trust the folder."),
+            state, held, Ui.row(a, button).also { it.setPadding(0, dp(6), 0, 0) })
+        fun show(r: JSONObject?) {
+            if (!alive) return
+            val t = r?.optJSONObject("trust")
+            if (t == null) { state.text = "Could not ask the Forge server."; return }
+            val trusted = t.optBoolean("trusted")
+            val wants = t.optJSONArray("held_back")
+            state.text = if (trusted) "This folder is trusted: its own settings and hooks apply." else "This folder is not trusted."
+            held.text = if (!trusted && wants != null && wants.length() > 0) "Held back until you trust it:\n" + (0 until wants.length()).joinToString("\n") { "• " + wants.optString(it) }
+                else if (!trusted) "Its own settings ask for nothing that needs trust." else ""
+            button.text = if (trusted) "Take the trust back" else "Trust this folder"
+            button.setOnClickListener {
+                Api.async("trust", { Api.post("/api/trust", JSONObject().put("trusted", !trusted)) }) { r2, e -> if (r2 == null) fail("Not changed", e) else { show(r2); ForgeSettings.refresh(Api.folder) } }
+            }
+        }
+        Api.async("settings", { Api.get("/api/settings") }) { r, _ -> show(r) }
+        return card
+    }
     private fun label(s: String): TextView { val t = Ui.text(a, s, 12.5f, Ui.fg2); t.setPadding(0, dp(8), 0, dp(2)); return t }
     private fun fail(what: String, e: Exception?) = Ui.toast(a, what + ": " + (e?.message ?: "unknown error"))
 
     fun build(host: LinearLayout) {
+        if (scope == "folder") {
+            host.addView(a.groupHeader("Folder trust"))
+            host.addView(trustCard())
+        }
         host.addView(a.groupHeader("Codebase index"))
         host.addView(indexCard())
         host.addView(a.groupHeader("Custom modes"))
         host.addView(customModesCard())
         host.addView(a.groupHeader("Commands the agent may run"))
         host.addView(StringList("command_allowlist", "Allowlist (run without asking)",
-            "Commands starting with one of these run at once, even with Auto-run off. Destructive commands still ask.",
+            "A command runs at once, even with Auto-run off, when every part of it (the commands joined with &&, ;, | and the like) starts with one of these. A command with $( ) or backticks never matches. Destructive and denylisted commands still ask." +
+                (if (scope == "folder") " A folder's own allowlist applies only once you trust the folder." else ""),
             "None. Commands wait for your approval unless Auto-run is on.").card)
-        host.addView(StringList("command_denylist", "Denylist (never run)",
-            "Commands starting with one of these are always refused, even with Auto-run on.",
-            "None. No command is refused outright.").card)
+        host.addView(StringList("command_denylist", "Denylist (never run without asking)",
+            "As in Cursor: a command that contains one of these always asks for your approval, even with Auto-run on or an allowlist match." +
+                (if (scope == "folder") " A folder's denylist adds to yours; it never removes entries." else ""),
+            "None.").card)
         if (scope != "user") return
         host.addView(a.groupHeader("Memories"))
         host.addView(memoriesCard())
@@ -149,6 +190,7 @@ internal class SettingsExtras(private val a: SettingsActivity, private val scope
         modesBox = box
         val card = Ui.card(c, hint("Your own chat modes next to Agent, Ask and Plan, like in Cursor. Each mode adds its instructions to every message you send in it, and can be limited to read-only tools or run commands without asking. The chat's mode picker lists them by name." +
             (if (scope == "folder") " Under Folder the list is saved for this folder only." else "")), box)
+        folderNote("custom_modes", "Custom modes")?.let { card.addView(it, 1) }
         drawModes()
         return card
     }
@@ -219,6 +261,7 @@ internal class SettingsExtras(private val a: SettingsActivity, private val scope
             val addRow = Ui.row(c, add, addBtn)
             addRow.setPadding(0, dp(6), 0, 0)
             card = Ui.card(c, Ui.text(c, title, 12.5f, Ui.fg2), hint(note).also { it.setPadding(0, 0, 0, dp(4)) }, list, addRow)
+            folderNote(key, title)?.let { card.addView(it, 1) }
             card.layoutParams = Ui.lp(Ui.match, Ui.wrap).also { it.topMargin = dp(6) }
             draw()
         }
@@ -401,7 +444,7 @@ internal class SettingsExtras(private val a: SettingsActivity, private val scope
         val box = Ui.column(c)
         hooksBox = box
         box.addView(emptyNote(c, "Loading the hooks..."))
-        val card = Ui.card(c, hint("Hooks run your own scripts at points in the agent loop. Each one gets the event as JSON on its input and may answer with {\"permission\": \"allow\" | \"ask\" | \"deny\", \"message\": \"...\"}; exit code 2 also means deny. A hook switched off keeps its command in the file under \"disabled_command\", which the server skips, so it can be switched on again."), box)
+        val card = Ui.card(c, hint("Hooks run your own scripts at points in the agent loop (beforeSubmitPrompt, beforeShellExecution, afterFileEdit, stop), with 10 seconds each. Each one gets the event as JSON on its input and may answer with {\"permission\": \"allow\" | \"ask\" | \"deny\", \"message\": \"...\"}; exit code 2 means deny whatever it printed, and the strictest answer of all hooks wins. Ask before a message shows you a question first. A hook that fails or runs out of time before a command makes Forge ask you; output that is not JSON counts as allow. A folder's own hooks run only once you trust the folder. A hook switched off keeps its command in the file under \"disabled_command\", which the server skips, so it can be switched on again."), box)
         loadHooks()
         return card
     }
@@ -621,7 +664,7 @@ internal class SettingsExtras(private val a: SettingsActivity, private val scope
         list.addView(emptyNote(c, "Loading the MCP servers..."))
         val pathText = hint("Configuration: $mcpPath")
         mcpPathText = pathText
-        val card = Ui.card(c, hint("Model Context Protocol servers give the agent more tools. Each server is a command the Forge server starts over stdio; its tools appear to the agent as mcp_<server>_<tool> and need approval to run."),
+        val card = Ui.card(c, hint("Model Context Protocol servers give the agent more tools. Each server is a command the Forge server starts over stdio; its tools appear to the agent as mcp_<server>_<tool>. They ask before they run, even with Auto-run on, while MCP tools protection is on (Agent behavior); Always allow on a tool's card allows that tool in one chat. A server that fails to start is tried again after ten minutes, or at once with Connect."),
             pathText, list, actionRow(c,
                 Ui.button(c, "Add a server", primary = true) { addServerDialog() },
                 Ui.button(c, "Connect servers") { connectServers() },

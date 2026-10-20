@@ -26,8 +26,9 @@ class DebugSession(val lang: String, val noDebug: Boolean, private val listener:
         fun onStopped(body: JSONObject)
         fun onContinued()
         fun onExited(code: Int)
-        /** The session ended: a terminated event, the adapter exited, or the connection dropped. Called once. */
-        fun onEnded()
+        /** The session ended: a terminated event, the adapter exited, or the connection dropped. Called once, with the
+         *  session that ended (during a Restart the listener may already have begun the next one). */
+        fun onEnded(ended: DebugSession)
     }
 
     enum class State { STARTING, RUNNING, STOPPED, ENDED }
@@ -42,6 +43,8 @@ class DebugSession(val lang: String, val noDebug: Boolean, private val listener:
     var reason = ""
     /** The reply of /api/debug/android when this session is attached to an app on a device. */
     var android: JSONObject? = null
+    /** How the view began this session (launch, attach or an Android app), so Restart begins the next one the same way. */
+    var origin: Any? = null
     /** True once the adapter sent its initialized event (it is ready for breakpoints). */
     var initialized = false
         private set
@@ -109,14 +112,14 @@ class DebugSession(val lang: String, val noDebug: Boolean, private val listener:
         ended = true
         state = State.ENDED
         failPending("The debugger disconnected.")
-        listener.onEnded()
+        listener.onEnded(this)
     }
 
     // ---------------------------------------------------------------- messages
     private fun onText(text: String) {
         val msg = try { JSONObject(text) } catch (e: Exception) { return }
         if (msg.has("forge")) {
-            when (msg.optString("forge")) {
+            when (msg.optText("forge")) {
                 "ready" -> {
                     ready = true
                     connectDeadline?.let { Api.main.removeCallbacks(it) }
@@ -126,22 +129,22 @@ class DebugSession(val lang: String, val noDebug: Boolean, private val listener:
                 "error" -> {
                     connectDeadline?.let { Api.main.removeCallbacks(it) }
                     val c = connectCb; connectCb = null
-                    if (c != null) c(Exception(msg.optString("message", "The debugger did not start."))) else listener.onOutput(msg.optString("message", "The debugger reported an error.") + "\n", "stderr")
+                    if (c != null) c(Exception(msg.optText("message", "The debugger did not start."))) else listener.onOutput(msg.optText("message", "The debugger reported an error.") + "\n", "stderr")
                     if (!ready) close()
                 }
                 "exit" -> end()
             }
             return
         }
-        when (msg.optString("type")) {
+        when (msg.optText("type")) {
             "response" -> {
                 val p = pending.remove(msg.optInt("request_seq")) ?: return
                 Api.main.removeCallbacks(p.deadline)
                 if (msg.optBoolean("success", false)) p.cb(msg.optJSONObject("body") ?: JSONObject(), null)
                 else p.cb(null, Exception(errorText(msg, p.command)))
             }
-            "event" -> onEvent(msg.optString("event"), msg.optJSONObject("body") ?: JSONObject())
-            "request" -> send(JSONObject().put("type", "response").put("request_seq", msg.optInt("seq")).put("command", msg.optString("command"))
+            "event" -> onEvent(msg.optText("event"), msg.optJSONObject("body") ?: JSONObject())
+            "request" -> send(JSONObject().put("type", "response").put("request_seq", msg.optInt("seq")).put("command", msg.optText("command"))
                 .put("success", false).put("message", "not supported by Forge"))
         }
     }
@@ -149,11 +152,11 @@ class DebugSession(val lang: String, val noDebug: Boolean, private val listener:
     /** The adapter's error message, with the DAP error format's {variables} filled in. */
     private fun errorText(msg: JSONObject, command: String): String {
         val err = msg.optJSONObject("body")?.optJSONObject("error")
-        var text = msg.optString("message", "")
+        var text = msg.optText("message", "")
         if (err != null) {
-            var f = err.optString("format", "")
+            var f = err.optText("format", "")
             val vars = err.optJSONObject("variables")
-            if (vars != null) for (k in vars.keys()) f = f.replace("{$k}", vars.optString(k))
+            if (vars != null) for (k in vars.keys()) f = f.replace("{$k}", vars.optText(k))
             if (f.isNotEmpty()) text = f
         }
         return if (text.isEmpty()) "$command failed" else text
@@ -167,17 +170,17 @@ class DebugSession(val lang: String, val noDebug: Boolean, private val listener:
                 for (f in w) f()
             }
             "output" -> {
-                val category = body.optString("category", "stdout")
-                val text = body.optString("output", "")
+                val category = body.optText("category", "stdout")
+                val text = body.optText("output", "")
                 if (category != "telemetry" && text.isNotEmpty()) listener.onOutput(text, category)
             }
             "stopped" -> {
                 state = State.STOPPED
                 val t = body.optInt("threadId", 0)
                 if (t != 0) threadId = t
-                val text = body.optString("text", "")
-                val desc = body.optString("description", "")
-                reason = body.optString("reason", "") + (if (text.isNotEmpty()) ": $text" else if (desc.isNotEmpty()) ": $desc" else "")
+                val text = body.optText("text", "")
+                val desc = body.optText("description", "")
+                reason = body.optText("reason", "") + (if (text.isNotEmpty()) ": $text" else if (desc.isNotEmpty()) ": $desc" else "")
                 listener.onStopped(body)
             }
             "continued" -> {
@@ -187,7 +190,7 @@ class DebugSession(val lang: String, val noDebug: Boolean, private val listener:
                     listener.onContinued()
                 }
             }
-            "thread" -> if (threadId == 0 && body.optString("reason") == "started") threadId = body.optInt("threadId", 0)
+            "thread" -> if (threadId == 0 && body.optText("reason") == "started") threadId = body.optInt("threadId", 0)
             "exited" -> listener.onExited(body.optInt("exitCode", 0))
             "terminated" -> end()
         }

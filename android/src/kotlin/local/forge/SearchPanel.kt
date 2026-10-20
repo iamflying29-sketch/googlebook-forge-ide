@@ -23,8 +23,6 @@ import android.widget.ListView
 import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.regex.Pattern
-import java.util.regex.PatternSyntaxException
 
 /**
  * The Search view (Ctrl Shift F), like Cursor's: search the whole folder as you type, with match case, whole word
@@ -54,7 +52,9 @@ class SearchPanel(private val ctx: Context, private val host: MainActivity) {
     private val searchTask = Runnable { search() }
     private val details: LinearLayout
 
-    class Hit(val path: String, val line: Int, val text: String)
+    /** One matching line from the server: where the matches are ([spans]) and, with a replacement, the line as
+     *  Replace would write it ([preview]), so the view shows exactly what Replace does. */
+    class Hit(val path: String, val line: Int, val text: String, val spans: List<IntArray> = emptyList(), val reps: List<String>? = null)
 
     init {
         view.setBackgroundColor(Ui.panel)
@@ -90,7 +90,7 @@ class SearchPanel(private val ctx: Context, private val host: MainActivity) {
         list.setOnItemClickListener { _, _, pos, _ ->
             when (val x = rows.getOrNull(pos)) {
                 is String -> { if (!collapsed.add(x)) collapsed.remove(x); render() }
-                is Hit -> { val col = firstMatch(x.text)?.first ?: 0; host.openFileAt(x.path, x.line, col) }
+                is Hit -> host.openFileAt(x.path, x.line, x.spans.firstOrNull()?.get(0) ?: 0)
             }
         }
         view.addView(list, Ui.lp(Ui.match, 0, 1f))
@@ -103,7 +103,8 @@ class SearchPanel(private val ctx: Context, private val host: MainActivity) {
         replace.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-            override fun afterTextChanged(s: Editable?) { adapter.notifyDataSetChanged() }
+            // What each match becomes comes from the server (the same engine as Replace), so the search runs again.
+            override fun afterTextChanged(s: Editable?) { Api.main.removeCallbacks(searchTask); Api.main.postDelayed(searchTask, 350) }
         })
         val keys = View.OnKeyListener { v, code, ev ->
             if (ev.action != KeyEvent.ACTION_DOWN) return@OnKeyListener false
@@ -118,6 +119,12 @@ class SearchPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     /** Opens the view with a query (the editor's selection) or a folder to search in. */
+    /** Test step: a search with files to include and a replacement typed in, as a person would type them. */
+    fun testSearch(q: String, includeGlob: String, replacement: String) {
+        replace.setText(replacement)
+        prefill(q, includeGlob)
+    }
+
     fun prefill(q: String, includeGlob: String) {
         if (includeGlob.isNotEmpty()) { include.setText(includeGlob); details.visibility = View.VISIBLE }
         if (q.isNotEmpty()) query.setText(q)
@@ -138,47 +145,37 @@ class SearchPanel(private val ctx: Context, private val host: MainActivity) {
         return t
     }
 
-    /** The pattern used to mark matches in the result lines (the server's grep finds the lines). */
-    private fun pattern(): Pattern? {
-        val q = query.text.toString()
-        if (q.isEmpty()) return null
-        var body = if (regex) q else Pattern.quote(q)
-        if (wholeWord) body = "(?<![A-Za-z0-9_])(?:$body)(?![A-Za-z0-9_])"
-        return try { Pattern.compile(body, if (matchCase) 0 else Pattern.CASE_INSENSITIVE or Pattern.UNICODE_CASE) } catch (e: PatternSyntaxException) { null }
-    }
-
-    private fun firstMatch(text: String): Pair<Int, Int>? {
-        val m = pattern()?.matcher(text) ?: return null
-        return if (m.find()) m.start() to m.end() else null
-    }
-
     fun search() {
         val q = query.text.toString()
         val g = ++generation
         if (q.isEmpty()) { hitsByFile.clear(); render(); status.text = "Type to search every file of this folder."; return }
-        if (regex && pattern() == null) { status.setTextColor(Ui.red); status.text = "This is not a valid regular expression."; return }
         status.setTextColor(Ui.fg3)
         status.text = "Searching…"
         val params = mapOf("q" to q, "path" to ".", "glob" to include.text.toString().trim(), "exclude" to exclude.text.toString().trim(),
-            "regex" to if (regex) "1" else "0", "case" to if (matchCase) "1" else "0", "word" to if (wholeWord) "1" else "0", "max" to "2000")
+            "regex" to if (regex) "1" else "0", "case" to if (matchCase) "1" else "0", "word" to if (wholeWord) "1" else "0", "max" to "2000",
+            "replacement" to replace.text.toString())
         Api.async("search", { Api.get("/api/search", params, 40000) }) { r, e ->
             if (g != generation) return@async
             hitsByFile.clear()
             dismissed.clear()
             if (r == null) { status.setTextColor(Ui.red); status.text = "Search failed: " + (e?.message ?: "no answer"); render(); return@async }
-            val result = r.optString("result")
-            val lineRx = Regex("^(.+?):(\\d+):(.*)$")
-            var note = ""
-            for (line in result.split('\n')) {
-                val m = lineRx.matchEntire(line)
-                if (m == null) { if (line.isNotBlank() && !line.contains(" matches for ")) note = line.trim(); continue }
-                hitsByFile.getOrPut(m.groupValues[1]) { ArrayList() }.add(Hit(m.groupValues[1], m.groupValues[2].toIntOrNull() ?: 1, m.groupValues[3]))
+            val arr = r.optJSONArray("hits") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val sp = o.optJSONArray("spans")
+                val spans = if (sp == null) emptyList() else (0 until sp.length()).mapNotNull { k -> sp.optJSONArray(k)?.let { intArrayOf(it.optInt(0), it.optInt(1)) } }
+                val path = o.optString("path")
+                val ra = o.optJSONArray("reps")
+                val reps = if (ra == null) null else (0 until ra.length()).map { ra.optString(it) }
+                hitsByFile.getOrPut(path) { ArrayList() }.add(Hit(path, o.optInt("line", 1), o.optString("text"), spans, reps))
             }
             render()
             val n = hitsByFile.values.sumOf { it.size }
+            val total = r.optInt("total", n)
             status.text = when {
-                n == 0 -> if (note.startsWith("No matches")) "No results." else note.ifEmpty { "No results." }
-                else -> "$n " + (if (n == 1) "result" else "results") + " in " + hitsByFile.size + " " + (if (hitsByFile.size == 1) "file" else "files") + (if (note.isNotEmpty() && note.contains("more")) ". $note" else "")
+                n == 0 -> if (r.optBoolean("stopped_early")) "No results before the search ran out of time." else "No results."
+                else -> "$total " + (if (total == 1) "result" else "results") + " in " + hitsByFile.size + " " + (if (hitsByFile.size == 1) "file" else "files") +
+                    (if (total > n) ". The first $n are shown; narrow the search." else "") + (if (r.optBoolean("stopped_early")) ". The search ran out of time." else "")
             }
         }
     }
@@ -230,26 +227,29 @@ class SearchPanel(private val ctx: Context, private val host: MainActivity) {
         }
     }
 
-    private fun highlighted(text: String): CharSequence {
+    /** A result line with its matches marked where the server found them. With text in Replace, each match is struck
+     *  through in red and followed by what Replace will write there, in green, as in Cursor's search view. */
+    private fun highlighted(h: Hit): CharSequence {
+        val text = h.text
         val t = text.trimStart()
         val cut = text.length - t.length
         val sb = SpannableStringBuilder(t)
-        val m = pattern()?.matcher(text) ?: return sb
-        val rep = replace.text.toString()
-        var count = 0
-        while (m.find() && count < 20) {
-            val a = m.start() - cut; val b = m.end() - cut
+        val reps = if (replace.text.isNotEmpty()) h.reps else null
+        // From the last match to the first, so the inserted replacements do not move the matches still to mark.
+        for (i in h.spans.indices.reversed()) {
+            val a = h.spans[i][0] - cut; val b = h.spans[i][1] - cut
             if (a < 0 || b > sb.length || b <= a) continue
-            sb.setSpan(BackgroundColorSpan(if (rep.isNotEmpty()) 0x55ff5c6c else 0x55ff8a3d), a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            sb.setSpan(ForegroundColorSpan(Ui.fg), a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            count++
-        }
-        if (rep.isNotEmpty() && count > 0) {
-            // A preview of the replacement after the line, in green, like Cursor's search view.
-            val start = sb.length
-            val preview = try { pattern()!!.matcher(t).replaceAll(if (regex) rep else java.util.regex.Matcher.quoteReplacement(rep)) } catch (e: Exception) { rep }
-            sb.append("  →  ").append(preview)
-            sb.setSpan(ForegroundColorSpan(Ui.green), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            if (reps != null) {
+                sb.setSpan(BackgroundColorSpan(0x55ff5c6c), a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                sb.setSpan(android.text.style.StrikethroughSpan(), a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                val r = reps.getOrNull(i) ?: continue
+                sb.insert(b, r)
+                sb.setSpan(BackgroundColorSpan(0x4422c55e), b, b + r.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                sb.setSpan(ForegroundColorSpan(Ui.green), b, b + r.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            } else {
+                sb.setSpan(BackgroundColorSpan(0x55ff8a3d), a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                sb.setSpan(ForegroundColorSpan(Ui.fg), a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
         }
         return sb
     }
@@ -278,7 +278,7 @@ class SearchPanel(private val ctx: Context, private val host: MainActivity) {
             val t = (convertView as? TextView) ?: Ui.text(ctx, "", 12f, Ui.fg2, mono = true).also {
                 it.isSingleLine = true; it.ellipsize = TextUtils.TruncateAt.END; it.setPadding(dp(34), dp(2), dp(8), dp(2))
             }
-            t.text = highlighted(h.text)
+            t.text = highlighted(h)
             t.tooltipText = h.path + ":" + h.line
             return t
         }

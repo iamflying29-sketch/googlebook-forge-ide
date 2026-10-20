@@ -56,6 +56,8 @@ class DeviceScreenWindow(private val ctx: Context, private val host: MainActivit
     private val behaveRow = FlowRow(ctx)
     private val nav = FlowRow(ctx)
     private val note = Ui.text(ctx, "", 11f, Ui.fg3)
+    /** Why the latest picture did not come (the server's own words); hidden while pictures arrive. */
+    private val problem = Ui.text(ctx, "", 11f, Ui.yellow)
 
     private var device: JSONObject? = null
     private var input = false
@@ -93,7 +95,7 @@ class DeviceScreenWindow(private val ctx: Context, private val host: MainActivit
         title.maxLines = 1; title.ellipsize = TextUtils.TruncateAt.END
         head.addView(title, Ui.lp(0, Ui.wrap, 1f))
         val shot = Ui.button(ctx, "To chat") { panel.screenshotToChat(device) }
-        shot.tooltipText = "Attach this screen to the chat so the vision model can look at it for Llama"
+        shot.tooltipText = "Attach this screen to the chat, so the chat model (or the vision model for it) can look at it"
         head.addView(shot, Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = dp(6) })
         val look = Ui.button(ctx, "Look") { panel.lookAtScreen(device) }
         look.tooltipText = "Attach this screen to the chat and ask the vision model to describe it"
@@ -116,16 +118,24 @@ class DeviceScreenWindow(private val ctx: Context, private val host: MainActivit
         // Behavior: a maker's battery behavior for one app (virtual devices only).
         val bgo = Ui.button(ctx, "Apply") {
             val d = device ?: return@button
-            val body = JSONObject().put("serial", d.optString("serial")).put("port", d.optInt("port")).put("preset", bsel.value).put("package", bpkg.text.toString().trim())
+            val body = JSONObject().put("serial", d.optText("serial")).put("port", d.optInt("port")).put("preset", bsel.value).put("package", bpkg.text.toString().trim())
             Api.async("device-behave", { Api.post("/api/devices/behave", body, 60000) }) { r, e ->
-                notice(r?.optString("message") ?: e?.message ?: "The behavior could not be applied.")
+                // A failure reads as one: the server's reason after "Not applied".
+                if (r == null) notice("Not applied: " + (e?.message ?: "the behavior could not be applied."))
+                else if (!r.optBoolean("ok")) notice("Not applied: " + r.optText("message").ifEmpty { "the device refused it." })
+                else notice(r.optText("message").ifEmpty { "Applied." })
             }
         }
-        bsel.onChange = { v -> bsel.view.tooltipText = panel.devices?.optJSONObject("behaviors")?.optJSONObject(v)?.optString("about") ?: "Undo every behavior for this app" }
+        bsel.onChange = { v -> bsel.view.tooltipText = panel.devices?.optJSONObject("behaviors")?.optJSONObject(v)?.optText("about") ?: "Undo every behavior for this app" }
         behaveRow.addView(bsel.view, ViewGroup.LayoutParams(Ui.match, Ui.wrap))
         behaveRow.addView(bpkg, ViewGroup.LayoutParams(dp(220), Ui.wrap)); behaveRow.addView(bgo)
         behaveRow.setPadding(dp(8), dp(6), dp(8), 0)
         box.addView(behaveRow, Ui.lp(Ui.match, Ui.wrap))
+
+        // Why there is no new picture, above the picture (the last good picture stays below it).
+        problem.setPadding(dp(8), dp(6), dp(8), 0)
+        problem.visibility = View.GONE
+        box.addView(problem, Ui.lp(Ui.match, Ui.wrap))
 
         // The picture, on black.
         val body = FrameLayout(ctx)
@@ -159,21 +169,21 @@ class DeviceScreenWindow(private val ctx: Context, private val host: MainActivit
     fun show(dev: JSONObject) {
         val d = JSONObject(dev.toString())
         device = d
-        input = d.optString("kind") != "googlebook"
+        input = d.optText("kind") != "googlebook"
         val data = panel.devices
-        val vid = d.optString("virtual_id")
-        vd = if (vid.isNotEmpty()) data?.optJSONObject("virtual")?.optJSONArray("devices").objs()?.firstOrNull { it.optString("id") == vid } else null
+        val vid = d.optText("virtual_id")
+        vd = if (vid.isNotEmpty()) data?.optJSONObject("virtual")?.optJSONArray("devices").objs()?.firstOrNull { it.optText("id") == vid } else null
         lookState = vd?.optJSONObject("look")?.let { JSONObject(it.toString()) } ?: JSONObject()
-        val pid = vd?.optString("persona") ?: ""
-        persona = if (pid.isNotEmpty()) data?.optJSONArray("personas").objs()?.firstOrNull { it.optString("id") == pid } else null
+        val pid = vd?.optText("persona") ?: ""
+        persona = if (pid.isNotEmpty()) data?.optJSONArray("personas").objs()?.firstOrNull { it.optText("id") == pid } else null
         fillProfiles(if (persona != null) "persona:$pid" else "")
-        title.text = d.optString("name").ifEmpty { d.optString("serial") }
+        title.text = d.optText("name").ifEmpty { d.optText("serial") }
         lookRow.visibility = if (vd != null) View.VISIBLE else View.GONE
         behaveRow.visibility = if (vd != null) View.VISIBLE else View.GONE
         val behaviors = data?.optJSONObject("behaviors") ?: JSONObject()
-        val pb = persona?.optString("behavior") ?: ""
+        val pb = persona?.optText("behavior") ?: ""
         val keys = behaviors.keys().asSequence().toList().sortedBy { if (pb.isNotEmpty() && it.startsWith(pb)) 0 else 1 }
-        val items = keys.map { Dropdown.Item(it, behaviors.optJSONObject(it)?.optString("label") ?: it) } + Dropdown.Item("reset", "Reset the app to normal")
+        val items = keys.map { Dropdown.Item(it, behaviors.optJSONObject(it)?.optText("label") ?: it) } + Dropdown.Item("reset", "Reset the app to normal")
         bsel.setItems(items, bsel.value)
         bsel.onChange?.invoke(bsel.value)
         if (bpkg.text.isEmpty()) bpkg.setText(panel.appId)
@@ -190,6 +200,8 @@ class DeviceScreenWindow(private val ctx: Context, private val host: MainActivit
         box.visibility = View.VISIBLE
         box.bringToFront()
         screen.setPicture(null, 0, 0)
+        screen.message = ScreenView.WAITING
+        problem.visibility = View.GONE
         refreshSoon(0)
     }
 
@@ -201,46 +213,54 @@ class DeviceScreenWindow(private val ctx: Context, private val host: MainActivit
 
     /** The Android view read /api/devices again; the behavior tooltips and profile labels come from there. */
     fun dataChanged() {
-        if (box.visibility == View.VISIBLE && prof.items.isEmpty()) fillProfiles(persona?.let { "persona:" + it.optString("id") } ?: "")
+        if (box.visibility == View.VISIBLE && prof.items.isEmpty()) fillProfiles(persona?.let { "persona:" + it.optText("id") } ?: "")
     }
 
-    /** The general profiles and this device's own persona screen (other personas' screens are left out). */
+    /**
+     * The general profiles and this device's own persona screen (other personas' screens are left out). An emulated
+     * ARM device also gets the emulated display's own size (a profile without a size), which only it can go back to.
+     */
     private fun fillProfiles(own: String) {
         val profiles = panel.devices?.optJSONObject("profiles") ?: JSONObject()
+        val version = vd?.optText("version") ?: ""
+        val arm = panel.devices?.optJSONObject("virtual")?.optJSONArray("versions").objs().any { it.optText("version") == version && it.optText("backend") == "arm" }
         val items = ArrayList<Dropdown.Item>()
         for (k in profiles.keys()) {
             if (k.startsWith("persona:") && k != own) continue
             val p = profiles.optJSONObject(k) ?: continue
-            items.add(Dropdown.Item(k, (if (k == own) "Persona: " else "") + p.optString("label") + " " + p.optInt("width") + "×" + p.optInt("height")))
+            val sized = p.optInt("width") > 0
+            if (!sized && !arm) continue
+            items.add(Dropdown.Item(k, (if (k == own) "Persona: " else "") + p.optText("label") + (if (sized) " " + p.optInt("width") + "×" + p.optInt("height") else "")))
         }
-        prof.setItems(items, lookState.optString("profile"))
+        prof.setItems(items, lookState.optText("profile"))
     }
 
     // ---------------------------------------------------------------- input, look and behavior
     private fun send(kind: String, extra: JSONObject) {
         val d = device ?: return
-        val body = JSONObject(extra.toString()).put("serial", d.optString("serial")).put("port", d.optInt("port")).put("kind", kind)
+        val body = JSONObject(extra.toString()).put("serial", d.optText("serial")).put("port", d.optInt("port")).put("kind", kind)
         Api.async("device-input", { Api.post("/api/devices/input", body, 30000) }) { r, e ->
             if (r == null) notice(e?.message ?: "The input was not sent.")
-            else if (!r.optBoolean("ok") && r.optString("message").isNotEmpty()) notice(r.optString("message"))
+            else if (!r.optBoolean("ok") && r.optText("message").isNotEmpty()) notice(r.optText("message"))
             refreshSoon(250)
         }
     }
 
     private fun setLook(change: JSONObject) {
         val d = device ?: return
-        val body = JSONObject(change.toString()).put("serial", d.optString("serial")).put("port", d.optInt("port"))
+        val body = JSONObject(change.toString()).put("serial", d.optText("serial")).put("port", d.optInt("port"))
         Api.async("device-look", { Api.post("/api/devices/look", body, 60000) }) { r, e ->
             if (r == null) { notice(e?.message ?: "The look was not changed."); return@async }
-            if (!r.optBoolean("ok")) { notice(r.optString("message")); return@async }
+            // The server keeps the choice even when the device did not take it now (it is applied at the next start).
             r.optJSONObject("look")?.let { lookState = it }
             applyLook()
+            if (!r.optBoolean("ok")) { notice(r.optText("message").ifEmpty { "The device did not take the change." }); return@async }
             refreshSoon(900)
         }
     }
 
     private fun applyLook() {
-        val profile = lookState.optString("profile")
+        val profile = lookState.optText("profile")
         if (profile.isNotEmpty()) prof.select(profile)
         val on = lookState.optBoolean("dark")
         dark.setTextColor(if (on) Ui.accent else Ui.fg)
@@ -248,8 +268,8 @@ class DeviceScreenWindow(private val ctx: Context, private val host: MainActivit
         val fs = lookState.optDouble("font_scale", 1.0)
         font.select(fs.toString().trimEnd('0').trimEnd('.'))
         val p = persona
-        val own = p != null && profile == "persona:" + p.optString("id") && lookState.optInt("rotation") % 4 == 0
-        screen.round = profile == "watch-round" || (own && p?.optString("kind") == "watch-round")
+        val own = p != null && profile == "persona:" + p.optText("id") && lookState.optInt("rotation") % 4 == 0
+        screen.round = profile == "watch-round" || (own && p?.optText("kind") == "watch-round")
         val corner = p?.optDouble("corner", 0.0) ?: 0.0
         val pw = p?.optDouble("width", 0.0) ?: 0.0
         val ph = p?.optDouble("height", 0.0) ?: 0.0
@@ -357,49 +377,79 @@ class DeviceScreenWindow(private val ctx: Context, private val host: MainActivit
         if (box.visibility != View.VISIBLE || !windowVisible) return
         val my = ++gen
         val t0 = System.currentTimeMillis()
-        val serial = d.optString("serial"); val port = d.optInt("port")
-        Api.async("device-screen", { fetchPicture(serial, port) }) { pic, _ ->
+        val serial = d.optText("serial"); val port = d.optInt("port")
+        Api.async("device-screen", { fetchPicture(serial, port) }) { pic, e ->
             if (my != gen) return@async
-            if (pic == null) { handler.postDelayed(refreshRunnable, 2500); return@async }
+            if (pic == null || pic.bitmap == null) {
+                showProblem(pic?.error ?: e?.message ?: "The picture could not be read.")
+                handler.postDelayed(refreshRunnable, 2500)
+                return@async
+            }
+            problem.visibility = View.GONE
             screen.setPicture(pic.bitmap, pic.width, pic.height)
             handler.postDelayed(refreshRunnable, max(350L, System.currentTimeMillis() - t0))
         }
     }
 
-    private class Picture(val bitmap: Bitmap, val width: Int, val height: Int)
+    /** Why no picture came: in place of the picture while there is none yet, above the last picture otherwise. */
+    private fun showProblem(why: String) {
+        if (screen.hasPicture()) {
+            problem.text = "No new picture: $why"
+            problem.visibility = View.VISIBLE
+        } else {
+            problem.visibility = View.GONE
+            screen.message = why
+            screen.invalidate()
+        }
+    }
+
+    /** A decoded picture, or the reason there is none (the server's error text, or what went wrong on the way). */
+    private class Picture(val bitmap: Bitmap?, val width: Int, val height: Int, val error: String? = null)
 
     /**
      * GET /api/devices/screen as PNG bytes, read while the server writes them, with a 15-second limit and a 40 MB
      * cap, and decoded off the main thread. A very large screen is decoded at half or a quarter size for drawing;
-     * the real size is kept for the input coordinates.
+     * the real size is kept for the input coordinates. When the server has no picture, its error text (for example
+     * that the device is still starting) comes back to be shown.
      */
-    private fun fetchPicture(serial: String, port: Int): Picture? {
+    private fun fetchPicture(serial: String, port: Int): Picture {
         val q = "serial=" + URLEncoder.encode(serial, "UTF-8") + "&port=" + port + "&t=" + System.currentTimeMillis()
         val c = URL(Api.SERVER + "/api/devices/screen?" + q).openConnection() as HttpURLConnection
         c.connectTimeout = 3000
         c.readTimeout = 15000
         c.useCaches = false
-        if (Api.folder.isNotEmpty()) c.setRequestProperty("X-Forge-Folder", URLEncoder.encode(Api.folder, "UTF-8").replace("+", "%20"))
+        Api.authorize(c)
+        val f = Api.currentFolder()
+        if (f.isNotEmpty()) c.setRequestProperty("X-Forge-Folder", URLEncoder.encode(f, "UTF-8").replace("+", "%20"))
         try {
-            if (c.responseCode != 200) return null
+            val code = c.responseCode
+            if (code != 200) {
+                val text = try { c.errorStream?.use { s -> String(s.readBytes().take(8192).toByteArray(), Charsets.UTF_8) } ?: "" } catch (e: Exception) { "" }
+                val msg = try { JSONObject(text).optText("error") } catch (e: Exception) { text.trim().take(200) }
+                return Picture(null, 0, 0, msg.ifEmpty { "The Forge server answered HTTP $code without a picture." })
+            }
             val out = ByteArrayOutputStream()
             c.inputStream.use { s ->
                 val buf = ByteArray(32 * 1024)
                 while (true) {
                     val n = s.read(buf)
                     if (n < 0) break
-                    if (out.size() + n > 40 * 1024 * 1024) return null
+                    if (out.size() + n > 40 * 1024 * 1024) return Picture(null, 0, 0, "The picture is larger than 40 MB, so the window does not show it.")
                     out.write(buf, 0, n)
                 }
             }
             val bytes = out.toByteArray()
             val bounds = BitmapFactory.Options(); bounds.inJustDecodeBounds = true
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return Picture(null, 0, 0, "The device sent something that is not a picture.")
             val opts = BitmapFactory.Options()
             opts.inSampleSize = if (max(bounds.outWidth, bounds.outHeight) > 2400) 4 else if (max(bounds.outWidth, bounds.outHeight) > 1300) 2 else 1
-            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
+            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return Picture(null, 0, 0, "The picture could not be decoded.")
             return Picture(bmp, bounds.outWidth, bounds.outHeight)
+        } catch (e: java.net.SocketTimeoutException) {
+            return Picture(null, 0, 0, "No picture arrived within 15 seconds.")
+        } catch (e: java.io.IOException) {
+            return Picture(null, 0, 0, "Cannot reach the Forge server for the picture: " + (e.message ?: e.javaClass.simpleName))
         } finally {
             try { c.disconnect() } catch (e: Exception) { }
         }
@@ -415,7 +465,13 @@ class DeviceScreenWindow(private val ctx: Context, private val host: MainActivit
  * cutout out of screenshots). Touch positions map to the device's real pixels.
  */
 internal class ScreenView(ctx: Context, private val maxHeight: () -> Int) : View(ctx) {
+    companion object {
+        const val WAITING = "Waiting for the first picture…"
+    }
+
     private var bitmap: Bitmap? = null
+    /** What the placeholder says while there is no picture: waiting, or why no picture came. */
+    var message: String = WAITING
     var deviceWidth = 0
         private set
     var deviceHeight = 0
@@ -428,7 +484,7 @@ internal class ScreenView(ctx: Context, private val maxHeight: () -> Int) : View
     private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val black = Paint().also { it.color = Color.BLACK }
     private val fill = Paint().also { it.color = Color.parseColor("#111111") }
-    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).also { it.color = Ui.fg3; it.textSize = Ui.dp(ctx, 12).toFloat(); it.textAlign = Paint.Align.CENTER }
+    private val textPaint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).also { it.color = Ui.fg3; it.textSize = Ui.dp(ctx, 12).toFloat() }
     private val minSide = Ui.dp(ctx, 80)
     private val placeholderWidth = Ui.dp(ctx, 180)
 
@@ -436,6 +492,8 @@ internal class ScreenView(ctx: Context, private val maxHeight: () -> Int) : View
         isFocusable = true
         isFocusableInTouchMode = true
     }
+
+    fun hasPicture(): Boolean = bitmap != null
 
     fun setPicture(b: Bitmap?, width: Int, height: Int) {
         val old = bitmap
@@ -478,7 +536,14 @@ internal class ScreenView(ctx: Context, private val maxHeight: () -> Int) : View
         if (b != null && !b.isRecycled) canvas.drawBitmap(b, null, RectF(0f, 0f, w, h), paint)
         else {
             canvas.drawRect(0f, 0f, w, h, fill)
-            canvas.drawText("Waiting for the first picture…", w / 2f, h / 2f, textPaint)
+            // The message wraps inside the placeholder, centered.
+            val pad = Ui.dp(context, 10)
+            val layout = android.text.StaticLayout.Builder.obtain(message, 0, message.length, textPaint, max(1, width - 2 * pad))
+                .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER).build()
+            canvas.save()
+            canvas.translate(pad.toFloat(), max(0f, (h - layout.height) / 2f))
+            layout.draw(canvas)
+            canvas.restore()
         }
         cutout?.let { c -> canvas.drawCircle(c[0] * w, c[1] * h, c[2] * w, black) }
         canvas.restore()

@@ -73,8 +73,10 @@ class Kernel:
         name = kernel_name_of(self.path)
         if name in PYTHON_NAMES or not os.path.isfile(JUPYTER_PY):
             cmd = [sys.executable, "-u", RUNNER]
+            self.jupyter = False
         else:
             cmd = [JUPYTER_PY, "-I", "-u", JUPYTER_RUNNER, name]
+            self.jupyter = True
         self.unit = None
         if shutil.which("systemd-run"):
             from .toolchains import scope_argv
@@ -125,13 +127,22 @@ class Kernel:
         self.send({"op": "execute", "id": msg_id, "code": code})
 
     def interrupt(self) -> None:
-        if self.alive():
-            # SIGINT raises KeyboardInterrupt in the cell. The scope wrapper is replaced by the kernel itself
-            # (systemd-run --scope execs it), so the process group holds just the kernel and anything it started.
+        if not self.alive():
+            return
+        if getattr(self, "jupyter", False):
+            # Kotlin, Bash and the other Jupyter kernels run in their own session under the bridge; a signal to the
+            # bridge would end it. The bridge asks the kernel to interrupt the cell the Jupyter way instead.
             try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
-            except OSError:
+                self.send({"op": "interrupt"})
+            except (OSError, RuntimeError):
                 pass
+            return
+        # Forge's own Python kernel: SIGINT raises KeyboardInterrupt in the cell. The scope wrapper is replaced by the
+        # kernel itself (systemd-run --scope execs it), so the process group holds just the kernel and what it started.
+        try:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+        except OSError:
+            pass
 
     def stop(self) -> None:
         p, self.proc = self.proc, None

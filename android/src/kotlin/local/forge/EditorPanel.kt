@@ -130,6 +130,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         override val content: View get() = nb.view
         override val dirty: Boolean get() = nb.isDirty()
         override fun dispose() { nb.close() }
+        override fun renamed(newPath: String) { path = newPath; nb.renameTo(newPath) }
     }
 
     inner class Group {
@@ -185,6 +186,12 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     private class Review(var base: String, val runId: String, val label: String, val inline: Boolean)
     private val reviews = LinkedHashMap<String, Review>()
     private val reviewTasks = HashMap<String, Runnable>()
+
+    // The language servers of this window's folder send their edits and notes here.
+    private var lspFolder = ""
+    private val lspApply: (Map<String, List<Lsp.TextEdit>>) -> Boolean = { edits -> applyWorkspaceEdit(edits) > 0 }
+    private val lspNotify: (String) -> Unit = { msg -> Ui.toast(ctx, msg) }
+    private val lspListener: (String, String, List<Lsp.Diagnostic>) -> Unit = { f, _, _ -> if (f == host.windowFolder()) treeAdapter.notifyDataSetChanged() }
 
     init {
         view.orientation = LinearLayout.HORIZONTAL
@@ -265,9 +272,23 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         renderTabs(current)
         showOutline()
 
-        Lsp.applyEdit = { edits -> applyWorkspaceEdit(edits) > 0 }
-        Lsp.notify = { msg -> Ui.toast(ctx, msg) }
-        Lsp.listeners.add { _, _ -> treeAdapter.notifyDataSetChanged() }
+        bindLsp()
+    }
+
+    /** Registers this window's editor with the language servers of its folder (again whenever the folder changes). */
+    fun bindLsp() {
+        unbindLsp()
+        lspFolder = host.windowFolder()
+        Lsp.applyEdit[lspFolder] = lspApply
+        Lsp.notify[lspFolder] = lspNotify
+        if (!Lsp.listeners.contains(lspListener)) Lsp.listeners.add(lspListener)
+    }
+
+    /** The window closes or leaves the folder: its handlers stop receiving that folder's edits and notes. */
+    fun unbindLsp(closing: Boolean = false) {
+        if (Lsp.applyEdit[lspFolder] === lspApply) Lsp.applyEdit.remove(lspFolder)
+        if (Lsp.notify[lspFolder] === lspNotify) Lsp.notify.remove(lspFolder)
+        if (closing) Lsp.listeners.remove(lspListener)
     }
 
     private fun iconButton(kind: String, tip: String, onClick: (View) -> Unit): View {
@@ -481,7 +502,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     /** Errors and warnings under a path (a file, or every file in a folder), from the language servers. */
     private fun problemCounts(path: String, dir: Boolean): Pair<Int, Int> {
         var e = 0; var w = 0
-        for ((p, list) in Lsp.diagnostics) {
+        for ((p, list) in Lsp.diagnosticsOf(host.windowFolder())) {
             if (p == path || (dir && p.startsWith("$path/"))) for (d in list) { if (d.severity <= 1) e++ else if (d.severity == 2) w++ }
         }
         return e to w
@@ -583,8 +604,8 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
                 1 -> renameDialog(e)
                 2 -> newFileDialog(dir)
                 3 -> newFolderDialog(dir)
-                4 -> { host.copyToClipboard(e.path); Ui.toast(ctx, "Copied " + e.path) }
-                6 -> { val full = Api.folder.trimEnd('/') + "/" + e.path; host.copyToClipboard(full); Ui.toast(ctx, "Copied $full") }
+                4 -> { val rel = relativeOf(e.path); host.copyToClipboard(rel); Ui.toast(ctx, "Copied $rel") }
+                6 -> { val full = if (e.path.startsWith("/")) e.path else host.windowFolder().trimEnd('/') + "/" + e.path; host.copyToClipboard(full); Ui.toast(ctx, "Copied $full") }
                 5 -> trashDialog(e)
                 10 -> openToSide(e.path)
                 11 -> host.addToChat(JSONObject().put("kind", "file").put("path", e.path).put("name", e.path))
@@ -595,6 +616,30 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
             true
         }
         menu.show()
+    }
+
+    /**
+     * A path typed in the New file or New folder dialog: an absolute path inside a folder added to this window stays
+     * absolute (the file goes into that folder), an absolute path inside this window's folder becomes relative, and a
+     * leading slash on anything else means this window's folder.
+     */
+    private fun newPathOf(typed: String): String {
+        val t = typed.trim()
+        if (!t.startsWith("/")) return t
+        val primary = host.windowFolder().trimEnd('/')
+        if (primary.isNotEmpty() && t.startsWith("$primary/")) return t.removePrefix("$primary/")
+        if (addedRoots().any { t == it || t.startsWith("$it/") }) return t
+        return t.trimStart('/')
+    }
+
+    /** The folders added to this window (absolute paths). */
+    private fun addedRoots(): List<String> = roots.filter { it.root == 2 }.map { it.path.trimEnd('/') }
+
+    /** A path relative to the folder that holds it: this window's folder, or the added folder it is in. */
+    private fun relativeOf(path: String): String {
+        if (!path.startsWith("/")) return path
+        val r = addedRoots().firstOrNull { path.startsWith("$it/") } ?: return path
+        return path.removePrefix("$r/")
     }
 
     /** The New file dialog with a name filled in (the palette's New file and New Jupyter notebook). */
@@ -609,9 +654,10 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
             if (name.isNotEmpty() && dot > 0) input.setSelection(prefix.length, prefix.length + dot) else input.setSelection(input.text.length)
         }
         val dialog = AlertDialog.Builder(ctx).setTitle("New file").setView(input).setPositiveButton("Create") { _, _ ->
-            val p = input.text.toString().trim().trimStart('/')
+            val p = newPathOf(input.text.toString())
             if (p.isEmpty() || p.endsWith("/")) return@setPositiveButton
-            Api.async("newfile", { Api.post("/api/file", JSONObject().put("path", p).put("content", "")) }) { r, e ->
+            // /api/file/new creates the file only when it does not exist yet; an existing file is never emptied.
+            Api.async("newfile", { Api.post("/api/file/new", JSONObject().put("path", p)) }) { r, e ->
                 if (r == null) { Ui.toast(ctx, "Not created: " + (e?.message ?: "")); return@async }
                 expandAncestors(p); refresh(); openFile(p)
             }
@@ -624,7 +670,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         val input = Ui.input(ctx, "folder name", mono = true)
         if (dir.isNotEmpty() && dir != ".") { input.setText(dir.trimEnd('/') + "/"); input.setSelection(input.text.length) }
         val dialog = AlertDialog.Builder(ctx).setTitle("New folder").setView(input).setPositiveButton("Create") { _, _ ->
-            val p = input.text.toString().trim().trim('/')
+            val p = newPathOf(input.text.toString()).trimEnd('/')
             if (p.isEmpty()) return@setPositiveButton
             Api.async("newfolder", { Api.post("/api/file/new", JSONObject().put("path", p).put("dir", true)) }) { r, e ->
                 if (r == null) { Ui.toast(ctx, "Not created: " + (e?.message ?: "")); return@async }
@@ -666,7 +712,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
             d.path = target(old)
             docs[d.path] = d
             for (t in d.tabs) t.renamed(d.path)
-            Lsp.moved(old, d.path, d.text())
+            Lsp.moved(old, d.path, d.text(), host.windowFolder())
             reviews.remove(old)?.let { reviews[d.path] = it; persistReviews() }
         }
         for (g in groups) for (t in g.tabs) if (t !is TextTab && moved(t.path)) t.renamed(target(t.path))
@@ -739,6 +785,13 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     /** Ctrl backslash: the active file opens again in a new group to the right of the focused one (Split Editor). */
     fun toggleSplit() {
         val src = current.active
+        if (src is NotebookTab) {
+            // A notebook shows in one group at a time (two views would save over each other's cells), so it moves.
+            val g = addGroup(current) ?: return
+            moveTab(src, g)
+            host.flashStatus("A notebook shows in one group at a time, so it moved to the new group.")
+            return
+        }
         val g = addGroup(current) ?: return
         current = g
         if (src != null) open(src.path, g, activate = true) { t -> if (t is TextTab && src is TextTab) { val (l, c) = src.editor.lineColOf(src.editor.cursorOffset()); t.editor.goTo(l, c) } } else for (x in groups) renderTabs(x)
@@ -753,6 +806,18 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     /** Opens a file in the group to the right of the focused one, making that group if there is none. */
+    /** Ctrl K V: the live preview next to the active Markdown file; it stays open when it already is. */
+    fun openPreview() { val t = current.active as? TextTab; if (t?.preview != null) return; togglePreview(t) }
+
+    /** Opens a file at a place in the group to the right, made when there is none (Open Definition to the Side). */
+    fun openToSideAt(path: String, line: Int, col: Int) {
+        val i = groups.indexOf(current)
+        val target = groups.getOrNull(i + 1) ?: addGroup(current) ?: return
+        current = target
+        open(path, target, activate = true) { t -> if (t is TextTab) t.editor.goTo(line, col) }
+        for (x in groups) renderTabs(x)
+    }
+
     fun openToSide(path: String) {
         val i = groups.indexOf(current)
         val target = groups.getOrNull(i + 1) ?: addGroup(current) ?: return
@@ -820,7 +885,8 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         val menu = PopupMenu(ctx, anchor)
         val t = g.active
         if (t is TextTab && PreviewPanel.isMarkdown(t.path)) menu.menu.add(0, 1, 0, if (t.preview == null) "Open the Markdown preview (Ctrl Shift V)" else "Close the Markdown preview")
-        if (t != null) {
+        // An Untitled file is in no folder yet, so it can be neither revealed nor attached by its path.
+        if (t != null && !isUntitled(t.path)) {
             menu.menu.add(0, 2, 1, "Reveal in the Explorer")
             menu.menu.add(0, 3, 2, "Add this file to the chat")
         }
@@ -829,7 +895,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         if (groups.size > 1) menu.menu.add(0, 6, 5, "Close this group")
         menu.setOnMenuItemClickListener { item ->
             when (item.itemId) {
-                1 -> togglePreview()
+                1 -> togglePreview(t)
                 2 -> t?.let { revealInTree(it.path) }
                 3 -> t?.let { host.addToChat(JSONObject().put("kind", "file").put("path", it.path).put("name", it.path)) }
                 4 -> for (x in g.tabs.toList()) if (!x.dirty) closeNow(x)
@@ -887,12 +953,32 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     /** Ctrl Alt Right and Left: the active tab moves to the next or previous group (a new one on the right if needed). */
     fun moveTabToGroup(dir: Int) {
         val t = current.active ?: return
-        if (t is NotebookTab && t.dirty) { Ui.toast(ctx, "Save the notebook first."); return }
         val i = groups.indexOf(current) + dir
         if (i < 0) return
         val target = if (i >= groups.size) (addGroup(current) ?: return) else groups[i]
-        open(t.path, target, activate = true) { }
-        closeNow(t)
+        moveTab(t, target)
+    }
+
+    private fun isNotebook(path: String) = path.endsWith(".ipynb", ignoreCase = true)
+
+    /**
+     * Moves a tab itself into another group: the same editor, notebook or picture, so unsaved changes, the cursor and
+     * a notebook's outputs go with it. An emptied group closes, as in Cursor.
+     */
+    private fun moveTab(t: Tab, target: Group) {
+        val g = t.group
+        if (g === target) return
+        val idx = g.tabs.indexOf(t)
+        g.tabs.remove(t)
+        g.frame.removeView(t.content)
+        if (g.active === t) g.active = null
+        t.group = target
+        target.tabs.add(t)
+        activate(t)
+        if (g.tabs.isEmpty() && groups.size > 1) closeGroupNow(g)
+        else if (g.active == null) g.tabs.getOrNull(idx.coerceAtMost(g.tabs.size - 1))?.let { n -> val keep = current; activate(n); keep.active?.let { activate(it) } }
+        for (x in groups) renderTabs(x)
+        scheduleStateSave()
     }
 
     /** Ctrl K Left and Right: the focused group changes places with its neighbour on that side. */
@@ -953,8 +1039,8 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     fun copyActivePath(relative: Boolean) {
         val p = activePath()
         if (p.isEmpty() || isUntitled(p)) { Ui.toast(ctx, "Open a saved file first."); return }
-        val abs = if (p.startsWith("/")) p else Api.folder.trimEnd('/') + "/" + p
-        val out = if (relative) abs.removePrefix(Api.folder.trimEnd('/') + "/") else abs
+        val abs = if (p.startsWith("/")) p else host.windowFolder().trimEnd('/') + "/" + p
+        val out = if (relative) relativeOf(abs.removePrefix(host.windowFolder().trimEnd('/') + "/")) else abs
         host.copyToClipboard(out)
         host.flashStatus("Copied $out")
     }
@@ -992,10 +1078,17 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
             .setPositiveButton("Save", null).setNegativeButton("Cancel", null).create()
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val target = input.text.toString().trim()
+                val target = newPathOf(input.text.toString())
                 if (target.isEmpty()) return@setOnClickListener
                 val text = d.text()
-                Api.async("save-as", { Api.post("/api/file", JSONObject().put("path", target).put("content", text).put("encoding", d.encoding).put("eol", d.eol)) }) { r, e ->
+                fun save(replace: Boolean) {
+                Api.async("save-as", { Api.post("/api/file", JSONObject().put("path", target).put("content", text).put("encoding", d.encoding).put("eol", d.eol).put("if_absent", !replace && target != old)) }) { r, e ->
+                    if (r == null && (e as? Api.ApiError)?.code == 409) {
+                        // The name is taken: replace it only after a yes, as Cursor asks.
+                        AlertDialog.Builder(ctx).setTitle("Replace $target?").setMessage("$target already exists. Replacing it overwrites its contents.")
+                            .setPositiveButton("Replace") { _, _ -> save(true) }.setNegativeButton("Cancel", null).show()
+                        return@async
+                    }
                     if (r == null) { Ui.toast(ctx, "Not saved: " + (e?.message ?: "")); return@async }
                     dialog.dismiss()
                     host.flashStatus("Saved $target")
@@ -1004,7 +1097,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
                         docs.remove(old); d.path = target; docs[target] = d
                         d.dirty = false; d.mtime = r.optDouble("mtime", 0.0)
                         for (x in d.tabs) { x.renamed(target); x.editor.lang = Highlighter.langFor(target) }
-                        Lsp.open(target, text)
+                        Lsp.open(target, text, host.windowFolder())
                         for (g in groups) renderTabs(g)
                         current.active?.let { onActiveChanged(it) }
                     } else {
@@ -1018,6 +1111,8 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
                     refresh()
                     done()
                 }
+                }
+                save(false)
             }
         }
         dialog.show()
@@ -1088,6 +1183,86 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
 
     fun noteEdit(path: String, ed: CodeEditor) { lastEdit = Spot(path, ed.cursorOffset()) }
 
+    // ---------------------------------------------------------------- open editors (kept per folder, as Cursor does)
+    private val statePrefs get() = ctx.getSharedPreferences("forge-editors", Context.MODE_PRIVATE)
+    private fun stateKey() = "open:" + host.windowFolder()
+    private val stateTask by lazy { Runnable { saveOpenState() } }
+    private var restoringState = false
+
+    /** A tab opened, closed or came to the front: the open editors are written down a moment later. */
+    private fun scheduleStateSave() { Api.main.removeCallbacks(stateTask); Api.main.postDelayed(stateTask, 1000) }
+
+    /**
+     * Writes down the open editors of this window's folder: the groups, their tabs in order, each group's active tab,
+     * the cursor of every text tab and the focused group. Reload Window and opening the folder again bring them back.
+     * Untitled files are not kept here; hot exit keeps unsaved text.
+     */
+    fun saveOpenState() {
+        Api.main.removeCallbacks(stateTask)
+        if (restoringState || host.testWindow || host.windowFolder().isEmpty()) return
+        val gs = JSONArray()
+        for (g in groups) {
+            val tabs = JSONArray()
+            for (t in g.tabs) {
+                if (isUntitled(t.path)) continue
+                val o = JSONObject().put("path", t.path)
+                if (t is TextTab) { val (l, c) = t.editor.lineColOf(t.editor.cursorOffset()); o.put("line", l).put("col", c) }
+                if (t in previewTabs) o.put("preview", true)
+                tabs.put(o)
+            }
+            gs.put(JSONObject().put("tabs", tabs).put("active", g.active?.path?.takeIf { !isUntitled(it) } ?: ""))
+        }
+        val o = JSONObject().put("groups", gs).put("focus", groups.indexOf(current)).put("stacked", stacked)
+        statePrefs.edit().putString(stateKey(), o.toString()).apply()
+    }
+
+    /** Opens the editors written down for this folder, one after the other so the tabs keep their order; a file that
+     *  is gone is skipped. [done] runs when all are open. */
+    fun restoreOpenState(done: () -> Unit) {
+        val o = try { JSONObject(statePrefs.getString(stateKey(), null) ?: "") } catch (e: Exception) { null }
+        val gs = o?.optJSONArray("groups")
+        if (o == null || gs == null || gs.length() == 0) { done(); return }
+        restoringState = true
+        if (o.optBoolean("stacked") != stacked && gs.length() > 1) { stacked = o.optBoolean("stacked"); layoutGroups() }
+        val steps = ArrayList<Pair<Int, JSONObject>>()
+        for (gi in 0 until gs.length()) {
+            val g = gs.optJSONObject(gi) ?: continue
+            val tabs = g.optJSONArray("tabs") ?: continue
+            for (ti in 0 until tabs.length()) tabs.optJSONObject(ti)?.let { steps.add(gi to it) }
+        }
+        var missing = 0
+        fun groupAt(i: Int): Group {
+            while (groups.size <= i && groups.size < MAX_GROUPS) { if (addGroup(groups.last()) == null) break }
+            return groups.getOrElse(i) { groups.last() }
+        }
+        fun finish() {
+            // Each group shows its active tab again, and the group that had the focus gets it back.
+            for (gi in 0 until gs.length()) {
+                val want = gs.optJSONObject(gi)?.optString("active").orEmpty()
+                val g = groups.getOrNull(gi) ?: continue
+                g.tabs.firstOrNull { it.path == want }?.let { activate(it) }
+            }
+            groups.getOrNull(o.optInt("focus", 0))?.let { g -> g.active?.let { activate(it) } ?: focusGroup(g) }
+            // Groups that stayed empty (all their files were gone) close again.
+            for (g in groups.toList()) if (g.tabs.isEmpty() && groups.size > 1) closeGroupNow(g)
+            restoringState = false
+            if (missing > 0) host.flashStatus(if (missing == 1) "One file that was open is gone." else "$missing files that were open are gone.")
+            done()
+        }
+        fun next(i: Int) {
+            if (i >= steps.size) { finish(); return }
+            val (gi, t) = steps[i]
+            val path = t.optString("path")
+            if (path.isEmpty()) { next(i + 1); return }
+            open(path, groupAt(gi), activate = true, failed = { missing++; next(i + 1) }) { tab ->
+                if (tab is TextTab && t.has("line")) tab.editor.goTo(t.optInt("line"), t.optInt("col"))
+                if (t.optBoolean("preview")) previewTabs.add(tab)
+                next(i + 1)
+            }
+        }
+        next(0)
+    }
+
     // ---------------------------------------------------------------- hot exit (unsaved files survive closing Forge)
     /** Every unsaved text file: path, text, encoding and line ending. */
     fun unsavedDocs(): JSONArray {
@@ -1146,7 +1321,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
                 val text = r.optString("content")
                 for (x in d.tabs) x.editor.replaceContent(text)
                 d.dirty = false; for (g in groups) renderTabs(g)
-                Lsp.change(d.path, text)
+                Lsp.change(d.path, text, host.windowFolder())
                 host.flashStatus("Reopened with " + d.encodingName + (if (!r.optBoolean("lossless", true)) ". Some bytes do not fit this encoding." else "."))
                 host.onEditorState(t.editor, t.path)
             }
@@ -1201,13 +1376,17 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         open(path, g, activate = true) { t -> if (t is TextTab) t.editor.goTo(line, col) }
     }
 
-    private fun open(path: String, g: Group, activate: Boolean, then: (Tab) -> Unit) {
-        val existing = g.tabs.firstOrNull { it.path == path }
+    /** "{ } JSON" and "Open as JSON" of a notebook: the file as plain text in a text tab. */
+    fun openAsText(path: String) = open(path, current, activate = true, asText = true) { }
+
+    private fun open(path: String, g: Group, activate: Boolean, failed: ((String) -> Unit)? = null, asText: Boolean = false, then: (Tab) -> Unit) {
+        // A notebook can be open as a notebook and as JSON text at the same time; each open finds its own kind of tab.
+        val existing = g.tabs.firstOrNull { it.path == path && (if (asText) it is TextTab else !(it is TextTab && isNotebook(path))) }
         if (existing != null) { if (activate) activate(existing); then(existing); return }
         when {
             isUntitled(path) -> { val d = docs[path] ?: return; val t = makeTextTab(g, d, d.text()); addTab(t, activate); then(t) }
-            PreviewPanel.isImage(path) -> { val t = ImageTab(g, path); addTab(t, activate); then(t) }
-            path.endsWith(".ipynb", ignoreCase = true) -> { val t = NotebookTab(g, path); t.nb.open(path); addTab(t, activate); then(t) }
+            !asText && PreviewPanel.isImage(path) -> { val t = ImageTab(g, path); addTab(t, activate); then(t) }
+            !asText && isNotebook(path) -> { val t = NotebookTab(g, path); t.nb.open(path); addTab(t, activate); then(t) }
             else -> {
                 val doc = docs[path]
                 if (doc != null && doc.tabs.isNotEmpty()) {
@@ -1216,14 +1395,15 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
                     return
                 }
                 Api.async("file", { Api.get("/api/file", mapOf("path" to path)) }) { r, e ->
-                    if (r == null) { Ui.toast(ctx, "Cannot open " + path + ": " + (e?.message ?: "")); return@async }
-                    val again = g.tabs.firstOrNull { it.path == path }
+                    if (r == null) { if (failed != null) failed(e?.message ?: "") else Ui.toast(ctx, "Cannot open " + path + ": " + (e?.message ?: "")); return@async }
+                    // The same kind of tab only: a notebook's JSON opens next to its notebook view, not instead of it.
+                    val again = g.tabs.firstOrNull { it.path == path && (if (asText) it is TextTab else !(it is TextTab && isNotebook(path))) }
                     if (again != null) { if (activate) activate(again); then(again); return@async }
                     val d = docs[path] ?: Doc(path).also { docs[path] = it }
                     d.mtime = r.optDouble("mtime", 0.0)
                     readCodec(d, r)
                     val t = makeTextTab(g, d, r.optString("content"))
-                    if (d.tabs.size == 1) Lsp.open(path, t.editor.text())
+                    if (d.tabs.size == 1) Lsp.open(path, t.editor.text(), host.windowFolder())
                     addTab(t, activate); then(t)
                     renderReview(path)
                 }
@@ -1263,6 +1443,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         val idx = g.active?.let { g.tabs.indexOf(it) + 1 } ?: g.tabs.size
         g.tabs.add(idx.coerceIn(0, g.tabs.size), t)
         if (activate || g.active == null) activate(t) else renderTabs(g)
+        scheduleStateSave()
     }
 
     private fun activate(t: Tab) {
@@ -1277,6 +1458,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         g.welcome?.visibility = View.GONE
         current = g
         noteActive(t)
+        scheduleStateSave()
         for (x in groups) renderTabs(x)
         onActiveChanged(t)
         t.focus()
@@ -1359,7 +1541,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         menu.menu.add(0, 3, 2, "Close to the right")
         menu.menu.add(0, 4, 3, "Close saved")
         menu.menu.add(0, 5, 4, "Close all")
-        menu.menu.add(0, 6, 5, if (g === groups.last()) "Open to the side" else "Move to the next group")
+        menu.menu.add(0, 6, 5, if (g === groups.last()) (if (t is NotebookTab) "Move to the side" else "Open to the side") else "Move to the next group")
         menu.menu.add(0, 7, 6, "Reveal in the Explorer")
         menu.menu.add(0, 8, 7, "Add to the chat")
         menu.menu.add(0, 9, 8, "Copy the relative path")
@@ -1370,7 +1552,11 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
                 3 -> { val i = g.tabs.indexOf(t); for (x in g.tabs.toList().drop(i + 1)) close(x) }
                 4 -> for (x in g.tabs.toList()) if (!x.dirty) closeNow(x)
                 5 -> for (x in g.tabs.toList()) close(x)
-                6 -> if (g === groups.last()) { current = g; openToSide(t.path) } else { open(t.path, groups[groups.indexOf(g) + 1], true) { }; closeNow(t) }
+                // A notebook moves (one view of it at a time keeps its unsaved cells safe); other files open again there.
+                6 -> {
+                    val next = if (g === groups.last()) addGroup(g) else groups[groups.indexOf(g) + 1]
+                    if (next != null) { if (t is NotebookTab || g !== groups.last()) moveTab(t, next) else { current = next; open(t.path, next, true) { } } }
+                }
                 7 -> revealInTree(t.path)
                 8 -> host.addToChat(JSONObject().put("kind", "file").put("path", t.path).put("name", t.path))
                 9 -> { host.copyToClipboard(t.path); Ui.toast(ctx, "Copied " + t.path) }
@@ -1405,7 +1591,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
             t.doc.tabs.remove(t)
             if (t.doc.tabs.isEmpty()) {
                 docs.remove(t.doc.path)
-                Lsp.close(t.doc.path)
+                Lsp.close(t.doc.path, host.windowFolder())
                 // An inline (Ctrl K) review cannot outlive the file's last editor; an agent review comes back on reopening.
                 if (reviews[t.doc.path]?.inline == true) reviews.remove(t.doc.path)
             }
@@ -1413,6 +1599,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     private fun closeNow(t: Tab) {
+        scheduleStateSave()
         val g = t.group
         val idx = g.tabs.indexOf(t)
         previewTabs.remove(t); mru.remove(t)
@@ -1481,7 +1668,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
                 val text = r.optString("content")
                 if (text != d.text()) {
                     for (t in d.tabs) t.editor.replaceContent(text)
-                    Lsp.change(path, text)
+                    Lsp.change(path, text, host.windowFolder())
                 }
                 renderReview(path)
             }
@@ -1502,8 +1689,11 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
 
     /** Font size and minimap from the settings (13 points is the default, 12.5 sp on this screen). */
     private fun applyEditorSettings(ed: CodeEditor) {
-        ed.setFontSize(ForgeSettings.int("font_size", 13).coerceIn(8, 32) * 12.5f / 13f)
-        ed.setMinimapVisible(ForgeSettings.bool("minimap", true))
+        val f = host.windowFolder()
+        ed.setFontSize(ForgeSettings.int("font_size", 13, f).coerceIn(8, 32) * 12.5f / 13f)
+        ed.setMinimapVisible(ForgeSettings.bool("minimap", true, f))
+        val ws = ForgeSettings.bool("render_whitespace", false, f)
+        if (ed.renderWhitespace != ws) { ed.renderWhitespace = ws; ed.edit.invalidate() }
     }
 
     /** The settings changed: every open editor follows. */
@@ -1591,6 +1781,33 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     // ---------------------------------------------------------------- edits from language servers
     /** Applies edits to several files (rename, quick fixes): open files change in their editor, others are opened first. */
     fun applyWorkspaceEdit(edits: Map<String, List<Lsp.TextEdit>>): Int {
+        // File operations (a rename that moves a class's file, a new file) run first, one after the other, through the
+        // server; the text edits follow, so edits to a renamed or created file land in it.
+        val ops = (edits as? Lsp.EditMap)?.ops.orEmpty()
+        if (ops.isNotEmpty()) {
+            runFileOps(ops, 0) { applyTextEdits(edits) }
+            return edits.values.count { it.isNotEmpty() } + ops.size
+        }
+        return applyTextEdits(edits)
+    }
+
+    private fun runFileOps(ops: List<Lsp.FileOp>, i: Int, done: () -> Unit) {
+        if (i >= ops.size) { refresh(); done(); return }
+        val op = ops[i]
+        val body = when (op.kind) {
+            "create" -> JSONObject().put("path", op.path)
+            "rename" -> JSONObject().put("path", op.path).put("new_path", op.newPath)
+            else -> JSONObject().put("path", op.path)
+        }
+        val route = when (op.kind) { "create" -> "/api/file/new"; "rename" -> "/api/file/rename"; else -> "/api/file/trash" }
+        Api.async("lsp-file-op", { Api.post(route, body) }) { _, e ->
+            if (e != null) Ui.toast(ctx, "The language server asked to " + op.kind + " " + op.path + ", which failed: " + e.message)
+            else if (op.kind == "rename") movePaths(op.path, op.newPath, dir = false)
+            runFileOps(ops, i + 1, done)
+        }
+    }
+
+    private fun applyTextEdits(edits: Map<String, List<Lsp.TextEdit>>): Int {
         var n = 0
         for ((p, list) in edits) {
             if (list.isEmpty()) continue
@@ -1603,13 +1820,14 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     // ---------------------------------------------------------------- the Markdown preview
-    /** Ctrl Shift V: the live preview next to the active Markdown file, or closes it. */
-    fun togglePreview() {
-        val t = current.active as? TextTab
+    /** Ctrl Shift V: the live preview next to a Markdown file's editor (the active one by default), or closes it. The
+     *  preview's own X and the group menus pass their tab, so they act on the group they belong to. */
+    fun togglePreview(tab: Tab? = current.active) {
+        val t = tab as? TextTab
         if (t == null || !PreviewPanel.isMarkdown(t.path)) { Ui.toast(ctx, "Open a Markdown file first."); return }
         val p = t.preview
         if (p != null) { t.box.removeView(p.view); t.box.removeViewAt(t.box.childCount - 1); t.preview = null; return }
-        val prev = PreviewPanel.MarkdownPreview(ctx, host, t.path) { togglePreview() }
+        val prev = PreviewPanel.MarkdownPreview(ctx, host, t.path) { togglePreview(t) }
         t.preview = prev
         t.box.addView(Ui.divider(ctx, true))
         t.box.addView(prev.view, Ui.lp(0, Ui.match, 1f))
@@ -1674,7 +1892,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
 
     private fun loadSymbols() {
         val t = current.active as? TextTab ?: return
-        val client = Lsp.clientFor(t.path)
+        val client = Lsp.clientFor(t.path, host.windowFolder())
         if (client == null || !client.has("documentSymbolProvider")) {
             if (client != null && !client.ready) { scheduleSymbols(2000); return }
             symbols = emptyList(); symbolsFor = t.path; showOutline(); return
@@ -1794,7 +2012,9 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     fun nextReview() {
         val list = pendingReviews()
         if (list.isEmpty()) { Ui.toast(ctx, "No changes wait for review."); return }
-        openFile(list.firstOrNull { it != activePath() } ?: list[0])
+        // The file after the one shown, round the list, so every file with changes is reached in turn.
+        val i = list.indexOf(activePath())
+        openFile(list[(i + 1) % list.size])
     }
 
     /** Keeps every pending agent change in every file. */
@@ -1865,6 +2085,12 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         if (keep) {
             r.base = Diff.keepHunk(base, now, h).joinToString("\n")
             renderReview(path)
+            // An agent change: the server keeps the new original, so the kept part stays kept after a reload and in a
+            // later Undo or Restore checkpoint.
+            if (!r.inline && r.runId.isNotEmpty()) {
+                val body = JSONObject().put("run_id", r.runId).put("path", path).put("before", r.base)
+                Api.async("keep-hunk", { Api.post("/api/changes/keep", body) }) { _, e -> if (e != null) Ui.toast(ctx, "The kept part is not saved: " + e.message) }
+            }
             return
         }
         val target = Diff.undoHunk(base, now, h).joinToString("\n")
@@ -1874,10 +2100,35 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
         if (!r.inline) saveDoc(d) { }
     }
 
+    /** The AI changes view kept part of a change: the editor's review of that file starts from the same original. */
+    fun setReviewBase(path: String, base: String) { val r = reviews[path] ?: return; r.base = base; renderReview(path) }
+
     private fun reviewAll(path: String, keep: Boolean) {
         val r = reviews[path] ?: return
         val d = docs[path] ?: return
         if (keep) { finishReview(path); host.flashStatus("Kept the changes in $path"); return }
+        if (!r.inline && r.runId.isNotEmpty()) {
+            // An agent change is undone from its checkpoint, as the AI changes view does: a file the agent created goes
+            // to the trash (an empty file would stay otherwise), and the checkpoint knows it was undone.
+            Api.async("revert", { Api.post("/api/revert", JSONObject().put("run_id", r.runId).put("path", path)) }) { res, e ->
+                if (res == null) { Ui.toast(ctx, "Not undone: " + (e?.message ?: "")); return@async }
+                finishReview(path)
+                Api.async("file", { Api.get("/api/file", mapOf("path" to path)) }) { f, _ ->
+                    if (f == null) {
+                        // The file is gone (the agent had created it): its tabs close.
+                        for (t in d.tabs.toList()) closeNow(t)
+                        docs.remove(path)
+                        refresh()
+                    } else {
+                        replaceMinimal(d.tabs[0].editor, f.optString("content"))
+                        d.dirty = false; d.mtime = f.optDouble("mtime", d.mtime)
+                        for (g in groups) renderTabs(g)
+                    }
+                    host.flashStatus(res.optString("message").ifEmpty { "Undid the changes in $path." })
+                }
+            }
+            return
+        }
         replaceMinimal(d.tabs[0].editor, r.base)
         finishReview(path)
         if (!r.inline) saveDoc(d) { }
@@ -1901,7 +2152,7 @@ class EditorPanel(private val ctx: Context, private val host: MainActivity) {
     /** Files the language servers report problems in, with their counts, for the status bar. */
     fun problemTotals(): Pair<Int, Int> {
         var e = 0; var w = 0
-        for (list in Lsp.diagnostics.values) for (d in list) { if (d.severity <= 1) e++ else if (d.severity == 2) w++ }
+        for (list in Lsp.diagnosticsOf(host.windowFolder()).values) for (d in list) { if (d.severity <= 1) e++ else if (d.severity == 2) w++ }
         return e to w
     }
 

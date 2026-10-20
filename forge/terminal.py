@@ -1,4 +1,4 @@
-"""Integrated terminal: a bash shell on a pseudo terminal, bridged to xterm.js over a WebSocket."""
+"""Integrated terminal: a bash shell on a pseudo terminal, bridged to the Forge app's terminal view over a WebSocket."""
 from __future__ import annotations
 
 import fcntl
@@ -65,7 +65,23 @@ class PtySession:
         except OSError:
             self.alive = False
 
+    @staticmethod
+    def _complete_upto(b: bytes) -> int:
+        """Where a UTF-8 character cut off at the end of [b] begins (len(b) when the bytes end with whole characters).
+        A read of the terminal can end in the middle of a character; that part waits for the next read, so the app
+        never decodes half a character (it would show a replacement mark)."""
+        i, n = len(b) - 1, 0
+        while i >= 0 and n < 3 and (b[i] & 0xC0) == 0x80:
+            i -= 1
+            n += 1
+        if i < 0:
+            return len(b)
+        lead = b[i]
+        need = 2 if lead & 0xE0 == 0xC0 else 3 if lead & 0xF0 == 0xE0 else 4 if lead & 0xF8 == 0xF0 else 1
+        return i if need > n + 1 else len(b)
+
     def _read_loop(self) -> None:
+        pending = b""
         while self.alive:
             try:
                 r, _, _ = select.select([self.fd], [], [], 0.5)
@@ -81,10 +97,20 @@ class PtySession:
                 break
             if not data:
                 break
+            data = pending + data
+            cut = self._complete_upto(data)
+            data, pending = data[:cut], data[cut:]
+            if not data:
+                continue
             with self.lock:
                 self.history += data
                 if len(self.history) > 200_000:
                     del self.history[:len(self.history) - 200_000]
+                    # The replay must not start in the middle of a character either.
+                    k = 0
+                    while k < len(self.history) and k < 3 and (self.history[k] & 0xC0) == 0x80:
+                        k += 1
+                    del self.history[:k]
                 clients = list(self.clients)
             for ws in clients:
                 try:

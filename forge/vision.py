@@ -90,8 +90,8 @@ class VisionManager:
             self._ev("model_activity", model="vision", state="released", label=self._label,
                      detail="Finished. The Forge app stops it and frees its memory.")
             if self._llama_lent_gpu:
-                self._ev("model_activity", model="llama", state="resuming", label="Llama 3.1",
-                         detail="The Intel GPU is free again, so Llama's GPU engine resumes.")
+                self._ev("model_activity", model="llama", state="resuming", label=self.st.chat_model_label("gpu"),
+                         detail="The Intel GPU is free again, so the chat model's GPU engine resumes.")
             self._llama_lent_gpu = False
 
     class _Hold:
@@ -221,8 +221,8 @@ class VisionManager:
                detail="Forge asks the Forge app to start the vision model on the Intel GPU.")
             if llama_on_gpu:
                 self._llama_lent_gpu = True
-                ev("model_activity", model="llama", state="pausing", label="Llama 3.1",
-                   detail="Llama's GPU engine pauses so the vision model can use the Intel GPU (one model on the GPU at a time).")
+                ev("model_activity", model="llama", state="pausing", label=self.st.chat_model_label("gpu"),
+                   detail="The chat model's GPU engine pauses so the vision model can use the Intel GPU (one model on the GPU at a time).")
         while time.time() < deadline:
             if c.alive():
                 break
@@ -230,8 +230,8 @@ class VisionManager:
             if engine != last_engine:
                 last_engine = engine
                 if engine == "paused" and llama_on_gpu:
-                    ev("model_activity", model="llama", state="paused", label="Llama 3.1",
-                       detail="Llama's GPU engine is paused and has lent the Intel GPU to the vision model.")
+                    ev("model_activity", model="llama", state="paused", label=self.st.chat_model_label("gpu"),
+                       detail="The chat model's GPU engine is paused and has lent the Intel GPU to the vision model.")
             if vstate != last_vstate and self.app_report_ts > requested:
                 last_vstate = vstate
                 if self.app.get("vtier"):
@@ -312,7 +312,7 @@ class VisionManager:
         if loaded:
             emit("The CPU vision model was skipped because the main model is using the VM's memory.")
             self._ev("model_activity", model="vision", state="skipped", label=f"{model} (CPU)",
-                     detail="Skipped: Llama is using the VM's memory, and two models must not be loaded at once.")
+                     detail="Skipped: the chat model is using the VM's memory, and two models must not be loaded at once.")
             return None
         if m.get("available_mb", 0) < CPU_VISION_NEED_MB:
             emit(f"The CPU vision model was skipped to protect memory ({m.get('available_mb')} MB free in the VM).")
@@ -385,7 +385,7 @@ class VisionManager:
             if r:
                 return r
         self._ev("model_activity", model="vision", state="unavailable", label="the vision model",
-                 detail="Not available for this look, so Llama gets the recognized text only.")
+                 detail="Not available for this look, so the chat model gets the recognized text only.")
         return "", "unavailable"
 
     def analyze(self, img_id: str, settings: dict, emit: Callable[[str], None],

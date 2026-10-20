@@ -7,10 +7,20 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import threading
 import time
 import urllib.parse
 from typing import Any, Callable, Dict, Iterator, List, Optional
+
+
+def keep_alive_value(v: Any) -> Any:
+    """Ollama reads a number as seconds (a negative one keeps the model loaded until it is unloaded) and text as a
+    duration with a unit ("5m", "24h"). A bare number written as text ("-1", "300") has no unit, which Ollama refuses,
+    so it is sent as a number."""
+    if isinstance(v, str) and re.fullmatch(r"\s*-?\d+\s*", v):
+        return int(v)
+    return v
 
 
 class OllamaError(Exception):
@@ -147,7 +157,7 @@ class OllamaClient:
     def chat_stream(self, model: str, messages: List[dict], options: Optional[dict] = None,
                     tools: Optional[list] = None, keep_alive: str = "30m",
                     cancel: Optional[threading.Event] = None, think: Optional[bool] = None) -> Iterator[dict]:
-        body: Dict[str, Any] = {"model": model, "messages": messages, "keep_alive": keep_alive}
+        body: Dict[str, Any] = {"model": model, "messages": messages, "keep_alive": keep_alive_value(keep_alive)}
         if think is not None:
             body["think"] = think
         if options:
@@ -158,7 +168,7 @@ class OllamaClient:
 
     def generate(self, model: str, prompt: str, options: Optional[dict] = None, raw: bool = False,
                  keep_alive: str = "30m", timeout: float = 120.0, system: Optional[str] = None) -> dict:
-        body: Dict[str, Any] = {"model": model, "prompt": prompt, "stream": False, "keep_alive": keep_alive}
+        body: Dict[str, Any] = {"model": model, "prompt": prompt, "stream": False, "keep_alive": keep_alive_value(keep_alive)}
         if options:
             body["options"] = options
         if raw:

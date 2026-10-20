@@ -14,8 +14,7 @@ import org.json.JSONObject
  * the Forge server in one list. The list shows every notepad; the selected one opens in an editor below the list
  * with its name and text. Edits are saved when the name or the text box loses focus, when another notepad is
  * selected, and one second after the last keystroke as a safety net (the page saved half a second after each edit).
- * "Add to chat" copies the text to the clipboard, because the native window has no way yet to attach a notepad
- * to the chat directly.
+ * "Add to chat" attaches the notepad to the chat as context, the same as picking it with @ in the chat input.
  */
 class NotepadsPanel(private val ctx: Context, private val host: MainActivity) {
     val view: LinearLayout = LinearLayout(ctx)
@@ -131,7 +130,7 @@ class NotepadsPanel(private val ctx: Context, private val host: MainActivity) {
         val tLp = Ui.lp(Ui.match, Ui.wrap); tLp.topMargin = Ui.dp(ctx, 6)
         col.addView(text, tLp)
         val add = Ui.button(ctx, "Add to chat") { addToChat() }
-        add.tooltipText = "Copies the notepad's text so you can paste it into the chat"
+        add.tooltipText = "Attaches this notepad to the chat as context, the same as picking it with @"
         val aLp = Ui.lp(Ui.wrap, Ui.wrap); aLp.topMargin = Ui.dp(ctx, 6)
         col.addView(add, aLp)
         return col
@@ -167,16 +166,13 @@ class NotepadsPanel(private val ctx: Context, private val host: MainActivity) {
         }
     }
 
-    /**
-     * The page attached the notepad to the chat as context. The native chat panel has no entry point for that
-     * yet, so the text goes to the clipboard and a notice says so.
-     */
+    /** Attaches the notepad to the chat as context (the model receives its text with the next message). */
     private fun addToChat() {
         val p = (if (active in 0 until pads.length()) pads.optJSONObject(active) else null) ?: return
         if (pullEditor()) dirty = true
         saveIfDirty()
         val name = p.optString("name").ifEmpty { "Untitled" }
-        host.copyToClipboard("Notepad: $name\n\n" + p.optString("text"))
-        Ui.toast(ctx, "The notepad \"$name\" is on the clipboard. Paste it into the chat.")
+        host.addToChat(JSONObject().put("kind", "text").put("title", "Notepad: $name").put("text", p.optString("text")).put("name", "notepad: $name"))
+        host.flashStatus("The notepad \"$name\" goes with your next message.")
     }
 }

@@ -6,10 +6,12 @@ seconds it reads the Googlebook's free memory (a few hundred bytes over adb, wit
 - below 3800 MB it returns the Linux VM's file cache to the Googlebook (at most every 10 seconds);
 - below 2900 MB it stops the device at once;
 - when the free memory cannot be read for 2 minutes, it stops the device too, because it can no longer protect it.
-It also stops a device nobody has used in Forge for 3 hours, gives VM kernel files that Android takes over back to
-root every 10 seconds, and exits as soon as the device has stopped.
-Devices are always stopped from outside (podman kill), never with Android's own power off.
-Usage: forge-vd-watchdog <container> <device id> <display unit>"""
+It also stops a device nobody has used in Forge for 3 hours, and exits as soon as the device has stopped.
+A container device is stopped from outside (podman kill), never with Android's own power off, and every 10 seconds
+the VM kernel files that Android takes over are given back to root. An emulated ARM device (QEMU, forge/armvm.py)
+is stopped by stopping its systemd scope; its Android has its own kernel inside QEMU, so it cannot touch the VM's.
+Usage: forge-vd-watchdog <container> <device id> <display unit>
+       forge-vd-watchdog --arm <device id> <scope unit>"""
 import json
 import os
 import subprocess
@@ -21,6 +23,7 @@ from forge.devices import googlebook_free_mb  # noqa: E402
 from forge.vdevice import conmon_running, restore_vm_permissions  # noqa: E402
 
 STOP_BELOW_MB, TRIM_BELOW_MB, UNKNOWN_LIMIT_S, IDLE_LIMIT_S = 2900, 3800, 120, 3 * 3600
+SCOPE_GRACE_S = 60   # how long QEMU's scope may take to appear after the watchdog started
 VD_DIR = os.path.expanduser("~/.forge-ide/vd")
 CONF = os.path.join(VD_DIR, "containers.conf")
 
@@ -29,6 +32,13 @@ def pod(*args, timeout=40):
     try:
         return subprocess.run(["sudo", "-n", "env", f"CONTAINERS_CONF_OVERRIDE={CONF}", "podman", *args],
                               capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", "timeout")
+
+
+def systemctl(*args, timeout=20):
+    try:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 124, "", "timeout")
 
@@ -42,26 +52,70 @@ def notice(dev_id, message):
     print(message, flush=True)
 
 
-def stop(name, display):
-    pod("kill", name)
-    subprocess.run(["systemctl", "--user", "stop", display], capture_output=True, timeout=20)
+class Container:
+    """A container device: running while Podman's monitor process for it exists."""
+
+    def __init__(self, name, display):
+        self.name, self.display = name, display
+
+    def running(self):
+        return conmon_running(self.name)
+
+    def housekeeping(self):
+        restore_vm_permissions()   # Android hands some VM kernel files to its system user; give them back
+
+    def stop(self):
+        pod("kill", self.name)
+        systemctl("stop", self.display)
+
+    def ended(self):
+        systemctl("stop", self.display)
+
+
+class ArmScope:
+    """An emulated ARM device: running while QEMU's systemd scope is active. The scope may appear a moment after the
+    watchdog starts, so the device counts as stopped only once the scope was seen, or after SCOPE_GRACE_S."""
+
+    def __init__(self, scope):
+        self.scope, self.seen, self.since = scope, False, time.time()
+
+    def running(self):
+        active = systemctl("is-active", "--quiet", self.scope, timeout=10).returncode == 0
+        self.seen = self.seen or active
+        return active or (not self.seen and time.time() - self.since < SCOPE_GRACE_S)
+
+    def housekeeping(self):
+        pass
+
+    def stop(self):
+        # SIGTERM ends QEMU at once (like its monitor's quit); a QEMU that does not end in time is killed.
+        if systemctl("stop", self.scope, timeout=40).returncode != 0:
+            systemctl("kill", "--signal=KILL", self.scope, timeout=20)
+
+    def ended(self):
+        pass
 
 
 def main():
-    name, dev_id, display = sys.argv[1:4]
+    if sys.argv[1:2] == ["--arm"]:
+        dev_id, scope = sys.argv[2:4]
+        device = ArmScope(scope)
+    else:
+        name, dev_id, display = sys.argv[1:4]
+        device = Container(name, display)
     unknown_since, last_trim, last_check = None, 0.0, 0.0
     while True:
         now = time.time()
         if now - last_check > 10:
             last_check = now
-            restore_vm_permissions()   # Android hands some VM kernel files to its system user; give them back
-            if not conmon_running(name):
-                subprocess.run(["systemctl", "--user", "stop", display], capture_output=True, timeout=20)
+            device.housekeeping()
+            if not device.running():
+                device.ended()
                 return
             try:
                 if now - os.path.getmtime(os.path.join(VD_DIR, dev_id + ".active")) > IDLE_LIMIT_S:
                     notice(dev_id, "Forge stopped the virtual device because nobody had used it for 3 hours.")
-                    stop(name, display)
+                    device.stop()
                     return
             except OSError:
                 pass
@@ -70,13 +124,13 @@ def main():
             unknown_since = unknown_since or now
             if now - unknown_since > UNKNOWN_LIMIT_S:
                 notice(dev_id, "Forge stopped the virtual device because it could not read the Googlebook's free memory for 2 minutes.")
-                stop(name, display)
+                device.stop()
                 return
         else:
             unknown_since = None
             if host < STOP_BELOW_MB:
                 notice(dev_id, f"Forge stopped the virtual device because the Googlebook had only {int(host)} MB of memory free.")
-                stop(name, display)
+                device.stop()
                 return
             if host < TRIM_BELOW_MB and now - last_trim > 10:
                 last_trim = now

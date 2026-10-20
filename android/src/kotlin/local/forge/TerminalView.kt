@@ -27,6 +27,9 @@ import kotlin.math.roundToInt
  * Draws a TerminalEmulator's grid with a monospace Paint and turns the laptop's keys into the bytes a terminal
  * sends. It looks like the web page's xterm: the dark Forge background, the same 16 colors, a block cursor in the
  * accent color. The mouse wheel and touch drags move through the scrollback; a tap gives the view the keyboard.
+ * While a program asks for mouse reports (vim, htop, tmux, less with --mouse), the mouse's presses, releases,
+ * drags, moves and wheel go to it as xterm reports them (classic, UTF-8, SGR or urxvt encoding), and Shift with
+ * the mouse still selects text and opens the menu here.
  * A hardware keyboard is the normal case on this laptop, so input arrives through onKeyDown; the input connection
  * only exists so an input method that commits text (dead keys, compose sequences) still reaches the shell.
  */
@@ -385,10 +388,98 @@ class TerminalView(ctx: Context) : View(ctx) {
 
     fun scrollToBottom() { if (scrollOffset != 0) { scrollOffset = 0; invalidate() } }
 
+    // ------------------------------------------------------------------ mouse reports for programs (xterm's protocol)
+    /** The button held since the last report press (0 left, 1 middle, 2 right), or -1. */
+    private var mouseButton = -1
+    private var lastMouseCell = -1
+    private var wheelRest = 0f
+
+    /** The live screen's cell under a point, 1-based (column, row), as mouse reports count them. */
+    private fun reportCell(x: Float, y: Float): Pair<Int, Int> =
+        Pair(((x - paddingLeft) / cellW).toInt().coerceIn(0, cols - 1) + 1, ((y - paddingTop) / cellH).toInt().coerceIn(0, rows - 1) + 1)
+
+    private fun buttonOf(state: Int): Int = when {
+        state and MotionEvent.BUTTON_SECONDARY != 0 -> 2
+        state and MotionEvent.BUTTON_TERTIARY != 0 -> 1
+        else -> 0
+    }
+
+    /** Shift 4, Alt 8 and Ctrl 16 added to the button code, as xterm reports them (not in X10 mode). */
+    private fun modifierBits(meta: Int): Int {
+        if (term.mouseMode == 9) return 0
+        var m = 0
+        if (meta and KeyEvent.META_SHIFT_ON != 0) m += 4
+        if (meta and KeyEvent.META_ALT_ON != 0) m += 8
+        if (meta and KeyEvent.META_CTRL_ON != 0) m += 16
+        return m
+    }
+
+    /**
+     * Sends one mouse report in the encoding the program chose. [code] is the button code (0 to 2 a button, 64 and 65
+     * the wheel, plus 32 for a move, plus the modifier bits); [release] marks a button's release. The classic encoding
+     * writes positions as single characters, which a UTF-8 terminal can carry only up to 94, so beyond that it
+     * reports nothing (programs that want large screens ask for the SGR encoding).
+     */
+    private fun sendMouse(code: Int, col: Int, row: Int, release: Boolean) {
+        val s = when (term.mouseEncoding) {
+            1006 -> "\u001b[<$code;$col;$row" + (if (release) "m" else "M")
+            1015 -> "\u001b[" + (32 + (if (release) 3 or (code and 28) else code)) + ";$col;${row}M"
+            1005 -> "\u001b[M" + (32 + (if (release) 3 or (code and 28) else code)).toChar() + (32 + col).toChar() + (32 + row).toChar()
+            else -> if (col > 94 || row > 94) null else "\u001b[M" + (32 + (if (release) 3 or (code and 28) else code)).toChar() + (32 + col).toChar() + (32 + row).toChar()
+        } ?: return
+        send(s)
+    }
+
+    /** A mouse press, move or release for a program that asked for reports. Returns false when the event is not one. */
+    private fun mouseToProgram(event: MotionEvent): Boolean {
+        val (col, row) = reportCell(event.x, event.y)
+        val mods = modifierBits(event.metaState)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (!isFocused) requestFocus()
+                mouseButton = buttonOf(event.buttonState)
+                lastMouseCell = row * 1000 + col
+                sendMouse(mouseButton + mods, col, row, false)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val cell = row * 1000 + col
+                if (mouseButton >= 0 && cell != lastMouseCell && (term.mouseMode == 1002 || term.mouseMode == 1003)) {
+                    lastMouseCell = cell
+                    sendMouse(mouseButton + 32 + mods, col, row, false)
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (mouseButton >= 0 && term.mouseMode != 9) sendMouse(mouseButton + mods, col, row, true)
+                mouseButton = -1
+            }
+            else -> return false
+        }
+        return true
+    }
+
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (term.mouseTracking && event.actionMasked == MotionEvent.ACTION_HOVER_MOVE && term.mouseMode == 1003) {
+            // Any-event tracking: moves without a button are reported too (button code 3 plus 32).
+            val (col, row) = reportCell(event.x, event.y)
+            val cell = row * 1000 + col
+            if (cell != lastMouseCell) { lastMouseCell = cell; sendMouse(35 + modifierBits(event.metaState), col, row, false) }
+            return true
+        }
         if (event.action == MotionEvent.ACTION_SCROLL) {
             val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
             if (v == 0f) return true
+            if (term.mouseTracking && term.mouseMode != 9) {
+                // The wheel goes to the program as buttons 64 (up) and 65 (down), one report per notch; a touchpad's
+                // small steps add up to whole notches first.
+                wheelRest += v
+                val (col, row) = reportCell(event.x, event.y)
+                val mods = modifierBits(event.metaState)
+                var n = 0
+                while (wheelRest >= 1f && n < 10) { sendMouse(64 + mods, col, row, false); wheelRest -= 1f; n++ }
+                while (wheelRest <= -1f && n < 10) { sendMouse(65 + mods, col, row, false); wheelRest += 1f; n++ }
+                if (n == 10) wheelRest = 0f
+                return true
+            }
             val steps = (v * 3).roundToInt().let { if (it == 0) (if (v > 0) 1 else -1) else it }
             if (term.altScreen && !term.mouseTracking) {
                 // Full screen programs have no scrollback; the wheel moves their cursor instead, as many terminals do.
@@ -403,6 +494,9 @@ class TerminalView(ctx: Context) : View(ctx) {
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val mouse = event.isFromSource(InputDevice.SOURCE_MOUSE) || event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE
+        // While a program asked for mouse reports, the mouse belongs to it; Shift keeps selecting and the menu here, as in xterm.
+        val shift = event.metaState and KeyEvent.META_SHIFT_ON != 0
+        if (mouse && (term.mouseTracking || mouseButton >= 0) && !shift && mouseToProgram(event)) return true
         if (mouse) {
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {

@@ -57,6 +57,9 @@ class EngineService : Service() {
 
         fun stateName(): String = state
 
+        /** True while the engine holds its model (running, or starting or paused with the model loaded). */
+        fun isRunning(): Boolean = state in setOf("running", "starting", "paused", "downloading")
+
         // ------------------------------------------------------------ public status
         fun status(ctx: Context): JSONObject {
             val o = JSONObject()
@@ -144,6 +147,7 @@ class EngineService : Service() {
 
         private fun httpPost(url: String, body: String, timeout: Int): String {
             val c = URL(url).openConnection() as HttpURLConnection
+            Api.authorize(c)
             c.connectTimeout = timeout; c.readTimeout = timeout
             c.requestMethod = "POST"; c.doOutput = true
             c.setRequestProperty("Content-Type", "application/json")
@@ -154,6 +158,7 @@ class EngineService : Service() {
 
         private fun httpGet(url: String, timeout: Int): String {
             val c = URL(url).openConnection() as HttpURLConnection
+            Api.authorize(c)
             c.connectTimeout = timeout; c.readTimeout = timeout
             val code = c.responseCode
             if (code != 200) throw Exception("GET $url -> HTTP $code")
@@ -224,7 +229,9 @@ class EngineService : Service() {
         }
 
         fun start(ctx: Context) { ctx.startForegroundService(Intent(ctx, EngineService::class.java).setAction(ACTION_START)) }
-        fun stop(ctx: Context) { ctx.startService(Intent(ctx, EngineService::class.java).setAction(ACTION_STOP)) }
+        /** Stops the engine. [byUser]: you stopped it (Stop engine), so the IDE does not start it again by itself until
+         *  you start it or a chat needs it; an idle unload passes false. */
+        fun stop(ctx: Context, byUser: Boolean = true) { ctx.startService(Intent(ctx, EngineService::class.java).setAction(ACTION_STOP).putExtra("by_user", byUser)) }
 
         /** Quit Forge: the engine process ends now, on this thread, before the app's own process goes away. */
         fun stopNow(why: String) { instance?.stopEngine(why) }
@@ -243,6 +250,7 @@ class EngineService : Service() {
     // ------------------------------------------------------------ service plumbing
     override fun onCreate() {
         super.onCreate()
+        Api.init(this)
         instance = this
         VisionControl.ensure(this)
         val nm = getSystemService(NotificationManager::class.java)
@@ -254,7 +262,9 @@ class EngineService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action ?: ACTION_START
         if (ACTION_STOP == action) {
-            stopEngine("stopped by user")
+            // The notification's Stop engine action carries no extra: that is you too.
+            val byUser = intent?.getBooleanExtra("by_user", true) ?: true
+            stopEngine(if (byUser) "stopped by you" else "unloaded after the idle time", byUser)
             stopSelf()
             return START_NOT_STICKY
         }
@@ -303,6 +313,7 @@ class EngineService : Service() {
 
     // ------------------------------------------------------------ the work
     internal fun run() {
+        Api.ensurePaired()   // the server must know this app's key before the engine asks for its configuration
         try {
             state = "starting"
             notifyText("Reading configuration from Forge…")
@@ -331,8 +342,10 @@ class EngineService : Service() {
             val bin = File(applicationInfo.nativeLibraryDir, "libllama-server.so")
             if (!bin.exists()) throw Exception("Engine binary missing from this build of the app.")
             // Weights + KV cache + compute buffers + margin, plus the projector and its image encoder when it sees.
-            var needMb = size / (1024 * 1024) + 1200 + (mmFile?.let { it.length() / (1024 * 1024) + 300 } ?: 0L)
-            val needPlain = size / (1024 * 1024) + 1200
+            // The KV cache grows with the context: 1200 MB was measured at 8192 tokens, a bigger context reserves more.
+            val kvMb = 1200L * maxOf(8192, cfg.optInt("ctx", 8192)) / 8192
+            var needMb = size / (1024 * 1024) + kvMb + (mmFile?.let { it.length() / (1024 * 1024) + 300 } ?: 0L)
+            val needPlain = size / (1024 * 1024) + kvMb
             GpuBudget.poolCreditPercent = cfg.optLong("pool_credit_percent", 0)
             // The free-memory check (GpuBudget), never bypassed. Ask the VM to hand memory back while waiting.
             var why = GpuBudget.check(this, needMb)
@@ -474,14 +487,15 @@ class EngineService : Service() {
         }
     }
 
-    private fun postStats(what: String) {
+    private fun postStats(what: String, byUser: Boolean = false) {
         Thread({
             try {
                 val c = URL("$FORGE/api/engine/stats").openConnection() as HttpURLConnection
+                Api.authorize(c)
                 c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 3000; c.readTimeout = 3000
                 c.setRequestProperty("Content-Type", "application/json")
                 val o = JSONObject()
-                o.put("event", what); o.put("state", state); o.put("detail", detail); o.put("log", logTail(40))
+                o.put("event", what); o.put("state", state); o.put("detail", detail); o.put("log", logTail(40)); o.put("by_user", byUser)
                 o.put("host_mem_mb", memAvailableMb()); o.put("budget", GpuBudget.describe(this))
                 c.outputStream.write(o.toString().toByteArray())
                 c.responseCode; c.disconnect()
@@ -496,6 +510,7 @@ class EngineService : Service() {
         downloadTotal = size; downloaded = have
         notifyText("Downloading the model (" + (size / (1024 * 1024)) + " MB)…")
         val c = URL(url).openConnection() as HttpURLConnection
+        Api.authorize(c)
         c.connectTimeout = 10000; c.readTimeout = 120000
         if (have > 0) c.setRequestProperty("Range", "bytes=$have-")
         val code = c.responseCode
@@ -522,7 +537,7 @@ class EngineService : Service() {
         log("model downloaded: " + dest.name + " $size bytes")
     }
 
-    internal fun stopEngine(why: String) {
+    internal fun stopEngine(why: String, byUser: Boolean = false) {
         stopping = true
         val p = proc
         if (p != null) {
@@ -532,6 +547,6 @@ class EngineService : Service() {
         }
         state = "stopped"
         detail = why
-        postStats("stopped")
+        postStats("stopped", byUser)
     }
 }

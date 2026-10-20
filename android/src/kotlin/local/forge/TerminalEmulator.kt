@@ -146,8 +146,17 @@ class TerminalEmulator(cols: Int, rows: Int, private val maxScrollback: Int = 50
     var appCursorKeys = false; private set
     /** Pasted text should be wrapped in ESC [ 200 ~ and ESC [ 201 ~ while this is on. */
     var bracketedPaste = false; private set
-    /** True while a program asked for mouse reports; the view then has nothing to scroll locally. */
-    var mouseTracking = false; private set
+    /**
+     * The mouse reports a program asked for, as in xterm: 0 none, 9 button presses only (X10), 1000 presses and
+     * releases with the wheel, 1002 also moves while a button is held, 1003 every move.
+     */
+    var mouseMode = 0; private set
+    /** How the reports are written: 0 xterm's classic bytes, 1005 UTF-8 positions, 1006 SGR (ESC [ < b ; x ; y M or m), 1015 urxvt. */
+    var mouseEncoding = 0; private set
+    /** True while a program asked for mouse reports; the view sends them instead of selecting or scrolling locally. */
+    val mouseTracking: Boolean get() = mouseMode != 0
+    /** A Forge task's shell line ended (TerminalTabs.runTask): its token and exit code, from the OSC 7737 it prints. */
+    var onTaskDone: ((token: String, code: Int) -> Unit)? = null
 
     private var g0LineDrawing = false
     private var g1LineDrawing = false
@@ -335,6 +344,11 @@ class TerminalEmulator(cols: Int, rows: Int, private val maxScrollback: Int = 50
         if (semi > 0) {
             val code = s.substring(0, semi)
             if (code == "0" || code == "2") title = s.substring(semi + 1)
+            if (code == "7737") {
+                // "7737;forge-done;<token>;<exit code>", printed by the shell line of TerminalTabs.runTask.
+                val parts = s.substring(semi + 1).split(';')
+                if (parts.size >= 3 && parts[0] == "forge-done") onTaskDone?.invoke(parts[1], parts[2].trim().toIntOrNull() ?: 1)
+            }
         }
     }
 
@@ -426,7 +440,7 @@ class TerminalEmulator(cols: Int, rows: Int, private val maxScrollback: Int = 50
         curFg = DEFAULT_COLOR; curBg = DEFAULT_COLOR; curAttr = 0
         top = 0; bottom = rows - 1
         autowrap = true; originMode = false; insertMode = false; cursorVisible = true
-        appCursorKeys = false; bracketedPaste = false; mouseTracking = false
+        appCursorKeys = false; bracketedPaste = false; mouseMode = 0; mouseEncoding = 0
         g0LineDrawing = false; g1LineDrawing = false; useG1 = false
         cursorStyle = 1
         savedX = 0; savedY = 0; savedFg = DEFAULT_COLOR; savedBg = DEFAULT_COLOR; savedAttr = 0
@@ -596,7 +610,9 @@ class TerminalEmulator(cols: Int, rows: Int, private val maxScrollback: Int = 50
             1047 -> if (on) enterAlt(false) else { if (altScreen) for (l in lines) l.erase(0, cols, DEFAULT_COLOR); leaveAlt(false) }
             1048 -> if (on) saveCursor() else restoreCursor()
             1049 -> if (on) enterAlt(true) else leaveAlt(true)
-            1000, 1002, 1003 -> mouseTracking = on
+            // One mouse mode at a time; turning any of them off turns mouse reports off, as in xterm.
+            9, 1000, 1002, 1003 -> mouseMode = if (on) m else 0
+            1005, 1006, 1015 -> if (on) mouseEncoding = m else if (mouseEncoding == m) mouseEncoding = 0
             2004 -> bracketedPaste = on
             else -> { }
         }

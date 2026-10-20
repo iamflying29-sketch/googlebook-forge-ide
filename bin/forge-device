@@ -34,9 +34,19 @@ import urllib.request
 BASE = os.environ.get("FORGE_URL", "http://127.0.0.1:8765")
 
 
+def vm_key():
+    """The VM's key for the Forge server (only readable by you); every request but the memory check needs it."""
+    try:
+        with open(os.path.join(os.environ.get("FORGE_HOME") or os.path.expanduser("~/.forge-ide"), "vm-key")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def call(path, body=None, raw=False, timeout=120):
     req = urllib.request.Request(BASE + path, data=None if body is None else json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"}, method="GET" if body is None else "POST")
+                                 headers={"Content-Type": "application/json", "X-Forge-Key": vm_key()},
+                                 method="GET" if body is None else "POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             data = r.read()

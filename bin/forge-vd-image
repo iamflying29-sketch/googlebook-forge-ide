@@ -22,6 +22,37 @@
 set -euo pipefail
 VARIANT=${1:-}
 SF=https://sourceforge.net/projects/waydroid-atv/files/images
+# The recipe Forge recorded for this version in ~/.forge-ide/vd/catalog-overrides.json ("build"): the newer files,
+# sums, package and folder of the last update or upgrade it installed, and every version an upgrade added (an
+# upgraded Google version's recipe also comes from its catalog entry). So this script, run by hand or by Download,
+# builds what Forge shows. Values already in the environment win; FORCE stays your choice.
+OVR=$HOME/.forge-ide/vd/catalog-overrides.json
+if [ -n "$VARIANT" ] && [ -f "$OVR" ]; then
+  eval "$(python3 -I - "$OVR" "$VARIANT" <<'EOF'
+import json, os, shlex, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+v = sys.argv[2]
+rec = dict((data.get("build") or {}).get(v) or {})
+g = ((data.get("extra") or {}).get(v) or {}).get("google")
+if isinstance(g, dict) and g.get("pkg"):
+    base = os.path.join(os.path.dirname(sys.argv[1]), str(g.get("base") or v))
+    for k, val in (("KIND", "google"), ("GOOGLE_PKG_OVERRIDE", g["pkg"]), ("SDK_OVERRIDE", g.get("sdk", "")),
+                   ("VENDOR_IMAGE_OVERRIDE", g.get("vendor_image", "")), ("BASE_OVERRIDE", base)):
+        rec.setdefault(k, val)
+keys = ("KIND", "SYS_FILE", "VEN_FILE", "SYS_SUM", "VEN_SUM", "SUM_ALGO", "ARCH_OVERRIDE", "SDK_OVERRIDE", "BASE_OVERRIDE",
+        "KEEP_ETC_OVERRIDE", "DESC_OVERRIDE", "IMG_SUFFIX", "GOOGLE_PKG_OVERRIDE", "VENDOR_IMAGE_OVERRIDE")
+for k in keys:
+    if k in rec and k not in os.environ and str(rec[k]) != "":
+        print(f"export {k}={shlex.quote(str(rec[k]))}")
+EOF
+)"
+fi
 case "$VARIANT" in
   17)
     SYS=lineage-24.0-20260926-VANILLA-waydroid_x86_64-system.zip; SYS_SHA=182ef734924fd4295bcaeb3712e0fb5ac8ade454353d6910a43c2df7f7ac6203
@@ -72,7 +103,8 @@ case "$VARIANT" in
                 BASE=${BASE_OVERRIDE:?}; DL=$BASE/dl; IMG=$BASE/img; KEEP_ETC=${KEEP_ETC_OVERRIDE:-0}; DESC=${DESC_OVERRIDE:-"LineageOS from WayDroid-ATV"} ;;
       google)   GOOGLE_PKG=${GOOGLE_PKG_OVERRIDE:?}; VENDOR_IMAGE=${VENDOR_IMAGE_OVERRIDE:?}; SDK=${SDK_OVERRIDE:?}; BASE=${BASE_OVERRIDE:?}; IMG=$BASE/img
                 DESC=${DESC_OVERRIDE:-"Google's system image with Redroid's vendor partition"} ;;
-      *) echo "Usage: forge-vd-image 17 | 17-google | tv16-google | wear6 | googletv16 | pixel16 | auto15 | xr14 | desktop14   (Android 11 to 16 are downloaded with podman pull)"; exit 2 ;;
+      *) echo "Usage: forge-vd-image 17 | 17-google | tv16-google | wear6 | googletv16 | pixel16 | auto15 | xr14 | desktop14   (Android 11 to 16 are downloaded with podman pull)"
+         echo "Versions added by an upgrade are built from the recipe Forge recorded in $OVR; none is recorded for '$VARIANT'."; exit 2 ;;
     esac ;;
 esac
 # Updates of a built-in version (forge/updates.py) name newer files, sums, packages or folders in the environment.

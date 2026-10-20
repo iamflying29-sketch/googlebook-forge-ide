@@ -48,6 +48,9 @@ class Voice(private val ctx: Context, private val sink: (JSONObject) -> Unit) {
     private var restarts = 0
     private var language = "en-US"
 
+    /** True while dictation is on (between start and stop). */
+    val listening: Boolean get() = wanted
+
     /** Must be called on the main thread. */
     fun start(lang: String?) {
         if (wanted) return

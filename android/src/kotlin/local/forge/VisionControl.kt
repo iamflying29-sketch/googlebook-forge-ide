@@ -32,6 +32,7 @@ object VisionControl {
     @Volatile private var launching = false
 
     @Synchronized fun ensure(ctx: Context) {
+        Api.init(ctx)
         val c = control
         if (c != null && c.isAlive) return
         val app = ctx.applicationContext
@@ -45,12 +46,17 @@ object VisionControl {
     private fun loop(ctx: Context) {
         while (true) {
             try {
-                val q = "wait=20&vstate=" + enc(vstate) + "&vtier=" + enc(vtier) + "&vdetail=" + enc(vdetail) + "&host_mem_mb=" + EngineService.memAvailableMb()
+                Api.ensurePaired()
+                // effective_mb: the free memory the app's own check counts (the driver's held memory included, as the
+                // memory credit setting allows), so the IDE asks for an autostart exactly when the app would allow it.
+                val q = "wait=20&vstate=" + enc(vstate) + "&vtier=" + enc(vtier) + "&vdetail=" + enc(vdetail) + "&host_mem_mb=" + EngineService.memAvailableMb() +
+                    "&effective_mb=" + GpuBudget.effectiveMb(ctx)
                 val r = JSONObject(get("$FORGE/api/engine/control?$q", 35000))
+                GpuBudget.poolCreditPercent = r.optLong("pool_credit_percent", GpuBudget.poolCreditPercent)
                 val want = r.optBoolean("want", false)
                 GpuBudget.heartbeat(ctx)
                 if (r.optBoolean("engine_start", false) && !want) EngineService.startIfIdle(ctx)
-                if (r.optBoolean("engine_stop", false) && !want && proc == null) { log("the IDE says the engine has been idle; unloading it"); EngineService.stop(ctx) }
+                if (r.optBoolean("engine_stop", false) && !want && proc == null) { log("the IDE says the engine has been idle; unloading it"); EngineService.stop(ctx, byUser = false) }
                 if (want && proc == null && !launching) {
                     launching = true
                     Thread({ try { start(ctx, r) } finally { launching = false } }, "forge-vision-start").start()
@@ -207,6 +213,7 @@ object VisionControl {
                 o.put("host_mem_mb", EngineService.memAvailableMb())
                 o.put("log", EngineService.logTail(60))   // the IDE keeps it for diagnosis (/api/engine/applog)
                 val c = URL("$FORGE/api/engine/vision_status").openConnection() as HttpURLConnection
+                Api.authorize(c)
                 c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 3000; c.readTimeout = 5000
                 c.setRequestProperty("Content-Type", "application/json")
                 c.outputStream.write(o.toString().toByteArray())
@@ -220,6 +227,7 @@ object VisionControl {
         report()
         val tmp = File(dest.absolutePath + ".part")
         val c = URL(url).openConnection() as HttpURLConnection
+        Api.authorize(c)
         c.connectTimeout = 10000; c.readTimeout = 120000
         if (c.responseCode != 200) throw Exception("download of " + dest.name + " failed: HTTP " + c.responseCode)
         c.inputStream.use { inp ->
@@ -238,6 +246,7 @@ object VisionControl {
 
     private fun get(url: String, timeout: Int): String {
         val c = URL(url).openConnection() as HttpURLConnection
+        Api.authorize(c)
         c.connectTimeout = 5000; c.readTimeout = timeout
         val code = c.responseCode
         if (code != 200) throw Exception("HTTP $code")

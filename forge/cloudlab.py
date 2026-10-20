@@ -35,6 +35,8 @@ AMAZON_URL = "https://developer.amazon.com/docs/app-testing/live-device-interact
 
 _lock = threading.Lock()
 _jobs: Dict[str, dict] = {}     # id -> {"running", "lines", "ok", "started", "what"}
+_auth: Dict[str, object] = {"time": 0.0, "rc": 1, "text": ""}   # the last sign-in check, kept for a minute
+AUTH_CACHE_S = 60
 
 
 def available() -> bool:
@@ -73,10 +75,15 @@ def _store(name: str, data) -> None:
 
 # ------------------------------------------------------------------ Google's device lab
 def google_status() -> dict:
+    """Signed in or not, Google's price, and the lab requests with their output. A signed-in answer of Google's tool
+    is kept for a minute, so the Android view can follow a running reservation every few seconds; while you are not
+    signed in, the tool is asked every time, so signing in shows at once."""
     if not available():
         return {"installed": False, "signed_in": False, "message": "Google's Android command line tool is not installed."}
-    rc, text = _run(["auth", "status"], 30)
-    signed = rc == 0 and "not logged in" not in text.lower()
+    if time.time() - float(_auth["time"]) > AUTH_CACHE_S or not _auth.get("signed"):
+        rc, text = _run(["auth", "status"], 30)
+        _auth.update({"time": time.time(), "rc": rc, "text": text, "signed": rc == 0 and "not logged in" not in text.lower()})
+    signed, text = bool(_auth.get("signed")), str(_auth["text"])
     return {"installed": True, "signed_in": signed, "message": text[-300:], "price": PRICE,
             "jobs": {k: dict(v) for k, v in _jobs.items()}}
 
@@ -109,9 +116,18 @@ def google_projects() -> dict:
 
 
 def google_list(project: str = "") -> dict:
-    args = ["device", "remote", "list", "--all"] + ([f"--project={project}"] if project else [])
-    rc, text = _run(args, 60)
-    return {"ok": rc == 0, "text": text[-3000:]}
+    """Your reservations: the tool's own listing of every state for reading, and the IDs it lists without --all (its
+    --short form), which Extend and Return pick from."""
+    if project and not _valid_project(project):
+        return {"ok": False, "text": "Enter your Google Cloud project ID (lowercase letters, digits and dashes).", "ids": []}
+    proj = [f"--project={project}"] if project else []
+    rc, text = _run(["device", "remote", "list", "--all"] + proj, 60)
+    ids: List[str] = []
+    if rc == 0:
+        rc2, short = _run(["device", "remote", "list", "--short"] + proj, 60)
+        if rc2 == 0:
+            ids = [x.strip() for x in short.splitlines() if re.match(r"^[A-Za-z0-9_.-]+$", x.strip())]
+    return {"ok": rc == 0, "text": text[-3000:], "ids": ids[:20]}
 
 
 def _job(key: str, what: str, args: List[str], timeout: float) -> None:

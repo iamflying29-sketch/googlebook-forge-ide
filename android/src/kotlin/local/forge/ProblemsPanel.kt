@@ -43,6 +43,9 @@ class ProblemsPanel(private val ctx: Context, private val host: MainActivity) {
 
     class Problem(val path: String, val line: Int, val col: Int, val severity: Int, val message: String, val source: String, val diag: Lsp.Diagnostic?)
 
+    /** Only the problems of this window's folder are listed here. */
+    private val lspListener: (String, String, List<Lsp.Diagnostic>) -> Unit = { f, _, _ -> if (f == host.windowFolder()) schedule(250) }
+
     init {
         view.orientation = LinearLayout.VERTICAL
         view.setBackgroundColor(Ui.bg)
@@ -79,9 +82,12 @@ class ProblemsPanel(private val ctx: Context, private val host: MainActivity) {
         view.addView(list, Ui.lp(Ui.match, 0, 1f))
         empty.setPadding(dp(14), dp(10), dp(14), dp(10))
         view.addView(empty, Ui.lp(Ui.match, Ui.wrap))
-        Lsp.listeners.add { _, _ -> schedule(250) }
+        Lsp.listeners.add(lspListener)
         render()
     }
+
+    /** The window closes: it stops listening. */
+    fun release() { Lsp.listeners.remove(lspListener); Api.main.removeCallbacks(renderTask) }
 
     private fun schedule(ms: Long) { Api.main.removeCallbacks(renderTask); Api.main.postDelayed(renderTask, ms) }
 
@@ -97,14 +103,14 @@ class ProblemsPanel(private val ctx: Context, private val host: MainActivity) {
     /** Every problem as one line of text (the chat's linter errors context and Fix all with AI). */
     fun allLines(): List<String> {
         val out = ArrayList<String>()
-        for ((p, list) in Lsp.diagnostics) for (d in list) if (d.severity <= 2) out.add(p + ":" + (d.line + 1) + ": " + (if (d.severity <= 1) "error" else "warning") + ": " + d.describe())
+        for ((p, list) in Lsp.diagnosticsOf(host.windowFolder())) for (d in list) if (d.severity <= 2) out.add(p + ":" + (d.line + 1) + ": " + (if (d.severity <= 1) "error" else "warning") + ": " + d.describe())
         for ((p, t) in checks) out.add(p + ": " + t.replace(Regex("\\s+"), " ").take(400))
         return out
     }
 
     fun counts(): Pair<Int, Int> {
         var e = checks.size; var w = 0
-        for (list in Lsp.diagnostics.values) for (d in list) { if (d.severity <= 1) e++ else if (d.severity == 2) w++ }
+        for (list in Lsp.diagnosticsOf(host.windowFolder()).values) for (d in list) { if (d.severity <= 1) e++ else if (d.severity == 2) w++ }
         return e to w
     }
 
@@ -119,7 +125,7 @@ class ProblemsPanel(private val ctx: Context, private val host: MainActivity) {
             errors++
             byFile.getOrPut(p) { ArrayList() }.add(Problem(p, line, 0, 1, t.lines().filter { it.isNotBlank() }.drop(1).joinToString(" ").ifEmpty { t }.take(500), "syntax check", null))
         }
-        for ((p, list) in Lsp.diagnostics) for (d in list) {
+        for ((p, list) in Lsp.diagnosticsOf(host.windowFolder())) for (d in list) {
             if (d.severity > 2) continue
             if (d.severity <= 1) errors++ else warnings++
             byFile.getOrPut(p) { ArrayList() }.add(Problem(p, d.line, d.col, d.severity, d.message, d.source + (if (d.code.isNotEmpty()) " " + d.code else ""), d))
@@ -186,7 +192,7 @@ class ProblemsPanel(private val ctx: Context, private val host: MainActivity) {
                 (row.getChildAt(0) as ImageView).setImageDrawable(Ui.icon(ctx, if (x in collapsed) R.drawable.ic_chevron_right else R.drawable.ic_chevron_down, Ui.fg3))
                 (row.getChildAt(1) as ImageView).setImageDrawable(FileIcons.file(ctx, x.substringAfterLast('/')))
                 (row.getChildAt(2) as TextView).text = x
-                val n = (Lsp.diagnostics[x]?.count { it.severity <= 2 } ?: 0) + (if (checks.containsKey(x)) 1 else 0)
+                val n = (Lsp.diagnosticsOf(host.windowFolder())[x]?.count { it.severity <= 2 } ?: 0) + (if (checks.containsKey(x)) 1 else 0)
                 (row.getChildAt(3) as TextView).text = n.toString()
                 return row
             }

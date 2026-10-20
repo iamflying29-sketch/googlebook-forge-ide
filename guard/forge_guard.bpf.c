@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Forge container guard: a small BPF security program that protects the Linux VM from Android running in
- * containers (Forge's virtual devices and Waydroid).
+/* Forge container guard: an experimental BPF security program that would protect the Linux VM from Android
+ * running in Forge's virtual devices. Nothing loads it: this kernel cannot attach BPF security programs (it has no
+ * function tracer), so the Forge Android guard (forge_android_guard.py) does this work instead.
  *
  * 1. Android's init writes to /proc/sysrq-trigger while it shuts down: "e" and "i" signal every process in the
  *    whole VM, and "c" (after a shutdown that takes too long) crashes the VM's kernel, which closes the Terminal app.
@@ -8,8 +9,8 @@
  * 2. Android's ueventd writes "add" into every /sys/.../uevent file at start, which replays every device event of
  *    the VM to the VM's own udev.
  *
- * The guard refuses both writes, but only for processes outside the VM's first PID namespace, that is, inside a
- * container. Everything the VM itself does is untouched. Counters show how often it refused. */
+ * Loaded, it would refuse both writes, but only for processes outside the VM's first PID namespace, that is, inside
+ * a container. Everything the VM itself does would be untouched, and counters would show how often it refused. */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>

@@ -11,7 +11,9 @@ because Android mounts its own /proc and /sys. This service (run as root by syst
 1. Shutdowns. When Android powers off or restarts, its init writes to /proc/sysrq-trigger: "e" and "i" signal every
    process in the whole VM, "u" remounts every file system read-only, and "c" crashes the VM's kernel, which closes the
    Terminal app. Android's init logs to the kernel log first, so the guard reads that log as it is written and ends
-   that Android at once (SIGKILL to its init ends the whole container), long before init reaches those steps. The same
+   that Android at once (SIGKILL to its init ends the whole container), long before init reaches those steps. The
+   kernel log does not name the container that wrote a line, so the guard traces it (the process that asked for the
+   shutdown, or the Android that has just started) and ends only its own containers, never another Android. The same
    happens if an Android init ever starts to load an SELinux policy, which would put the whole VM under Android's
    policy. (Forge's images never do; this is the backstop for any other image.)
 
@@ -21,14 +23,15 @@ because Android mounts its own /proc and /sys. This service (run as root by syst
 
 3. Global settings. Android's startup scripts change kernel settings for the whole VM (memory overcommit, memory
    watermarks, panic on hung tasks, SysRq, performance counters) and hand kernel files to Android's users, whose
-   numbers belong to other users in the VM (Android's "system" is your own uid 1000). While any Android runs, and for
-   a minute after, the guard compares those settings and the owners and modes of the files under /proc, /sys and the
+   numbers belong to other users in the VM (Android's "system" is your own uid 1000). While one of this guard's
+   Androids runs, and for a minute after, the guard compares those settings and the owners and modes of the files under /proc, /sys and the
    kernel's tracing, security and debug file systems with a reference taken while no Android was running, and puts
    back anything that changed. When nothing has run for a minute it refreshes the reference, so your own changes
    are kept.
 
-4. Hazards. It clears any SafeSetID policy (one for uid 1000 would kill sudo), and it ends Android's livelock daemon
-   llkd, which can crash the kernel on purpose.
+4. Hazards. In the same time, it clears any SafeSetID policy (one for uid 1000 would kill sudo), switches off the
+   handlers for ARM programs that Android registers with the kernel, and ends its Androids' livelock daemon llkd,
+   which can crash the kernel on purpose.
 
 Every step has a time limit and nothing here waits on another process. The guard writes its log to the journal and a
 short status for Forge in /run/forge-android-guard."""
@@ -156,23 +159,114 @@ def nested_named(names):
             continue
 
 
-def act(message: bytes) -> None:
-    """The kernel log does not say which container wrote a line, so every running container of this guard is ended;
-    containers that are not this guard's are never touched."""
-    killed = []
-    for pid, comm in namespace_inits():
-        if comm != b"init":
+# init logs who asked for a shutdown: "Received sys.powerctl='...' from pid: N (program)", N being the PID inside
+# that Android's container. The lines that follow it in the same shutdown name nobody.
+POWERCTL_FROM = re.compile(rb"Received sys\.powerctl='[^']*' from pid: (\d+)(?: \(([^)]*)\))?")
+FOLLOW_UP = re.compile(rb"\binit: (Reboot start|Got shutdown_command)")
+SELINUX_LINE = re.compile(rb"\binit: (Opening|Loading) SELinux policy")
+_traced = {"time": -1e9, "inits": []}   # the latest shutdown request whose Android was found
+
+
+def android_inits():
+    """(pid, mine) for the init of every Android container in the VM, this guard's or not. Only read: another
+    guard's containers are never touched."""
+    return [(pid, in_scope(pid)) for pid, comm in namespace_inits(scoped=False) if comm == b"init"]
+
+
+def pid_namespace(pid) -> str:
+    try:
+        return os.readlink(f"/proc/{pid}/ns/pid")
+    except OSError:
+        return ""
+
+
+def requester_inits(ns_pid: bytes, program: bytes) -> list:
+    """(pid, mine) for the init of each container that holds a process with this PID inside its container and this
+    program name: the Android whose process asked for the shutdown."""
+    spaces = set()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
             continue
+        try:
+            with open(f"/proc/{name}/status", "rb") as f:
+                ids = []
+                for line in f:
+                    if line.startswith(b"NSpid:"):
+                        ids = line.split()[1:]
+                        break
+            if len(ids) < 2 or ids[-1] != ns_pid:
+                continue
+            if program:
+                with open(f"/proc/{name}/cmdline", "rb") as f:
+                    if f.read(4096).split(b"\0", 1)[0] != program:
+                        continue
+            space = pid_namespace(name)
+            if space:
+                spaces.add(space)
+        except OSError:
+            continue
+    return [(pid, mine) for pid, mine in android_inits() if pid_namespace(pid) in spaces]
+
+
+def started_inits(seconds: float = 30.0) -> list:
+    """(pid, mine) for the Android inits that started in the last seconds (init loads SELinux in its first second)."""
+    try:
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+        tick = os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError):
+        return []
+    out = []
+    for pid, mine in android_inits():
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                fields = f.read().rsplit(b")", 1)[1].split()
+            if up - int(fields[19]) / tick <= seconds:
+                out.append((pid, mine))
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def act(message: bytes) -> None:
+    """Ends the Android that began to shut down or to load SELinux, but only when it runs in one of this guard's
+    containers. The kernel log does not say which container wrote a line, so the guard traces it: the process that
+    asked for the shutdown, the shutdown request that a follow-up line belongs to, or the Android that started in
+    the last seconds. A line it cannot trace ends this guard's own containers, and never another Android."""
+    text = message.decode("utf-8", "replace").strip()[:300]
+    now = time.monotonic()
+    found = None
+    m = POWERCTL_FROM.search(message)
+    if m:
+        found = requester_inits(m.group(1), m.group(2) or b"") or None
+        if found is not None:
+            _traced.update(time=now, inits=found)
+    elif FOLLOW_UP.search(message) and now - _traced["time"] < 5:
+        found = _traced["inits"]
+    elif SELINUX_LINE.search(message):
+        found = started_inits() or None
+    others = False
+    if found is None:
+        inits = android_inits()
+        targets = [pid for pid, mine in inits if mine]
+        others = any(not mine for _pid, mine in inits)
+    else:
+        targets = [pid for pid, mine in found if mine]
+        if not targets:
+            return   # another Android's line: its own guard looks after it
+    killed = []
+    for pid in targets:
         try:
             os.kill(pid, signal.SIGKILL)
             killed.append(pid)
         except OSError:
             pass
-    text = message.decode("utf-8", "replace").strip()[:300]
     if not killed:
-        return   # not one of this guard's containers
-    log(f"Android began to shut down or to load SELinux ({text}); ended container init {killed}")
-    write_status("last.json", {"time": time.time(), "message": text, "killed": killed})
+        return
+    how = "traced to it" if found is not None else ("not traceable, and another Android runs too, so only this guard's "
+                                                    "containers were ended to keep the VM alive" if others else "not traceable")
+    log(f"Android began to shut down or to load SELinux ({text}; {how}); ended container init {killed}")
+    write_status("last.json", {"time": time.time(), "message": text, "killed": killed, "traced": found is not None})
 
 
 def watch_kmsg() -> None:
@@ -519,8 +613,10 @@ def shield() -> None:
                 last_android = now
             active = running or now - last_android < 60
             fixes = []
-            reassert_proc(proc_ref, fixes)
             if active:
+                # Only while one of this guard's Androids runs (or ran in the last minute): the shared /proc files,
+                # settings and hazards an Android elsewhere changes are left to that Android's own guard.
+                reassert_proc(proc_ref, fixes)
                 hold_locks()
                 restore_sysctls(ref, fixes)
                 restore_values(ref, fixes)
@@ -531,7 +627,6 @@ def shield() -> None:
                     last_full = now
                 hazards(fixes)
             else:
-                hazards(fixes)
                 if now - last_ref >= 300:
                     # Refresh the reference so your own changes are kept, but only if no Android started while it
                     # was being taken (Android changes things within its first second).
@@ -555,8 +650,7 @@ def shield() -> None:
                                          "reference_time": ref["time"], "recent": recent[-20:],
                                          "wake_lock": WAKE_LOCK, "hibernation_blocked": _secret_fd >= 0})
             if wake.wait(2 if active else 5):
-                wake.clear()
-                last_android = time.monotonic()   # an Android init just started: check at once and stay watchful
+                wake.clear()   # an Android init just started: the next round checks at once whether it is this guard's
         except Exception as e:  # noqa: BLE001 (the shield must keep running)
             log(f"shield check failed: {e!r}")
             time.sleep(5)

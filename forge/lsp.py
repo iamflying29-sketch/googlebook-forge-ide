@@ -1,7 +1,7 @@
-"""Language servers for the editor (code intelligence like in Cursor): a WebSocket <-> stdio bridge.
+"""Language servers for the editor (code intelligence like in Cursor): a bridge between a WebSocket and a server's stdio.
 
-The browser speaks the Language Server Protocol itself (static/lsp.js); this module only starts the right server
-for a language and passes messages both ways. One server per window and language; it stops when the window closes.
+The Forge app speaks the Language Server Protocol itself (Lsp.kt); this module only starts the right server for a
+language and passes messages both ways. One server per window folder and language; it stops when the window closes.
 Output is drained continuously by a thread, so a server can never block on a full pipe.
 """
 from __future__ import annotations
@@ -330,12 +330,15 @@ def headless_kotlin(root: str, memory_ok, log_dir: str):
 
 def serve(ws: WebSocket, lang: str, root: str, memory_ok, log_dir: str, cmd: Optional[List[str]] = None,
           what: str = "language server", cap: Optional[str] = None, needs: Optional[tuple] = None,
-          kotlin_pref: str = "auto", host_free_mb: Optional[float] = None) -> None:
+          kotlin_pref: str = "auto", host_free_mb: Optional[float] = None, merge_launch_env: bool = False) -> None:
     """Bridge one browser WebSocket to a fresh language server (or debug adapter) process until either side
     closes. Both speak Content-Length framed JSON, so one bridge serves both protocols. Large servers run inside
-    a systemd scope with a memory cap, so a runaway server is stopped instead of squeezing the system."""
+    a systemd scope with a memory cap, so a runaway server is stopped instead of squeezing the system.
+    merge_launch_env: a debug adapter's launch request gets the adapter's own environment with the launch's env
+    added on top (a null value removes a variable), for adapters that would otherwise replace the whole environment."""
     from . import toolchains
-    cmd = cmd or server_command(lang, root)
+    if not cmd and what == "language server":
+        cmd = server_command(lang, root)   # a debug adapter is never replaced by a language server
     if not cmd:
         ws.send_text(json.dumps({"forge": "error", "message": f"No {what} is installed for {lang}."}))
         ws.close()
@@ -415,6 +418,21 @@ def serve(ws: WebSocket, lang: str, root: str, memory_ok, log_dir: str, cmd: Opt
                 break
             if op not in (1, 2) or not data:
                 continue
+            if merge_launch_env and b'"launch"' in data:
+                try:
+                    msg = json.loads(data)
+                    args = msg.get("arguments") if msg.get("command") == "launch" else None
+                    if isinstance(args, dict) and isinstance(args.get("env"), dict):
+                        merged = dict(env)
+                        for k, v in args["env"].items():
+                            if v is None:
+                                merged.pop(str(k), None)
+                            else:
+                                merged[str(k)] = str(v)
+                        args["env"] = merged
+                        data = json.dumps(msg).encode()
+                except ValueError:
+                    pass
             if opts is not None or shadow:
                 # Add Forge's startup settings to the editor's initialize request. In Kotlin light mode the server's
                 # project folder is Forge's shadow folder (with workspace.json); the files keep their real paths.

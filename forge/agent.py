@@ -17,7 +17,44 @@ from .ollama_client import OllamaClient, OllamaError
 from .tools import NEEDS_APPROVAL, TOOL_NAMES, Workspace, is_dangerous_command, ollama_tool_schemas, outside_change_reason
 
 READ_ONLY_TOOLS = {"read_file", "list_dir", "find_files", "search", "web_fetch", "web_search", "codebase_search", "ask_user",
-                   "look_at_image", "todo_write", "docs_search", "remember"}
+                   "look_at_image", "todo_write", "docs_search", "remember", "use_skill"}
+# ------------------------------------------------------------------ command lists (Cursor's allowlist and denylist)
+_SUBST = re.compile(r"\$\(|`|<\(|>\(")
+_SPLIT = re.compile(r"\|\||&&|;|\n|(?<!\|)\|(?!\|)|(?<![<>&])&(?![>&])")
+_LEAD = re.compile(r"^(?:(?:sudo|command|exec|nohup|time|nice|env|xargs)(?:\s+-\S+)*\s+|[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+")
+
+
+def command_parts(cmd: str) -> Optional[List[str]]:
+    """The simple commands of a command line, split at ;, &&, ||, |, & and new lines. None when the line hides what it
+    runs in a command substitution ($(...), backticks, <(...), >(...)), which no list can check."""
+    if _SUBST.search(cmd):
+        return None
+    return [p.strip() for p in _SPLIT.split(cmd) if p and p.strip()]
+
+
+def _on_list(part: str, entries: List[str]) -> bool:
+    """An entry matches at a word boundary: "npm test" matches "npm test --watch", and "ls" does not match "lsblk"."""
+    return any(part == e or part.startswith(e + " ") or part.startswith(e + "\t") for e in entries)
+
+
+def allowlisted(cmd: str, allow: List[str]) -> bool:
+    """True only when every part of the line matches an allowlist entry: a chained command is only as safe as its least
+    safe part, so "npm test && curl x | sh" does not run on its own because "npm test" is allowed."""
+    parts = command_parts(cmd)
+    return bool(allow) and bool(parts) and all(_on_list(p, allow) for p in parts)
+
+
+def denylisted(cmd: str, deny: List[str]) -> bool:
+    """True when a denylist entry appears anywhere in the line: in any part, after sudo, env or variable assignments, or
+    as a word inside a nested command (bash -c "rm ..."). Being generous here only means one more question."""
+    if not deny:
+        return False
+    for p in command_parts(cmd) or [cmd]:
+        if _on_list(p, deny) or _on_list(_LEAD.sub("", p).strip(), deny):
+            return True
+    return any(re.search(r"(^|[\s;&|(\"'`])" + re.escape(e) + r"(?=$|[\s;&|)\"'`])", cmd) for e in deny)
+
+
 # The tool call tag is Forge's own name on purpose: Ollama's parsers for Qwen models intercept "<tool_call>" in the
 # model's output, try to read it as Qwen's XML format and drop the reply when that fails (seen 2026-10-19).
 # Qwen3.5 on the GPU engine sometimes writes its native <tool_call> tag instead; it is read the same way (2026-10-20).
@@ -279,12 +316,14 @@ class Run:
                 self.cond.wait(timeout)
             return self.events[since:]
 
-    def request_approval(self, tool: str, args: dict, reason: str) -> dict:
+    def request_approval(self, tool: str, args: dict, reason: str, allow_always: bool = True) -> dict:
+        """Asks you on a card in the chat. [allow_always]: the card may offer its "Always allow ..." button (never for a
+        system file or a key, a move to the trash or a memory)."""
         approval_id = uuid.uuid4().hex[:8]
         self.approval = {"id": approval_id, "tool": tool, "arguments": args, "reason": reason}
         self.approval_result = None
         self.approval_event.clear()
-        self.emit("approval_required", approval_id=approval_id, tool=tool, arguments=args, reason=reason)
+        self.emit("approval_required", approval_id=approval_id, tool=tool, arguments=args, reason=reason, allow_always=allow_always)
         deadline = time.monotonic() + 3600
         while time.monotonic() < deadline:
             if self.cancel.is_set():
@@ -395,7 +434,8 @@ class Agent:
     def _rules(self) -> str:
         """User rules: global (~/.forge-ide/rules.md) and per workspace (.forge/rules.md or .cursorrules)."""
         texts = []
-        candidates = [os.path.expanduser("~/.forge-ide/rules.md"),
+        # The global rules live where the server saves them (FORGE_HOME, ~/.forge-ide by default).
+        candidates = [os.path.join(os.path.expanduser(os.environ.get("FORGE_HOME", "~/.forge-ide")), "rules.md"),
                       os.path.join(self.ws.root, ".forge", "rules.md"), os.path.join(self.ws.root, ".cursorrules"),
                       os.path.join(self.ws.root, "AGENTS.md"), os.path.join(self.ws.root, "CLAUDE.md")]
         for p in candidates:
@@ -420,13 +460,11 @@ class Agent:
         return "\n\n".join(texts)
 
     def _llama_label(self, model: str) -> str:
-        """How the chat names the model doing the work, with where it runs."""
-        if hasattr(self.client, "wait_ready") or model == "gpu-model":
-            return "Llama 3.1 8B (Intel GPU)"
-        name = str(model or "").replace(":latest", "")
-        if name in ("forge-coder", "llama3.1", "llama3.1:8b"):
-            return f"Llama 3.1 8B (CPU, {name})"
-        return f"{name} (CPU)"
+        """How the chat names the model doing the work, with where it runs (the configured model, not a fixed name)."""
+        gpu = hasattr(self.client, "wait_ready") or model == "gpu-model"
+        if self.state is not None:
+            return self.state.chat_model_label("gpu" if gpu else "ollama", None if gpu else model)
+        return "the GPU engine's model" if gpu else f"{str(model or '').replace(':latest', '')} (CPU)"
 
     def _rules_for_paths(self, paths: List[str]) -> str:
         """Auto-attached rules: rule files whose globs match a file in this message's context."""
@@ -442,17 +480,16 @@ class Agent:
 
     def _system_prompt(self, mode: str) -> str:
         thinking = bool(self.settings.get("thinking", True))
-        if mode == "ask":
-            base = prompts.build_ask_system(self._repo_map(), thinking)
-        else:
-            base = prompts.build_agent_system(self._repo_map(), thinking, plan_mode=(mode == "plan"))
+        # The sections below go before the workspace outline (see prompts.build_agent_system): the outline changes most
+        # often, so it comes last and a refresh of it does not make the engine read the rest again.
+        base = ""
         mcp_text = ""
         try:
             from .mcp import MCP
             mcp_text = MCP.get().specs_text()
         except Exception:  # noqa: BLE001
             mcp_text = ""
-        if mcp_text and mode != "ask":
+        if mcp_text and mode not in ("ask", "plan"):
             base += "\n\n## Extra tools from MCP servers\n" + mcp_text
         rules = self._rules()
         if rules:
@@ -472,10 +509,24 @@ class Agent:
             mem = self.state.memories.prompt_text(self.ws.root)
             if mem:
                 base += "\n\n## Memories (facts the user approved; follow them)\n" + mem
+            try:
+                from . import skills as _skills
+                sk = _skills.prompt_list(self.ws.root, bool(self.state.settings.get("skills_claude_codex", True)))
+                if sk:
+                    base += ("\n\n## Skills\nSkills are instructions for particular tasks. When the user's request clearly fits "
+                             "one of these, load it with use_skill first and follow it.\n" + sk)
+            except Exception:  # noqa: BLE001
+                pass
             docs = [d["name"] for d in self.state.docs.list() if d.get("status") == "ready"]
-            if docs and mode != "ask":
+            if docs:
                 base += "\n\n## Indexed documentation for docs_search\n" + ", ".join(docs)
-        return base
+        return prompts.build_agent_system(self._repo_map(), thinking, plan_mode=(mode == "plan"), ask_mode=(mode == "ask"), extras=base,
+                                          native=self._native(mode))
+
+    def _native(self, mode: str) -> bool:
+        """Native tool calling is Ollama's JSON tool API. The GPU engine (llama-server) always uses Forge's tagged format,
+        so with it the setting has no effect (the Settings hint says so); Ask and Plan mode use the tagged format too."""
+        return self.settings.get("tool_mode", "prompt") == "native" and mode not in ("ask", "plan") and not hasattr(self.client, "wait_ready")
 
     def _trim(self, messages: List[dict], run: Run, budget_override: Optional[int] = None) -> List[dict]:
         """Keep the conversation inside the context window. Old tool outputs go first, then old turns, and when that
@@ -556,9 +607,12 @@ class Agent:
                 user_msg["images"] = imgs
         self.session.setdefault("runs", []).append({"run_id": run.id, "msg_index": len(msgs), "ts": time.time()})
         self.session["runs"] = self.session["runs"][-300:]
+        # Every message of this turn carries the run id, so Restore checkpoint finds where the turn began even after
+        # older messages were trimmed away (Forge's own key; it is taken off before the model sees the messages).
+        user_msg["run_id"] = run.id
         msgs.append(user_msg)
         max_iters = int(self.settings.get("max_iterations", 30))
-        native = self.settings.get("tool_mode", "prompt") == "native" and mode != "ask"
+        native = self._native(mode)
         model = self.settings.get("model", "llama3.1")
         run.emit("verbose", kind="request", text=f"model={model} mode={mode} tool_mode={'native' if native else 'prompt'} "
                                                 f"messages={len(msgs)} system_chars={len(system)} options={json.dumps(self._options())}")
@@ -589,42 +643,37 @@ class Agent:
                 self._trim(msgs, run, budget_override=target)
                 assistant_text, tool_call, stats = self._stream_assistant(run, msgs, model, native)
             if run.cancel.is_set():
-                msgs.append({"role": "assistant", "content": assistant_text})
+                msgs.append({"run_id": run.id, "role": "assistant", "content": assistant_text})
                 run.emit("status", text="Stopped by user.")
                 run.finish("cancelled")
                 return
             if stats:
                 run.emit("stats", **stats)
             if tool_call is None:
-                msgs.append({"role": "assistant", "content": assistant_text})
+                msgs.append({"run_id": run.id, "role": "assistant", "content": assistant_text})
                 # Some models (Qwen3.5 among them) end their reply right after the thought process without acting.
                 # One nudge, with the cached prompt, gets the step they decided on; a second empty reply ends the turn.
-                if not nudged and mode != "ask" and not _visible_text(assistant_text).strip():
+                if not nudged and not _visible_text(assistant_text).strip():
                     nudged = True
                     run.emit("status", text="The model stopped after its thought process; asking it to carry out the step it decided on.")
-                    msgs.append({"role": "user", "content": "Continue with the step you decided on: exactly one tool call, or the final "
+                    msgs.append({"run_id": run.id, "role": "user", "content": "Continue with the step you decided on: exactly one tool call, or the final "
                                                             "answer in Markdown. Do not write another thinking block."})
                     continue
                 run.emit("turn_done", iterations=iterations)
                 run.finish("done")
                 return
-            if mode == "ask":
-                msgs.append({"role": "assistant", "content": assistant_text})
-                run.emit("turn_done", iterations=iterations)
-                run.finish("done")
-                return
             # Record the assistant message with the tool call so the model sees its own call.
             if native:
-                msgs.append({"role": "assistant", "content": assistant_text or "", "tool_calls": [
+                msgs.append({"run_id": run.id, "role": "assistant", "content": assistant_text or "", "tool_calls": [
                     {"function": {"name": tool_call["name"], "arguments": tool_call["arguments"]}}]})
             else:
-                msgs.append({"role": "assistant", "content": assistant_text})
+                msgs.append({"run_id": run.id, "role": "assistant", "content": assistant_text})
             result = self._execute_tool(run, tool_call, mode)
             if result is None:  # ask_user ends the turn
                 run.emit("turn_done", iterations=iterations)
                 run.finish("done")
                 return
-            msgs.append({"role": "tool", "content": result})
+            msgs.append({"run_id": run.id, "role": "tool", "content": result})
 
     def _native_images(self, attachments: List[dict]) -> List[str]:
         import base64
@@ -648,7 +697,7 @@ class Agent:
         if run is not None:
             # Shown in the chat as a conversation: Forge asks the vision model on Llama's behalf, the answer streams in.
             run.emit("vision_exchange", id=xid, phase="ask", asker="forge", number=number, image_id=img_id,
-                     image_url="/api/image?id=" + img_id, question=VISION_PROMPT)
+                     image_url="/api/image?id=" + img_id, question=VISION_PROMPT, chat_sees=bool(self.settings.get("native_images")))
         ev = (lambda kind, **d: run.emit(kind, exchange=xid, **d)) if run is not None else None
         res = self.vision.analyze(img_id, self.settings, emit, ev)
         if res.get("error"):
@@ -673,9 +722,14 @@ class Agent:
             lines.append("Text recognized in the image (OCR, may contain small mistakes):\n```\n" + ocr[:6000] + "\n```")
         elif not desc:
             lines.append("No text was recognized in the image.")
+        if run is not None:
+            # The panel "What the vision model sees in image N" under the message shows exactly what the model is told.
+            run.emit("image_analysis", number=number, source=source, description=desc, ocr=ocr[:6000])
         return "\n".join(lines)
 
     def _compose_user_message(self, text: str, attachments: List[dict], run: Optional["Run"] = None) -> str:
+        # The searches for @codebase, @web, @docs and @folders use the user's own words, not the notes Forge adds.
+        query = " ".join(text.split())[:300]
         editor = [a for a in attachments if a.get("kind") == "editor"]
         attachments = [a for a in attachments if a.get("kind") != "editor"]
         if editor and editor[0].get("path"):
@@ -709,8 +763,28 @@ class Agent:
                     parts.append(f"\n### Attached file {meta['name']} ({meta['kind']}, saved at {meta['path']})\n```\n"
                                  f"{body[:40000]}\n```" + ("\n[truncated; use read_file on the saved path for the rest]" if cut else ""))
                 continue
+            if kind == "command":
+                # A slash command chosen in the chat: its instructions apply to this message.
+                from .features import BUILTIN_COMMANDS, custom_commands
+                from .server import DATA_DIR as _data_dir
+                name = str(a.get("name", ""))
+                found = next((c for c in BUILTIN_COMMANDS + custom_commands(_data_dir, self.ws.root) if c.get("name") == name), None)
+                prompt = (found or {}).get("prompt") or str(a.get("prompt", ""))
+                if prompt:
+                    parts.append(f"\n### The /{name} command (follow these instructions for this message)\n{prompt}")
+                continue
+            if kind == "skill":
+                # A skill the user ran with /name: its whole SKILL.md applies to this message.
+                from . import skills as _skills
+                inc = bool(self.state.settings.get("skills_claude_codex", True)) if self.state is not None else True
+                sk = _skills.find(self.ws.root, str(a.get("name", "")), inc)
+                if sk:
+                    parts.append(f"\n### The {sk['name']} skill (the user asked for it; follow its instructions)\n" + _skills.full_text(sk))
+                else:
+                    parts.append(f"\n### The {a.get('name')} skill\n[no skill with this name was found in the skill folders]")
+                continue
             if kind == "docs" and self.state is not None:
-                parts.append("\n### Documentation (@Docs " + str(a.get("name")) + ")\n" + self.state.docs.search(str(a.get("name")), text))
+                parts.append("\n### Documentation (@Docs " + str(a.get("name")) + ")\n" + self.state.docs.search(str(a.get("name")), query))
                 continue
             if kind == "chat" and self.state is not None:
                 other = self.state.sessions.get(str(a.get("id", "")))
@@ -721,7 +795,7 @@ class Agent:
             if kind == "folder":
                 from .features import folder_context
                 try:
-                    parts.append("\n### Folder (@folders)\n" + folder_context(self.ws, str(a.get("path", ".")), text))
+                    parts.append("\n### Folder (@folders)\n" + folder_context(self.ws, str(a.get("path", ".")), query))
                 except Exception as e:  # noqa: BLE001
                     parts.append(f"\n### Folder {a.get('path')}\n[could not read: {e}]")
                 continue
@@ -740,20 +814,15 @@ class Agent:
             elif kind == "terminal":
                 parts.append(f"\n### Terminal output\n```\n{a.get('text','')[-6000:]}\n```")
             elif kind == "codebase":
-                parts.append("\n### Relevant code from the workspace (@codebase)\n" + self._code_search(text, limit=6, max_chars=7000))
+                parts.append("\n### Relevant code from the workspace (@codebase)\n" + self._code_search(query, limit=6, max_chars=7000))
             elif kind == "web":
                 try:
-                    parts.append("\n### Web search results (@web)\n" + self.ws.web_search(text, limit=6))
+                    parts.append("\n### Web search results (@web)\n" + self.ws.web_search(query, limit=6))
                 except Exception as e:  # noqa: BLE001
                     parts.append(f"\n### Web search results (@web)\n[search failed: {e}]")
             elif kind == "git":
-                import subprocess
-                try:
-                    diff = subprocess.run(["git", "-C", self.ws.root, "diff", "--stat", "-p", "--no-color"], capture_output=True,
-                                          text=True, timeout=20).stdout
-                except (subprocess.TimeoutExpired, OSError) as e:
-                    diff = f"[git diff failed: {e}]"
-                parts.append("\n### Uncommitted git changes (@git)\n```diff\n" + (diff[:12000] or "(no changes)") + "\n```")
+                from .features import git_changes_context
+                parts.append("\n### Uncommitted git changes (@git)\n" + git_changes_context(self.ws.root))
         rules = self._rules_for_paths([str(a.get("path")) for a in attachments if a.get("kind") in ("file", "selection") and a.get("path")])
         if rules:
             parts.append("\n### Project rules for these files (follow them)\n" + rules)
@@ -775,7 +844,7 @@ class Agent:
             note = self.state.engine_memory_note() if self.state is not None else ""
             if now - last_line >= 60:
                 last_line = now
-                run.emit("status", text="Waiting for Llama's GPU engine to resume…" + (" " + note if note else ""))
+                run.emit("status", text="Waiting for the GPU engine to be ready…" + (" " + note if note else ""))
             if note and now - last_act >= 20:
                 last_act = now
                 act("waiting", note)
@@ -791,18 +860,25 @@ class Agent:
         native_calls: List[dict] = []
         stats: Optional[dict] = None
         last_obj: Optional[dict] = None
-        tools = ollama_tool_schemas() if native else None
+        tools = None
+        if native:
+            tools = ollama_tool_schemas()
+            try:
+                from .mcp import MCP
+                tools += MCP.get().schemas()     # the MCP tools the prompt lists, in the same format
+            except Exception:  # noqa: BLE001
+                pass
         label = self._llama_label(model)
         act = lambda state, detail: run.emit("model_activity", model="llama", state=state, label=label, detail=detail)
         if hasattr(self.client, "wait_ready") and not self.client.alive():
-            act("waiting", "Waiting for Llama's GPU engine to resume (it pauses while the vision model uses the Intel GPU).")
+            act("waiting", "Waiting for the GPU engine to be ready (it starts after an idle unload, and pauses while a separate vision model uses the Intel GPU).")
             ok = self._wait_for_engine(run, act)
             if not ok:
                 note = self.state.engine_memory_note() if self.state is not None else ""
                 act("failed", "The GPU engine did not come back.")
                 raise OllamaError("The GPU engine did not come back. " + (note + " Press Retry when the status bar says the engine is ready."
                                   if note else "Start it again from the Forge app (Settings, GPU engine card)."))
-            act("resumed", "Llama's GPU engine is running again on the Intel GPU.")
+            act("resumed", "The GPU engine is running on the Intel GPU.")
         elif not hasattr(self.client, "wait_ready") and self.state is not None and not self.state.model_loaded(model):
             act("loading", "Loading the model into the VM's memory (this takes a little while the first time).")
         ctx = sum(estimate_tokens(mm.get("content", "")) for mm in msgs)
@@ -817,7 +893,8 @@ class Agent:
         last_progress = time.monotonic()
         # Ollama: a model with a built-in thinking mode gets it switched off (Forge keeps its own short thought process).
         extra = {"think": False} if (not hasattr(self.client, "wait_ready") and _thinking_family(model)) else {}
-        for obj in self.client.chat_stream(model, msgs, options=options, tools=tools, cancel=run.cancel, **extra,
+        wire = [{k: v for k, v in mm.items() if k != "run_id"} for mm in msgs]
+        for obj in self.client.chat_stream(model, wire, options=options, tools=tools, cancel=run.cancel, **extra,
                                            keep_alive=str(self.settings.get("keep_alive", "30m"))):
             last_obj = obj
             if (obj.get("message") or {}).get("content"):
@@ -960,6 +1037,22 @@ class Agent:
                 out += "\n\n" + more.replace("\n--- ", "\n--- " + root + "/")
         return out
 
+    def _grants(self) -> List[str]:
+        """What "Always allow" granted in this chat: "run_command", "mcp:<tool>" or "outside_changes". A chat saved by an
+        older version with its single auto_approve flag keeps what that flag meant (commands and MCP tools)."""
+        g = self.session.setdefault("allow", [])
+        if self.session.pop("auto_approve", False):
+            for k in ("run_command", "mcp:*"):
+                if k not in g:
+                    g.append(k)
+        return g
+
+    def _grant(self, run: Run, key: str) -> None:
+        g = self._grants()
+        if key not in g:
+            g.append(key)
+        run.emit("chat_allow", allow=list(g))
+
     def _execute_tool(self, run: Run, call: dict, mode: str) -> Optional[str]:
         name = call["name"]
         args = dict(call.get("arguments") or {})
@@ -973,8 +1066,11 @@ class Agent:
             res = f"ERROR: '{name}' is not allowed in the {self.custom_mode.get('name')} mode. Only read-only tools may be used."
             run.emit("tool_result", call_id=call_id, name=name, result=res, ok=False)
             return res
-        if mode == "plan" and name not in READ_ONLY_TOOLS:
-            res = f"ERROR: '{name}' is not allowed in Plan mode. Only read-only tools may be used; finish by writing the plan."
+        if mode in ("plan", "ask") and name not in READ_ONLY_TOOLS:
+            res = (f"ERROR: '{name}' is not allowed in Plan mode. Only read-only tools may be used; finish by writing the plan."
+                   if mode == "plan" else
+                   f"ERROR: '{name}' is not allowed in Ask mode. Only read-only tools may be used; answer the question, and "
+                   "suggest Agent mode if the user wants changes.")
             run.emit("tool_result", call_id=call_id, name=name, result=res, ok=False)
             return res
         if name == "ask_user":
@@ -990,8 +1086,13 @@ class Agent:
             except Exception:  # noqa: BLE001
                 target = None
             reason = outside_change_reason(self.ws, target, bool(self.settings.get("external_file_protection", True))) if target else None
-            if reason:
-                decision = run.request_approval(name, self._display_args({**args, "path": target}), reason)
+            # System files and keys always ask: with protection off only they still have a reason, and no grant of
+            # "Always allow changes outside the project" ever covers them.
+            always_asks = bool(target) and outside_change_reason(self.ws, target, False) is not None
+            if reason and (always_asks or "outside_changes" not in self._grants()):
+                decision = run.request_approval(name, self._display_args({**args, "path": target}), reason, allow_always=not always_asks)
+                if decision.get("decision") == "always" and not always_asks:
+                    self._grant(run, "outside_changes")
                 if decision.get("decision") not in ("approve", "always"):
                     run.emit("approval_resolved", call_id=call_id, decision="denied")
                     res = ("The user declined this change outside the project folder. Ask them how to proceed or keep "
@@ -1014,6 +1115,9 @@ class Agent:
             decision = run.request_approval("remember", {"memory": text, "scope": scope}, "Save this memory for future chats?")
             if decision.get("decision") in ("approve", "always") and text and self.state is not None:
                 saved = str((decision.get("arguments") or {}).get("memory") or text).strip()
+                # The user picks the place on the approval card: this project or every project.
+                chosen = str((decision.get("arguments") or {}).get("scope") or scope).lower()
+                scope = "global" if chosen == "global" else "project"
                 self.state.memories.add(self.ws.root, saved, scope)
                 run.emit("approval_resolved", call_id=call_id, decision="approved")
                 res = f"Memory saved ({scope}): {saved}"
@@ -1027,20 +1131,31 @@ class Agent:
         needs = name in NEEDS_APPROVAL or name.startswith("mcp_")
         if needs:
             cmd_text = str(args.get("command", ""))
-            allow = [p.strip() for p in (self.settings.get("command_allowlist") or []) if str(p).strip()]
-            deny = [p.strip() for p in (self.settings.get("command_denylist") or []) if str(p).strip()]
-            denied = name == "run_command" and any(cmd_text.strip().startswith(p) for p in deny)
-            allowed = name == "run_command" and any(cmd_text.strip().startswith(p) for p in allow)
-            auto = bool(self.settings.get("auto_approve_commands")) or bool(self.session.get("auto_approve")) or allowed
+            allow = [str(p).strip() for p in (self.settings.get("command_allowlist") or []) if str(p).strip()]
+            deny = [str(p).strip() for p in (self.settings.get("command_denylist") or []) if str(p).strip()]
+            # Cursor's lists: the allowlist runs a command without asking only when every part of the line is on it;
+            # the denylist means "never run on its own": such a command always asks, even with Auto-run on.
+            denied = name == "run_command" and denylisted(cmd_text, deny)
+            allowed = name == "run_command" and allowlisted(cmd_text, allow)
+            grants = self._grants()
+            if name.startswith("mcp_"):
+                # MCP tools protection (Cursor's setting): they ask even with Auto-run on, unless you allowed this tool
+                # for this chat.
+                protected = bool(self.settings.get("mcp_tool_protection", True))
+                auto = f"mcp:{name}" in grants or "mcp:*" in grants or (bool(self.settings.get("auto_approve_commands")) and not protected)
+            else:
+                auto = bool(self.settings.get("auto_approve_commands")) or "run_command" in grants or allowed
             dangerous = name == "delete_path" or (name == "run_command" and (is_dangerous_command(cmd_text) or denied)) or force_ask
             if not auto or dangerous:
-                reason = "A hook asked for your approval." if force_ask else "This command is on your denylist." if denied else "This command looks destructive." if dangerous and name == "run_command" else (
+                reason = "A hook asked for your approval." if force_ask else "This command is on your denylist, so it never runs without asking." if denied else "This command looks destructive." if dangerous and name == "run_command" else (
                     "Moving a file to the trash." if name == "delete_path" else
                     "Tool from an MCP server." if name.startswith("mcp_") else "Commands run on your computer.")
                 decision = run.request_approval(name, self._display_args(args), reason)
                 d = decision.get("decision")
-                if d == "always":
-                    self.session["auto_approve"] = True
+                if d == "always" and name != "delete_path":
+                    # "Always allow" grants exactly this kind of call for this chat: commands (destructive and
+                    # denylisted ones still ask), or this one MCP tool.
+                    self._grant(run, "run_command" if name == "run_command" else f"mcp:{name}")
                 if d in ("approve", "always"):
                     if decision.get("arguments"):
                         args.update(decision["arguments"])
@@ -1057,15 +1172,25 @@ class Agent:
         except Exception as e:  # noqa: BLE001
             ok = False
             res = f"ERROR in {name}: {e}"
-        dur = round(time.monotonic() - t0, 2)
-        run.emit("tool_result", call_id=call_id, name=name, result=res, ok=ok, seconds=dur)
         if name in ("write_file", "edit_file") and ok and self.state is not None:
-            st, root = self.state, self.ws.root
+            # afterFileEdit hooks (a formatter, for example) run before the result goes back, so the model, the review
+            # and the checkpoint all see the file as the hook left it. Each hook has its own time limit.
             try:
                 p = self.ws.resolve(str(args.get("path", "")))
+                before_hook = self.ws.read_text(p)
+                h = self.state.hooks.run(self.ws.root, "afterFileEdit", {"path": p})
+                after_hook = self.ws.read_text(p)
+                if after_hook != before_hook:
+                    rel = self.ws.relpath(p)
+                    ch = self.ws.checkpoints.get(run.id, rel)
+                    if ch is not None:
+                        ch.after = after_hook
+                        self.ws.checkpoints.save(run.id)
+                    res += "\n(An afterFileEdit hook changed the file after this edit" + (": " + "; ".join(h["messages"]) if h["messages"] else "") + ". Read it again before the next edit.)"
             except Exception:  # noqa: BLE001
-                p = str(args.get("path", ""))
-            threading.Thread(target=lambda: st.hooks.run(root, "afterFileEdit", {"path": p}), daemon=True).start()
+                pass
+        dur = round(time.monotonic() - t0, 2)
+        run.emit("tool_result", call_id=call_id, name=name, result=res, ok=ok, seconds=dur)
         if name in ("write_file", "edit_file", "delete_path") and ok:
             ch = self.ws.checkpoints.get(run.id, self.ws.relpath(self.ws.resolve(str(args.get("path", "")))))
             if ch:
@@ -1136,7 +1261,7 @@ class Agent:
                         return ("NOT RUN: " + why + " A build can use up to 2 GB. Ask the user to close other apps, switch "
                                 "chats to the GPU engine (which frees the VM's memory), or unload the model, then try again.")
             long_job = bool(cap) or "forge-gradle" in command
-            out, _code = ws.run_command(command, float(s("timeout", 900 if long_job else 90) or 90), s("cwd"), memory_cap_mb=cap)
+            out, _code = ws.run_command(command, float(s("timeout", 900 if long_job else 90) or 90), s("cwd"), memory_cap_mb=cap, cancel=run.cancel)
             return out
         if name == "web_fetch":
             return ws.web_fetch(str(need("url")))
@@ -1164,6 +1289,16 @@ class Agent:
             run.emit("todos", todos=clean)
             done = sum(1 for t in clean if t["status"] == "completed")
             return f"To-do list updated: {done} of {len(clean)} done."
+        if name == "use_skill":
+            from . import skills as _skills
+            inc = bool(self.state.settings.get("skills_claude_codex", True)) if self.state is not None else True
+            sk = _skills.find(self.ws.root, str(need("name")).strip().lstrip("/"), inc)
+            if sk is None:
+                names = ", ".join(x["name"] for x in _skills.discover(self.ws.root, inc)) or "none"
+                raise ValueError(f"no skill named '{need('name')}'. Skills: {names}")
+            if sk["manual_only"]:
+                raise ValueError(f"the {sk['name']} skill runs only when the user asks for it with /{sk['name']}")
+            return f"The {sk['name']} skill:\n" + _skills.full_text(sk)
         if name == "docs_search":
             if self.state is None:
                 raise ValueError("documentation search is not available")
@@ -1181,7 +1316,7 @@ class Agent:
             xid = uuid.uuid4().hex[:8]
             t0 = time.time()
             run.emit("vision_exchange", id=xid, phase="ask", asker="llama", image_id=img_id,
-                     image_url="/api/image?id=" + img_id, question=question)
+                     image_url="/api/image?id=" + img_id, question=question, chat_sees=bool(self.settings.get("native_images")))
             answer, source = self.vision.ask(path, mime, question, self.settings, lambda t: run.emit("status", text=t),
                                              lambda kind, **d: run.emit(kind, exchange=xid, **d))
             if answer:
@@ -1237,6 +1372,10 @@ def inline_edit_stream(client: OllamaClient, settings: dict, run: Run, path: str
                 run.emit("code_delta", text=d)
             if obj.get("done"):
                 break
+        if run.cancel.is_set():
+            # Cancelled (Escape, the bar's X): nothing of the partial answer is applied.
+            run.finish("cancelled")
+            return
         code = extract_code_block(full, selection)
         run.emit("code", text=code, raw=full)
         if last:
@@ -1245,6 +1384,9 @@ def inline_edit_stream(client: OllamaClient, settings: dict, run: Run, path: str
                      prompt_tokens=last.get("prompt_eval_count"))
         run.finish("done")
     except Exception as e:  # noqa: BLE001
+        if run.cancel.is_set():
+            run.finish("cancelled")    # an interrupted read after a cancel is not an error
+            return
         run.emit("error", message=str(e))
         run.finish("error")
 
@@ -1295,7 +1437,8 @@ def complete(client: OllamaClient, settings: dict, path: str, language: str, pre
             f"The cursor is in this line, at the |: `{line_before}|{line_after}`\n"
             "Output only the text to insert at the cursor (between prefix and suffix). If the line is unfinished, finish it "
             "first; continue with at most two more lines.")
-    opts = {"num_ctx": min(int(settings.get("num_ctx", 8192)), 4096), "temperature": 0.0, "num_predict": 64,
+    # The same context as the chat: Ollama loads the model again whenever a request asks for another context size.
+    opts = {"num_ctx": int(settings.get("num_ctx", 8192)), "temperature": 0.0, "num_predict": 64,
             "stop": ["<|eot_id|>", "\n\n\n", "</prefix>", "<suffix>"]}
     if settings.get("num_thread"):
         opts["num_thread"] = int(settings["num_thread"])

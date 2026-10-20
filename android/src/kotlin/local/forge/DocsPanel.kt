@@ -137,7 +137,12 @@ class DocsPanel(private val ctx: Context, private val host: MainActivity) {
             }
         })
         row.tooltipText = du
-        row.setOnClickListener { host.copyToClipboard("@docs $dn"); Ui.toast(ctx, "\"@docs $dn\" is on the clipboard. Paste it into the chat to use these docs.") }
+        // A click attaches these docs to the chat, as picking @docs does: the next message searches them for its answer.
+        row.setOnClickListener {
+            if (status != "ready") { Ui.toast(ctx, "These docs are not ready yet ($status)."); return@setOnClickListener }
+            host.addToChat(JSONObject().put("kind", "docs").put("name", dn))
+            host.flashStatus("The $dn docs go with your next message.")
+        }
         return row
     }
 

@@ -101,7 +101,10 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
     private var inlineRunId = ""
     var generating = false; private set
 
-    private val diagnosticsListener: (String, List<Lsp.Diagnostic>) -> Unit = { p, list -> if (p == path) editor.setDiagnostics(list) }
+    /** The folder of this editor's window; its language servers are that folder's. */
+    private val folder = host.windowFolder()
+
+    private val diagnosticsListener: (String, String, List<Lsp.Diagnostic>) -> Unit = { f, p, list -> if (f == folder && p == path) editor.setDiagnostics(list) }
 
     private val watcher = object : TextWatcher {
         override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
@@ -110,7 +113,7 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
         }
         override fun afterTextChanged(s: Editable?) {
             if (detached) return
-            Lsp.change(path, editor.text())
+            Lsp.change(path, editor.text(), folder)
             val typed = lastTyped
             lastTyped = '\u0000'
             if (typed != '\u0000') Api.main.post { onTyped(typed) }
@@ -137,10 +140,10 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
         editor.cursorHook = { off -> onCursor(off) }
         editor.contextMenuHook = { x, y -> contextMenu(x, y) }
         Lsp.listeners.add(diagnosticsListener)
-        Lsp.diagnostics[path]?.let { editor.setDiagnostics(it) }
+        Lsp.diagnosticsOf(folder)[path]?.let { editor.setDiagnostics(it) }
     }
 
-    fun saved() { Lsp.save(path) }
+    fun saved() { Lsp.save(path, folder) }
 
     fun detach() {
         detached = true
@@ -175,6 +178,11 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
                 KeyEvent.KEYCODE_ESCAPE -> { closeCompletion(); return true }
                 KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_MOVE_HOME, KeyEvent.KEYCODE_MOVE_END -> closeCompletion()
             }
+        }
+        // A snippet's tab stops: Tab goes to the next placeholder, Shift Tab back, Escape leaves them.
+        if (snippetStops.isNotEmpty() && !ctrl && !alt) {
+            if (code == KeyEvent.KEYCODE_TAB) { goToStop(snippetAt + if (shift) -1 else 1); return true }
+            if (code == KeyEvent.KEYCODE_ESCAPE) { endSnippet(); return true }
         }
         if (code == KeyEvent.KEYCODE_ESCAPE && signaturePopup != null) { signaturePopup?.dismiss(); signaturePopup = null; return true }
         if (code == KeyEvent.KEYCODE_ESCAPE && hoverPopup != null) { hoverPopup?.dismiss(); hoverPopup = null; return true }
@@ -213,7 +221,7 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
     private fun onTyped(c: Char) {
         if (detached) return
         hoverPopup?.dismiss(); hoverPopup = null
-        val client = Lsp.clientFor(path)
+        val client = Lsp.clientFor(path, folder)
         val triggers = client?.triggerCharacters("completionProvider") ?: emptySet()
         val sigTriggers = (client?.triggerCharacters("signatureHelpProvider") ?: emptySet()) + setOf('(', ',')
         when {
@@ -238,7 +246,7 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
     }
 
     private fun requestCompletion(trigger: Char?) {
-        val client = Lsp.clientFor(path) ?: return
+        val client = Lsp.clientFor(path, folder) ?: return
         if (!client.ready) return
         val off = editor.cursorOffset()
         val start = wordStart(off)
@@ -342,7 +350,7 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
     private fun updateDocs() {
         val it = shown.getOrNull(selected) ?: return
         fillDocs(it)
-        val client = Lsp.clientFor(path) ?: return
+        val client = Lsp.clientFor(path, folder) ?: return
         if (it.documentation.isEmpty() && client.capability("completionProvider")?.optBoolean("resolveProvider") == true) {
             val g = ++resolveGen
             client.resolveCompletion(it) { full -> if (g == resolveGen && shown.getOrNull(selected) === it) fillDocs(full) }
@@ -382,6 +390,44 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
         return out
     }
 
+    // ---------------------------------------------------------------- snippet tab stops
+    /** Marks one tab stop in the text; the mark grows with what is typed into it. */
+    private class TabStopMark : android.text.NoCopySpan
+    private var snippetStops: List<TabStopMark> = emptyList()
+    private var snippetAt = -1
+
+    /** After a snippet was inserted at [base]: its stops are marked and the first one is selected. Stop 0 (the final
+     *  cursor place) comes last; a stop that appears twice is visited once. */
+    private fun startSnippet(base: Int, stops: List<Lsp.SnippetStop>) {
+        endSnippet()
+        val order = stops.filter { it.index > 0 }.distinctBy { it.index }.sortedBy { it.index } + stops.filter { it.index == 0 }.take(1)
+        if (order.isEmpty()) return
+        val t = editor.edit.text
+        snippetStops = order.map { st ->
+            val m = TabStopMark()
+            t.setSpan(m, (base + st.start).coerceIn(0, t.length), (base + st.end).coerceIn(0, t.length), android.text.Spanned.SPAN_EXCLUSIVE_INCLUSIVE)
+            m
+        }
+        goToStop(0)
+    }
+
+    private fun goToStop(i: Int) {
+        val t = editor.edit.text
+        val m = snippetStops.getOrNull(i.coerceAtLeast(0)) ?: run { endSnippet(); return }
+        val a = t.getSpanStart(m); val b = t.getSpanEnd(m)
+        if (a < 0) { endSnippet(); return }
+        snippetAt = i.coerceAtLeast(0)
+        editor.edit.setSelection(a, maxOf(a, b))
+        // The last stop ends the snippet: the cursor stays there and Tab types a tab again.
+        if (snippetAt == snippetStops.size - 1) endSnippet()
+    }
+
+    private fun endSnippet() {
+        val t = editor.edit.text
+        for (m in snippetStops) t.removeSpan(m)
+        snippetStops = emptyList(); snippetAt = -1
+    }
+
     /** Inserts the selected item: its own edit range when it has one, else over the typed word; then its extra edits. */
     private fun accept() {
         val it = shown.getOrNull(selected) ?: run { closeCompletion(); return }
@@ -401,20 +447,28 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
         }
         var text = it.insertText
         var cursorBack = 0
+        // A snippet keeps its tab stops: its placeholders are selected one after the other with Tab, as in Cursor.
+        var stops: List<Lsp.SnippetStop> = emptyList()
+        if (it.snippet) {
+            val raw = it.raw.optJSONObject("textEdit")?.optString("newText") ?: it.raw.optString("insertText").ifEmpty { it.label }
+            val parsed = Lsp.parseSnippet(raw)
+            text = parsed.first; stops = parsed.second
+        }
         val callable = it.kind == 2 || it.kind == 3 || it.kind == 4
-        if (callable && !text.contains('(') && (b >= t.length || t[b] != '(') && (editor.lang.id in setOf("kotlin", "java", "python", "javascript", "typescript", "go", "rust", "c", "cpp", "dart", "swift"))) {
+        if (stops.isEmpty() && callable && !text.contains('(') && (b >= t.length || t[b] != '(') && (editor.lang.id in setOf("kotlin", "java", "python", "javascript", "typescript", "go", "rust", "c", "cpp", "dart", "swift"))) {
             text += "()"
             cursorBack = 1
-        } else if (it.snippet && text.endsWith("()") && it.raw.optString("insertText").contains("$")) cursorBack = 1
+        }
         applying = true
         try {
             editor.replaceRange(a, b, text)
             if (cursorBack > 0) editor.edit.setSelection((a + text.length - cursorBack).coerceIn(0, editor.edit.text.length))
+            if (stops.isNotEmpty()) startSnippet(a, stops)
             if (it.additional.isNotEmpty()) editor.applyEdits(it.additional)
         } finally { applying = false }
         if (cursorBack > 0) requestSignature()
         // A resolved item may bring extra edits (an import) that the list did not have.
-        val client = Lsp.clientFor(path)
+        val client = Lsp.clientFor(path, folder)
         if (it.additional.isEmpty() && client != null && client.capability("completionProvider")?.optBoolean("resolveProvider") == true) {
             val textNow = editor.text()
             client.resolveCompletion(it) { full -> if (full.additional.isNotEmpty() && editor.text() == textNow) { applying = true; try { editor.applyEdits(full.additional) } finally { applying = false } } }
@@ -480,7 +534,7 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
         Api.main.removeCallbacks(hoverDismiss)
         val diags = editor.diagnosticsAt(off)
         val word = editor.wordRangeAt(off)
-        val client = Lsp.clientFor(path)
+        val client = Lsp.clientFor(path, folder)
         val gen = ++hoverGen
         if (client == null || !client.ready || !client.has("hoverProvider") || word.isEmpty()) {
             if (diags.isNotEmpty()) showHover(diags, "", x, y, off) else { hoverPopup?.dismiss(); hoverPopup = null }
@@ -553,13 +607,18 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
         return r
     }
 
-    private fun fixWithAi(d: Lsp.Diagnostic) {
-        host.quickAsk("Fix this problem in $path at line ${d.line + 1}: ${d.describe()}", "agent", JSONObject().put("kind", "file").put("path", path).put("name", path))
+    private fun fixWithAi(d: Lsp.Diagnostic) = fixAllWithAi(listOf(d))
+
+    /** Every problem given goes to the agent with the file, one per line of the request. */
+    private fun fixAllWithAi(list: List<Lsp.Diagnostic>) {
+        val text = if (list.size == 1) "Fix this problem in $path at line ${list[0].line + 1}: ${list[0].describe()}"
+            else "Fix these problems in $path:\n" + list.joinToString("\n") { "- line ${it.line + 1}: ${it.describe()}" }
+        host.quickAsk(text, "agent", JSONObject().put("kind", "file").put("path", path).put("name", path))
     }
 
     // ---------------------------------------------------------------- signature help
     private fun requestSignature() {
-        val client = Lsp.clientFor(path) ?: return
+        val client = Lsp.clientFor(path, folder) ?: return
         if (!client.ready || !client.has("signatureHelpProvider")) return
         val (line, col) = editor.cursorLineCol()
         val gen = ++signatureGen
@@ -610,7 +669,7 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
 
     // ---------------------------------------------------------------- navigation
     private fun clientOrSay(): LspClient? {
-        val c = Lsp.clientFor(path)
+        val c = Lsp.clientFor(path, folder)
         if (c == null) { Ui.toast(ctx, if (Lsp.serverFor(path) == null) "No language server knows this kind of file." else "The language server is not running (Settings, Language servers)."); return null }
         if (!c.ready) { Ui.toast(ctx, "The language server is still starting."); return null }
         return c
@@ -619,19 +678,32 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
     private fun goToLocation(method: String, cap: String, off: Int) {
         val client = clientOrSay() ?: return
         val (line, col) = editor.lineColOf(off)
+        // The words match what is asked for: a definition or an implementation.
+        val impl = method == "textDocument/implementation"
         client.locations(method, cap, path, line, col, false) { list, err ->
             if (detached) return@locations
             when {
                 err != null && list.isEmpty() -> Ui.toast(ctx, err)
-                list.isEmpty() -> Ui.toast(ctx, "No definition found for this symbol.")
+                list.isEmpty() -> Ui.toast(ctx, if (impl) "No implementation found for this symbol." else "No definition found for this symbol.")
                 list.size == 1 -> panel.openAt(list[0].path, list[0].line, list[0].col)
-                else -> pickLocation("Definitions", list)
+                else -> pickLocation(if (impl) "Implementations" else "Definitions", list)
             }
         }
     }
 
     fun goToDefinition() = goToLocation("textDocument/definition", "definitionProvider", editor.cursorOffset())
     fun goToImplementation() = goToLocation("textDocument/implementation", "implementationProvider", editor.cursorOffset())
+
+    /** The definition at the cursor (the first one when there are several), for Open Definition to the Side. */
+    fun findDefinition(done: (Lsp.Location?) -> Unit) {
+        val client = clientOrSay() ?: return
+        val (line, col) = editor.cursorLineCol()
+        client.locations("textDocument/definition", "definitionProvider", path, line, col, false) { list, err ->
+            if (detached) return@locations
+            if (list.isEmpty() && err != null) { Ui.toast(ctx, err); return@locations }
+            done(list.firstOrNull())
+        }
+    }
 
     /** A small list of places (several definitions or implementations) to choose from. */
     private fun pickLocation(title: String, list: List<Lsp.Location>) {
@@ -772,22 +844,27 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
         val sStart = minOf(editor.edit.selectionStart, editor.edit.selectionEnd); val sEnd = maxOf(editor.edit.selectionStart, editor.edit.selectionEnd)
         val (l1, c1) = editor.lineColOf(sStart); val (l2, c2) = editor.lineColOf(sEnd)
         val diags = editor.diagnosticsOnLine(line)
-        val client = Lsp.clientFor(path)
+        val client = Lsp.clientFor(path, folder)
         fun show(actions: List<Lsp.CodeAction>) {
             val titles = ArrayList<String>()
             for (a in actions) titles.add((if (a.preferred) "★ " else "") + a.title)
-            val aiTitle = if (diags.isNotEmpty()) "Fix with AI: " + diags.first().message.take(80) else "Ask AI to improve this code"
+            val aiTitle = if (diags.size > 1) "Fix the " + diags.size + " problems on this line with AI" else if (diags.isNotEmpty()) "Fix with AI: " + diags.first().message.take(80) else "Improve this code with AI (Ctrl K)"
             titles.add(aiTitle)
             AlertDialog.Builder(ctx).setTitle(if (actions.isEmpty()) "No quick fixes from the language server" else "Quick fixes")
                 .setItems(titles.toTypedArray()) { _, i ->
                     if (i >= actions.size) {
-                        if (diags.isNotEmpty()) fixWithAi(diags.first())
-                        else openInlineEdit()
+                        if (diags.isNotEmpty()) fixAllWithAi(diags)
+                        else openInlineEdit(prefill = "Improve this code")
                         return@setItems
                     }
-                    val a = actions[i]
-                    if (a.edits.isNotEmpty()) panel.applyWorkspaceEdit(a.edits)
-                    a.command?.let { cmd -> client?.executeCommand(cmd) { err -> if (err != null) Ui.toast(ctx, "The fix failed: $err") } }
+                    val chosen = actions[i]
+                    fun run(a: Lsp.CodeAction) {
+                        if (a.edits.isNotEmpty()) panel.applyWorkspaceEdit(a.edits)
+                        a.command?.let { cmd -> client?.executeCommand(cmd) { err -> if (err != null) Ui.toast(ctx, "The fix failed: $err") } }
+                    }
+                    val raw = chosen.raw
+                    if (raw != null && client != null) client.resolveCodeAction(raw) { full, err -> if (full == null) Ui.toast(ctx, "The fix failed: $err") else run(full) }
+                    else run(chosen)
                 }.setNegativeButton("Close", null).show()
         }
         if (client == null || !client.ready || !client.has("codeActionProvider")) { show(emptyList()); return }
@@ -826,13 +903,13 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
         val menu = android.widget.PopupMenu(ctx, anchor)
         val hasSel = editor.edit.selectionStart != editor.edit.selectionEnd
         val diags = editor.diagnosticsOnLine(editor.cursorLineCol().first)
-        val lsp = Lsp.clientFor(path)?.ready == true
+        val lsp = Lsp.clientFor(path, folder)?.ready == true
         val items = ArrayList<Pair<String, () -> Unit>>()
         fun add(label: String, enabled: Boolean = true, run: () -> Unit) { if (enabled) items.add(label to run) }
-        add("Add the selection to the chat  (Ctrl L)", hasSel) { host.editorSelection()?.let { host.addToChat(it) } }
+        add("Add the selection to the chat  (Ctrl Shift L)", hasSel) { host.editorSelection()?.let { host.addToChat(it) } }
         add("Edit with AI  (Ctrl K)") { openInlineEdit() }
         add("Explain this code", hasSel) { host.quickAsk("Explain this code.", "ask", host.editorSelection()) }
-        add("Fix the problems here with AI", diags.isNotEmpty()) { fixWithAi(diags.first()) }
+        add(if (diags.size > 1) "Fix the " + diags.size + " problems here with AI" else "Fix the problem here with AI", diags.isNotEmpty()) { fixAllWithAi(diags) }
         add("Go to the definition  (F12)", lsp) { goToDefinition() }
         add("Peek the definition  (Alt F12)", lsp) { peekDefinition() }
         add("Find all references  (Shift F12)", lsp) { references() }
@@ -864,7 +941,8 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
     }
 
     /** Asks the model for a short continuation at the cursor; the answer shows as ghost text that Tab inserts. */
-    fun requestCompletionPublic() = requestCompletion(null)
+    /** Ctrl Space: suggestions now; when no language server can give them, the reason is said instead of nothing. */
+    fun requestCompletionPublic() { if (clientOrSay() != null) requestCompletion(null) }
 
     /** The inline edit box's input, while the box is open (Ctrl Shift K moves the focus between it and the code). */
     private var inlineInput: EditText? = null
@@ -918,7 +996,12 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
         Api.async("complete", { Api.post("/api/complete", body, 90000) }) { r, e ->
             host.setTabStatus(null)
             if (gen != ghostGen || detached) return@async
-            if (r == null) { if (manual) Ui.toast(ctx, "No completion: " + (e?.message ?: "no answer")); return@async }
+            if (r == null) {
+                if (manual) Ui.toast(ctx, "No completion: " + (e?.message ?: "no answer"))
+                // A refusal for lack of memory is said once in the status bar, so missing suggestions have a reason.
+                else if ((e as? Api.ApiError)?.code == 503) host.flashStatus("Tab completions wait: " + (e.message ?: ""))
+                return@async
+            }
             val text = r.optString("text")
             if (text.isEmpty()) { if (manual) Ui.toast(ctx, "The model had nothing to add here."); return@async }
             if (editor.cursorOffset() != off || editor.text().hashCode() != version) return@async
@@ -1047,15 +1130,27 @@ class EditorSmarts(private val ctx: Context, private val host: MainActivity, pri
                     }
                     "code" -> finalCode = ev.optString("text")
                     "stats" -> { val tps = ev.optDouble("gen_tps", 0.0); if (tps > 0) status.text = "Done, " + String.format("%.1f", tps) + " tokens per second" }
-                    "error" -> { status.setTextColor(Ui.red); status.text = ev.optString("message").take(160) }
+                    "error" -> {
+                        status.setTextColor(Ui.red); status.text = ev.optString("message").take(160)
+                        // The connection to the server was lost for good: no "end" follows, so the edit ends here, the
+                        // selection gets its original text back and the editor takes keys again.
+                        if (ev.optBoolean("lost") && generating) {
+                            generating = false
+                            inlineStream = null
+                            editor.mirrorEdit(start, shownLen, selection)
+                            retry()
+                        }
+                    }
                     "end" -> {
-                        android.util.Log.i("ForgeSmarts", "inline edit ended: " + (finalCode?.length ?: -1) + " characters of code")
+                        android.util.Log.i("ForgeSmarts", "inline edit ended (" + ev.optString("status") + "): " + (finalCode?.length ?: -1) + " characters of code")
+                        if (!generating) return@EventStream
                         generating = false
                         inlineStream = null
                         // Back to the original text first, so the final change is recorded (and mirrored) against it.
                         editor.mirrorEdit(start, shownLen, selection)
                         val code = finalCode
-                        if (code == null) { if (status.currentTextColor != Ui.red) status.text = "Cancelled"; retry(); return@EventStream }
+                        // A cancelled edit (Escape, the X) applies nothing, not even what was written so far.
+                        if (code == null || ev.optString("status") == "cancelled") { if (status.currentTextColor != Ui.red) status.text = "Cancelled"; retry(); return@EventStream }
                         val base = editor.text()
                         editor.replaceRange(start, end, code)
                         bar.dismiss()

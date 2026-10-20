@@ -40,10 +40,78 @@ object Api {
     private const val TAG = "ForgeApi"
     val main = Handler(Looper.getMainLooper())
 
-    /** The folder this window works in; empty means the server's default folder. */
+    /** The folder of the window in front (each window sets it when it gets the focus); empty means the server's
+     *  default folder. */
     @Volatile var folder: String = ""
 
+    /** The folder a request made on this thread carries when it is not the window in front's (see withFolder). */
+    private val threadFolder = ThreadLocal<String?>()
+
+    /** Runs [block] so that the requests it makes on this thread carry [f], a window's own folder. A window's timers
+     *  use it, so a window that is not in front still talks about its own folder. */
+    fun <T> withFolder(f: String, block: () -> T): T {
+        if (f.isEmpty()) return block()
+        val old = threadFolder.get()
+        threadFolder.set(f)
+        try { return block() } finally { threadFolder.set(old) }
+    }
+
+    /** The folder a request made now, on this thread, carries. */
+    fun currentFolder(): String = threadFolder.get() ?: folder
+
     class ApiError(message: String, val code: Int = 0) : Exception(message)
+
+    // ------------------------------------------------------------------ the app's key
+    /** This app install's own key (made once, kept in the app's private storage). Every request carries it, so no other
+     *  app on the Googlebook can use the server through the forwarded port; the server learns it when the app pairs. */
+    @Volatile var key: String = ""
+    @Volatile private var paired = false
+
+    /** Loads the key (or makes it the first time). Called by every part of the app before its first request. */
+    fun init(ctx: android.content.Context) {
+        if (key.isNotEmpty()) return
+        synchronized(this) {
+            if (key.isNotEmpty()) return
+            val f = java.io.File(ctx.applicationContext.filesDir, "forge-key")
+            var k = try { f.readText().trim() } catch (e: Exception) { "" }
+            if (k.length < 32) {
+                val b = ByteArray(32); java.security.SecureRandom().nextBytes(b)
+                k = b.joinToString("") { String.format("%02x", it) }
+                try { f.writeText(k) } catch (e: Exception) { Log.w(TAG, "the key could not be saved", e) }
+            }
+            key = k
+        }
+    }
+
+    /** Tells the server this app's key; true when the server knows it (it pairs with the first app after a reset). */
+    fun ensurePaired(): Boolean {
+        if (paired) return true
+        if (key.isEmpty()) return false
+        return try {
+            val c = URL("$SERVER/api/pair").openConnection() as HttpURLConnection
+            c.connectTimeout = 3000; c.readTimeout = 8000; c.requestMethod = "POST"; c.doOutput = true
+            c.setRequestProperty("Content-Type", "application/json")
+            c.outputStream.use { it.write(JSONObject().put("key", key).toString().toByteArray(Charsets.UTF_8)) }
+            val ok = c.responseCode == 200
+            if (!ok) Log.w(TAG, "pairing refused: HTTP " + c.responseCode)
+            try { c.disconnect() } catch (e: Exception) { }
+            paired = ok
+            ok
+        } catch (e: Exception) { false }
+    }
+
+    /** Puts the key on a connection to the Forge server (also for the engine's and the vision model's own requests). */
+    fun authorize(c: HttpURLConnection) { if (key.isNotEmpty()) c.setRequestProperty("X-Forge-Key", key) }
+
+    /** A request the server refused for its key is sent once more after pairing (the server may have been reset). */
+    private inline fun <T> keyed(block: () -> T): T {
+        try { return block() } catch (e: ApiError) {
+            if (e.code != 401) throw e
+            paired = false
+            if (!ensurePaired()) throw ApiError("The Forge server does not know this app's key. If you reinstalled the app, run forge-ide pair-reset in the Linux terminal, then reopen Forge.", 401)
+            return block()
+        }
+    }
 
     /**
      * Fix: URLEncoder turns a space into "+", but the server decodes the header with urllib.parse.unquote, which
@@ -60,7 +128,9 @@ object Api {
         c.requestMethod = method
         c.useCaches = false
         c.setRequestProperty("Accept", "application/json")
-        if (folder.isNotEmpty()) c.setRequestProperty("X-Forge-Folder", encodeComponent(folder))
+        val f = currentFolder()
+        if (f.isNotEmpty()) c.setRequestProperty("X-Forge-Folder", encodeComponent(f))
+        authorize(c)
         return c
     }
 
@@ -123,41 +193,47 @@ object Api {
 
     /** GET with query parameters; runs on the calling (background) thread. */
     fun get(path: String, params: Map<String, String> = emptyMap(), timeoutMs: Int = 20000): JSONObject {
-        val q = params.entries.joinToString("&") { encodeComponent(it.key) + "=" + encodeComponent(it.value) }
-        val full = if (q.isEmpty()) path else path + (if (path.contains("?")) "&" else "?") + q
-        val c = open(full, "GET", timeoutMs)
-        return withConnection(c, path) { parse(c) }
+        return keyed {
+            val q = params.entries.joinToString("&") { encodeComponent(it.key) + "=" + encodeComponent(it.value) }
+            val full = if (q.isEmpty()) path else path + (if (path.contains("?")) "&" else "?") + q
+            val c = open(full, "GET", timeoutMs)
+            return withConnection(c, path) { parse(c) }
+        }
     }
 
     /** GET raw bytes (an image for the image viewer) with at most [cap] bytes; runs on the calling (background) thread. */
     fun bytes(path: String, params: Map<String, String> = emptyMap(), cap: Int = 40 * 1024 * 1024, timeoutMs: Int = 30000): ByteArray {
-        val q = params.entries.joinToString("&") { encodeComponent(it.key) + "=" + encodeComponent(it.value) }
-        val full = if (q.isEmpty()) path else path + (if (path.contains("?")) "&" else "?") + q
-        val c = open(full, "GET", timeoutMs)
-        try {
-            if (c.responseCode >= 400) throw ApiError(readBody(c, 4096).let { b -> try { JSONObject(b).optString("error", b) } catch (e: Exception) { b } }.ifEmpty { "HTTP " + c.responseCode }, c.responseCode)
-            val out = java.io.ByteArrayOutputStream()
-            c.inputStream.use { inp ->
-                val buf = ByteArray(65536)
-                while (true) {
-                    val n = inp.read(buf)
-                    if (n < 0) break
-                    if (out.size() + n > cap) throw ApiError("larger than " + (cap / (1024 * 1024)) + " MB")
-                    out.write(buf, 0, n)
+        return keyed {
+            val q = params.entries.joinToString("&") { encodeComponent(it.key) + "=" + encodeComponent(it.value) }
+            val full = if (q.isEmpty()) path else path + (if (path.contains("?")) "&" else "?") + q
+            val c = open(full, "GET", timeoutMs)
+            try {
+                if (c.responseCode >= 400) throw ApiError(readBody(c, 4096).let { b -> try { JSONObject(b).optString("error", b) } catch (e: Exception) { b } }.ifEmpty { "HTTP " + c.responseCode }, c.responseCode)
+                val out = java.io.ByteArrayOutputStream()
+                c.inputStream.use { inp ->
+                    val buf = ByteArray(65536)
+                    while (true) {
+                        val n = inp.read(buf)
+                        if (n < 0) break
+                        if (out.size() + n > cap) throw ApiError("larger than " + (cap / (1024 * 1024)) + " MB")
+                        out.write(buf, 0, n)
+                    }
                 }
-            }
-            return out.toByteArray()
-        } finally { try { c.disconnect() } catch (e: Exception) { } }
+                return out.toByteArray()
+            } finally { try { c.disconnect() } catch (e: Exception) { } }
+        }
     }
 
     /** POST a JSON body; runs on the calling (background) thread. */
     fun post(path: String, body: JSONObject, timeoutMs: Int = 60000): JSONObject {
-        val c = open(path, "POST", timeoutMs)
-        c.doOutput = true
-        c.setRequestProperty("Content-Type", "application/json")
-        return withConnection(c, path) {
-            c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-            parse(c)
+        return keyed {
+            val c = open(path, "POST", timeoutMs)
+            c.doOutput = true
+            c.setRequestProperty("Content-Type", "application/json")
+            return withConnection(c, path) {
+                c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                parse(c)
+            }
         }
     }
 
@@ -167,9 +243,13 @@ object Api {
      * thread without ever calling done, so a panel could wait forever; it is now reported like an exception.
      */
     fun <T> async(name: String, work: () -> T, done: (T?, Exception?) -> Unit) {
+        // The folder is taken when the work is asked for, so a request started by one window never carries the folder
+        // of a window that came to the front while it waited.
+        val f = currentFolder()
         val t = Thread({
             var result: T? = null
             var error: Exception? = null
+            threadFolder.set(f)
             try { result = work() }
             catch (e: Exception) { error = e; Log.w(TAG, "$name failed: $e") }
             catch (e: Error) { error = ApiError("$name failed: $e"); Log.w(TAG, "$name failed: $e") }
@@ -183,7 +263,10 @@ object Api {
         return try {
             val c = open("/api/status", "GET", 2500)
             c.connectTimeout = 1500
-            try { c.responseCode == 200 } finally { c.disconnect() }
+            val code = try { c.responseCode } finally { c.disconnect() }
+            // A server that does not know this app's key yet (a new install, a reset) learns it now.
+            if (code == 401) { paired = false; if (ensurePaired()) return serverUp() }
+            code == 200
         } catch (e: Exception) { false }
     }
 
@@ -210,6 +293,8 @@ object Api {
      *  - Several "data:" lines of one event are joined with a newline, as the event stream format requires.
      */
     class EventStream(private val runId: String, private val onEvent: (JSONObject) -> Unit) {
+        /** The folder of the window that started the stream; a resumed connection carries the same one. */
+        private val folderAtStart = currentFolder()
         private val stopped = AtomicBoolean(false)
         private val finished = AtomicBoolean(false)
         @Volatile private var conn: HttpURLConnection? = null
@@ -218,7 +303,7 @@ object Api {
         private val resumeDelaysMs = longArrayOf(500, 1500, 3000, 5000)
 
         fun start() {
-            val t = Thread({ runReader() }, "forge-events")
+            val t = Thread({ threadFolder.set(folderAtStart); runReader() }, "forge-events")
             t.isDaemon = true
             t.start()
         }
@@ -232,7 +317,8 @@ object Api {
                     Outcome.ENDED -> break
                     Outcome.DROPPED, Outcome.NOT_FOUND -> {
                         if (outcome == Outcome.NOT_FOUND || attempt >= resumeDelaysMs.size) {
-                            deliverOnce(JSONObject().put("type", "error")
+                            // "lost": the stream ends here without an "end" event, so a consumer can finish what it waits for.
+                            deliverOnce(JSONObject().put("type", "error").put("lost", true)
                                 .put("message", if (outcome == Outcome.NOT_FOUND) "The Forge server no longer knows this run (it was probably restarted)."
                                                 else "Connection to the Forge server was lost and could not be resumed."))
                             break
@@ -364,8 +450,10 @@ object Api {
                 s.soTimeout = 90000
                 socket = s
                 val key = Base64.encodeToString(Random.nextBytes(16), Base64.NO_WRAP)
+                ensurePaired()
                 val req = "GET $path HTTP/1.1\r\nHost: ${url.host}:$port\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
-                    "Sec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                    "Sec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\n" +
+                    (if (Api.key.isNotEmpty()) "X-Forge-Key: ${Api.key}\r\n" else "") + "\r\n"
                 val o = s.getOutputStream()
                 o.write(req.toByteArray(Charsets.ISO_8859_1)); o.flush()
                 val inp = DataInputStream(s.getInputStream())

@@ -17,9 +17,9 @@ import socket
 import subprocess
 import threading
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
-from .devices import FORGE_PORT, adb
+from .devices import FORGE_PORT, NATIVE_PROFILE, PROFILES, adb
 
 HOME = os.path.expanduser("~")
 ARM_DIR = os.path.join(HOME, ".forge-ide", "vd", "arm")
@@ -173,20 +173,49 @@ def monitor(d: dict, commands: List[str], wait: float = 0.6) -> str:
     return out.decode(errors="replace")
 
 
-def screenshot(d: dict, path: str) -> bool:
-    """The emulated screen as a PNG, through QEMU (works before Android's adb is up)."""
+def screenshot(d: dict, path: str) -> Tuple[bool, str]:
+    """The emulated screen as a PNG, through QEMU (works before Android's adb is up). Returns (done, why not). The
+    picture file keeps its name, so a picture QEMU did not write anew is never passed off as the current one."""
     ppm = path[:-4] + ".ppm" if path.endswith(".png") else path + ".ppm"
-    monitor(d, [f"screendump {ppm}"], wait=1.2)
+    t0 = time.time()
+    out = monitor(d, [f"screendump {ppm}"], wait=1.2)
+    if out.startswith("monitor error"):
+        return False, f"The emulated machine did not answer, so it is not running or is still starting ({out})."
     try:
+        if os.path.getmtime(ppm) < t0 - 1:
+            return False, "QEMU did not write a new picture of the emulated screen."
         from PIL import Image
-        Image.open(ppm).save(path)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+        with Image.open(ppm) as im:
+            im.save(path)
+        return True, ""
+    except Exception as e:  # noqa: BLE001
+        return False, f"The picture of the emulated screen could not be read: {e}"
 
 
-QEMU_KEYS = {"back": "esc", "home": "home", "recents": "f3", "enter": "ret", "backspace": "backspace", "tab": "tab",
-             "up": "up", "down": "down", "left": "left", "right": "right", "space": "spc", "escape": "esc"}
+def screen_png(d: dict) -> Tuple[Optional[bytes], str]:
+    """The emulated screen as PNG bytes through QEMU, for the device window and the chat while adb is not up.
+    Returns (picture, why not)."""
+    shot = os.path.join(_dev_dir(d), "screen.png")
+    done, why = screenshot(d, shot)
+    if not done:
+        return None, why
+    try:
+        with open(shot, "rb") as fh:
+            return fh.read(40_000_000), ""
+    except OSError as e:
+        return None, f"The picture of the emulated screen could not be read: {e}"
+
+
+# Keys the device window sends, as QEMU's key names (the emulated USB keyboard). "delete" is Backspace.
+QEMU_KEYS = {"back": "esc", "home": "home", "recents": "f3", "enter": "ret", "backspace": "backspace", "delete": "backspace",
+             "tab": "tab", "up": "up", "down": "down", "left": "left", "right": "right", "space": "spc", "escape": "esc"}
+# Characters as keys of a US keyboard (Android's default layout for a keyboard it does not know), for typed text.
+QEMU_CHARS = {" ": "spc", "\n": "ret", "\t": "tab", "-": "minus", "=": "equal", "[": "bracket_left", "]": "bracket_right",
+              ";": "semicolon", "'": "apostrophe", "`": "grave_accent", "\\": "backslash", ",": "comma", ".": "dot", "/": "slash",
+              "_": "shift-minus", "+": "shift-equal", "{": "shift-bracket_left", "}": "shift-bracket_right", ":": "shift-semicolon",
+              '"': "shift-apostrophe", "~": "shift-grave_accent", "|": "shift-backslash", "<": "shift-comma", ">": "shift-dot",
+              "?": "shift-slash", "!": "shift-1", "@": "shift-2", "#": "shift-3", "$": "shift-4", "%": "shift-5", "^": "shift-6",
+              "&": "shift-7", "*": "shift-8", "(": "shift-9", ")": "shift-0"}
 
 
 def send_input(d: dict, kind: str, a: dict) -> dict:
@@ -217,18 +246,23 @@ def send_input(d: dict, kind: str, a: dict) -> dict:
             return {"ok": False, "message": "That key is not available through the emulator before adb is up."}
         cmds = [f"sendkey {k}"]
     elif kind == "text":
-        cmds = []
+        cmds, missing = [], []
         for ch in str(a.get("text", ""))[:200]:
-            if ch.isalnum():
+            if ch.isascii() and ch.isalnum():
                 cmds.append("sendkey " + (("shift-" + ch.lower()) if ch.isupper() else ch))
-            elif ch == " ":
-                cmds.append("sendkey spc")
-            elif ch == "\n":
-                cmds.append("sendkey ret")
+            elif ch in QEMU_CHARS:
+                cmds.append("sendkey " + QEMU_CHARS[ch])
+            elif ch not in missing:
+                missing.append(ch)
+        if missing:
+            return {"ok": False, "message": "Until adb is up, text reaches the emulated device as keys of a US keyboard, and "
+                                            "these characters have none: " + " ".join(missing[:10]) + ". Nothing was typed."}
     else:
         return {"ok": False, "message": "Unknown input."}
     out = monitor(d, cmds, wait=0.25 if kind != "long" else 0.7)
-    return {"ok": "error" not in out.lower(), "message": ""}
+    if out.startswith("monitor error"):
+        return {"ok": False, "message": f"The emulated machine did not answer ({out})."}
+    return {"ok": "error" not in out.lower(), "message": "" if "error" not in out.lower() else out.strip()[-200:]}
 
 
 def running(d: dict) -> bool:
@@ -290,7 +324,66 @@ def start(d: dict, set_phase: Callable[[str, str], None], on_ready: Optional[Cal
             return {"ok": False, "message": f"QEMU did not start: {e}"}
     set_phase("booting", "ARM emulation: starting the virtual machine")
     threading.Thread(target=_boot, args=(d, set_phase, on_ready), name="arm-boot", daemon=True).start()
-    return {"ok": True, "message": f"Starting {d['name']} under ARM emulation. The first screen takes 15 to 30 minutes."}
+    return {"ok": True, "started": True, "scope": scope_unit(d),
+            "message": f"Starting {d['name']} under ARM emulation. The first screen takes 15 minutes to an hour."}
+
+
+def scope_unit(d: dict) -> str:
+    """The systemd scope QEMU runs in (its memory cap and CPU quota); the device watchdog watches and stops it."""
+    return f"forge-arm-{d['id']}.scope"
+
+
+def apply_look(d: dict, serial: str) -> str:
+    """The device's screen profile (its type's, or the one chosen in the device window), dark theme, text size and
+    rotation, applied over adb once Android has started, the way devices.set_look applies them live. The definition
+    is read again first, so a change made in the device window while the device was starting is used. The makers'
+    systems are slow to settle after the boot, so the profile is checked and sent again up to three times.
+    Returns "" or what did not take effect."""
+    from . import vdevice   # vdevice imports this module
+    cur = vdevice.get(d["id"]) or d
+    look = dict(cur.get("look") or {})
+    key = look.get("profile") or vdevice.TYPES.get(cur.get("type", ""), "")
+    prof = PROFILES.get(key)
+    cmds: List[str] = []
+    want = ""
+    if key == NATIVE_PROFILE:
+        cmds += ["wm size reset", "wm density reset"]
+    elif prof:
+        cmds += [f"wm size {prof[1]}x{prof[2]}", f"wm density {prof[3]}"]
+        want = f"Override size: {prof[1]}x{prof[2]}"
+    if "dark" in look:
+        cmds.append("cmd uimode night " + ("yes" if look["dark"] else "no"))
+    if look.get("font_scale"):
+        cmds.append(f"settings put system font_scale {float(look['font_scale']):g}")
+    if "rotation" in look:
+        cmds += ["settings put system accelerometer_rotation 0", f"settings put system user_rotation {int(look['rotation']) % 4}"]
+    if not cmds:
+        return ""
+    last = ""
+    for attempt in range(3):
+        if not running(d):
+            return "The device stopped before its screen profile was applied."
+        rc, out, err = adb(["shell", "; ".join(cmds)], serial=serial, port=FORGE_PORT, timeout=120)
+        last = (out or err or "").strip()[-160:]
+        if rc == 0 and not want:
+            return ""
+        if rc == 0:
+            rc2, size, _ = adb(["shell", "wm size"], serial=serial, port=FORGE_PORT, timeout=60)
+            if rc2 == 0 and want in (size or ""):
+                return ""
+            last = (size or "").strip()[-160:]
+        time.sleep(20)
+    label = prof[0] if prof else key
+    return f"The screen profile {label} did not take effect" + (f" (Android said: {last})" if last else "") + "; choose it again in the device window."
+
+
+def _ready(d: dict, serial: str, t0: float, set_phase: Callable[[str, str], None], on_ready: Optional[Callable[[dict], None]]) -> None:
+    """Android has started: the saved look goes on, then the device is ready (and becomes the target)."""
+    set_phase("booting", "Applying the screen profile, dark theme and text size")
+    problem = apply_look(d, serial)
+    set_phase("ready", f"Ready after {int((time.time() - t0) / 60)} minutes (emulated ARM; expect a slow screen)" + (f". {problem}" if problem else ""))
+    if on_ready:
+        on_ready(d)
 
 
 def _reconnect(serial: str) -> None:
@@ -370,9 +463,7 @@ def _boot(d: dict, set_phase: Callable[[str, str], None], on_ready: Optional[Cal
         _connect_once(serial)
         rc, out, _ = adb(["shell", "getprop sys.boot_completed"], serial=serial, port=FORGE_PORT, timeout=8)
         if rc == 0 and (out or "").strip() == "1":
-            set_phase("ready", f"Ready after {mins} minutes (emulated ARM; expect a slow screen)")
-            if on_ready:
-                on_ready(d)
+            _ready(d, serial, t0, set_phase, on_ready)
             return
         time.sleep(10)
     # Slow images take longer; the device keeps running and is checked every half minute until it stops.
@@ -381,9 +472,7 @@ def _boot(d: dict, set_phase: Callable[[str, str], None], on_ready: Optional[Cal
         _connect_once(serial)
         rc, out, _ = adb(["shell", "getprop sys.boot_completed"], serial=serial, port=FORGE_PORT, timeout=8)
         if rc == 0 and (out or "").strip() == "1":
-            set_phase("ready", f"Ready after {int((time.time() - t0) / 60)} minutes (emulated ARM; expect a slow screen)")
-            if on_ready:
-                on_ready(d)
+            _ready(d, serial, t0, set_phase, on_ready)
             return
         time.sleep(30)
     set_phase("failed", "The emulated machine stopped while starting. Its serial log is in " + _dev_dir(d))

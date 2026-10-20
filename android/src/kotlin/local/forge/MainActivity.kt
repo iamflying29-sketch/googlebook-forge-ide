@@ -36,6 +36,10 @@ class MainActivity : Activity() {
     companion object {
         /** Forge windows open now (test windows are not counted); closing the last one quits Forge. */
         @Volatile var liveWindows = 0
+        /** Every Forge window that exists now, test windows included (to know which folders still have a window). */
+        val windows = ArrayList<MainActivity>()
+        /** Settings' "Show the keyboard shortcuts": the window shows them when it comes back to the front. */
+        @Volatile var showShortcutsNext = false
         /** Set once Forge is quitting, so the windows that close on the way do not start a second quit. */
         @Volatile var quitting = false
 
@@ -62,7 +66,7 @@ class MainActivity : Activity() {
             }
         }
 
-        const val VERSION = "4.0"
+        const val VERSION = "4.1"
         private const val TAG = "Forge"
         private const val TERMINAL_PACKAGE = "com.android.virtualization.terminal"
         private const val PROBE_MS = 3000L
@@ -89,7 +93,7 @@ class MainActivity : Activity() {
     private lateinit var waiting: LinearLayout
     private lateinit var waitingText: TextView
     private lateinit var chat: ChatPanel
-    private lateinit var editor: EditorPanel
+    lateinit var editor: EditorPanel; private set
     private lateinit var terminal: TerminalTabs
     private lateinit var logcat: LogcatPanel
     private lateinit var debugConsole: DebugConsolePanel
@@ -127,14 +131,22 @@ class MainActivity : Activity() {
     private var voice: Voice? = null
     private var dictateInto: EditText? = null
     private var afterMic: Runnable? = null
-    private val probeTask = Runnable { connect() }
-    private val statusTask = object : Runnable { override fun run() { refreshStatus(); Api.main.postDelayed(this, STATUS_MS) } }
-    private val indexTask = object : Runnable { override fun run() { refreshIndex(this) } }
+    private val probeTask = Runnable { Api.withFolder(myFolder) { connect() } }
+    private val statusTask = object : Runnable { override fun run() { Api.withFolder(myFolder) { refreshStatus() }; Api.main.postDelayed(this, STATUS_MS) } }
+    private val indexTask = object : Runnable { override fun run() { Api.withFolder(myFolder) { refreshIndex(this) } } }
+
+    /** The folder this window shows (the folder of the window in front while this one has none yet). */
+    fun windowFolder(): String = myFolder.ifEmpty { Api.folder }
+
+    /** True for the self-closing test windows (snapshot_only); they never write the window state of a folder. */
+    val testWindow: Boolean get() = intent?.getBooleanExtra("snapshot_only", false) == true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Api.init(this)
         Ui.loadTheme(this)
         if (intent?.getBooleanExtra("snapshot_only", false) != true) { counted = true; liveWindows++ }
+        windows.add(this)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setBackgroundDrawable(ColorDrawable(Ui.bg))
         val p = intent?.getStringExtra("path")
@@ -179,6 +191,8 @@ class MainActivity : Activity() {
                 when {
                     step.startsWith("palette:") -> { openPalette(step.removePrefix("palette:")); Api.main.postDelayed({ snapshotView = palette.lastView }, 1500) }
                     step.startsWith("search:") -> showSearch(step.removePrefix("search:"))
+                    // search-rep:<query>|<files to include>|<replacement>
+                    step.startsWith("search-rep:") -> step.removePrefix("search-rep:").split('|').let { a -> showSearch(); searchPanel.testSearch(a[0], a.getOrElse(1) { "" }, a.getOrElse(2) { "" }) }
                     step == "split" -> editor.toggleSplit()
                     step == "preview" -> editor.togglePreview()
                     step == "reviewdemo" -> {
@@ -201,12 +215,18 @@ class MainActivity : Activity() {
                     step == "close-side" -> closeSide()
                     step.startsWith("panel:") -> { if (!bottomShown) toggleBottomPanel(); selectPanel(step.removePrefix("panel:").toIntOrNull() ?: 0) }
                     step.startsWith("open:") -> editor.openFile(step.removePrefix("open:"))
+                    // open-json:<path>: a file as plain text, as a notebook's "{ } JSON" button opens it
+                    step.startsWith("open-json:") -> editor.openAsText(step.removePrefix("open-json:"))
                     step == "chat:history" -> openChatHistory()
                     // Chat steps for pictures of a running reply: a new chat, a question, text left in the box, Stop.
                     step == "chat:new" -> chat.newChatTab()
                     step.startsWith("chat:ask:") -> chat.quickAsk(step.removePrefix("chat:ask:"), "ask")
                     step.startsWith("chat:type:") -> chat.typeForTest(step.removePrefix("chat:type:"))
+                    step.startsWith("chat:append:") -> chat.appendForTest(step.removePrefix("chat:append:"))
+                    // chat:tab:<n>: shows the chat tab at that position (0 is the first), as a click on its tab does
+                    step.startsWith("chat:tab:") -> chat.switchTabForTest(step.removePrefix("chat:tab:").toIntOrNull() ?: 0)
                     step == "chat:stop" -> chat.stopForTest()
+                    step == "chat:select" -> chat.selectInLastMessageForTest()
                     step == "quit" -> doQuit()
                     // Key presses inside a test window, for pictures of the key bindings: "key:Ctrl+K Ctrl+0".
                     step.startsWith("key:") -> for (k in step.removePrefix("key:").split(' ')) testKey(k)
@@ -214,6 +234,10 @@ class MainActivity : Activity() {
                     step.startsWith("reload:") -> { intent?.putExtra("snapshot", step.removePrefix("reload:").replace('+', ',')); intent?.putExtra("path", myFolder); recreate() }
                     step == "explorer" -> toggleExplorer()
                     step == "settings" -> startActivity(Intent(this, SettingsActivity::class.java).putExtra("snapshot", "settings"))
+                    // settings-at:<section>: Settings opened at a section, as Ctrl Shift J and Edit modes open it
+                    step.startsWith("settings-at:") -> step.removePrefix("settings-at:").let { sec -> startActivity(Intent(this, SettingsActivity::class.java).putExtra("section", sec).putExtra("snapshot", "settings-$sec")) }
+                    // folder:<path>: Open folder in this window (the window is built again for that folder)
+                    step.startsWith("folder:") -> goToFolder(step.removePrefix("folder:"))
                 }
             }, finished = {
                 // A window opened only for pictures closes itself and leaves nothing in Recents.
@@ -240,7 +264,7 @@ class MainActivity : Activity() {
             onFolder = { openFolderDialog() },
             onSearch = { editor.quickOpen() },
             onTerminal = { toggleTerminal() },
-            onChat = { toggleChat() },
+            onChat = { if (agentLayout) toggleAgentLayout() else toggleChat() },
             onNewWindow = { newWindow() },
             onSettings = { openSettings() },
             onQuit = { quitForge() })
@@ -259,19 +283,20 @@ class MainActivity : Activity() {
         // The activity bar on the left.
         activityBar = Chrome.activityBar(this, listOf(
             Chrome.ActivityItem("explorer", R.drawable.ic_files, "Explorer (Ctrl B)", { toggleExplorer() }),
-            Chrome.ActivityItem("search", R.drawable.ic_search, "Search (Ctrl Shift F)", { showSideById("search") }),
-            Chrome.ActivityItem("git", R.drawable.ic_source_control, "Source control", { showSideById("git") }),
-            Chrome.ActivityItem("debug", R.drawable.ic_run, "Run and debug", { showSideById("debug") }),
-            Chrome.ActivityItem("android", R.drawable.ic_android, "Android and toolchains", { showSideById("android") }),
-            Chrome.ActivityItem("review", R.drawable.ic_review, "AI changes (review)", { showSideById("review") }),
-            Chrome.ActivityItem("notepads", R.drawable.ic_notes, "Notepads", { showSideById("notepads") }),
-            Chrome.ActivityItem("docs", R.drawable.ic_docs, "Documentation", { showSideById("docs") }),
-            Chrome.ActivityItem("history", R.drawable.ic_history, "Chat history", { showSideById("history") }),
+            Chrome.ActivityItem("search", R.drawable.ic_search, "Search (Ctrl Shift F)", { showSideById("search", toggle = true) }),
+            Chrome.ActivityItem("git", R.drawable.ic_source_control, "Source control", { showSideById("git", toggle = true) }),
+            Chrome.ActivityItem("debug", R.drawable.ic_run, "Run and debug", { showSideById("debug", toggle = true) }),
+            Chrome.ActivityItem("android", R.drawable.ic_android, "Android and toolchains", { showSideById("android", toggle = true) }),
+            Chrome.ActivityItem("review", R.drawable.ic_review, "AI changes (review)", { showSideById("review", toggle = true) }),
+            Chrome.ActivityItem("notepads", R.drawable.ic_notes, "Notepads", { showSideById("notepads", toggle = true) }),
+            Chrome.ActivityItem("memories", R.drawable.ic_bulb, "Memories (global and this project)", { showSideById("memories", toggle = true) }),
+            Chrome.ActivityItem("docs", R.drawable.ic_docs, "Documentation", { showSideById("docs", toggle = true) }),
+            Chrome.ActivityItem("history", R.drawable.ic_history, "Chat history", { showSideById("history", toggle = true) }),
             Chrome.ActivityItem("settings", R.drawable.ic_settings, "Settings (Ctrl ,)", { openSettings() }, bottom = true),
         ))
         activityBar.setActive("explorer")
 
-        // The side host shows the placeholder panels next to the activity bar; the explorer itself lives in the editor panel.
+        // The side host shows the side views (search, source control, debug and the rest) next to the activity bar; the explorer itself lives in the editor panel.
         sideHost = FrameLayout(this)
         sideHost.setBackgroundColor(Ui.panel)
         sideHost.visibility = View.GONE
@@ -298,7 +323,7 @@ class MainActivity : Activity() {
         ide.addView(body, Ui.lp(Ui.match, 0, 1f))
 
         ide.addView(Ui.divider(this, false))
-        statusBar = Chrome.statusBar(this) { openSettings() }
+        statusBar = Chrome.statusBar(this) { openSettingsAt("index") }
         statusBar.right.text = "Forge $VERSION"
         branchItem = statusBar.addItem(this, R.drawable.ic_source_control, "Source control", left = true) { showSideById("git") }
         branchItem.first.visibility = View.GONE
@@ -317,10 +342,13 @@ class MainActivity : Activity() {
         tabItem = statusBar.addItem(this, R.drawable.ic_sparkle, "AI Tab completions: click to turn them on or off (Alt \\ asks at once)") { toggleTabCompletions() }
         posItem.first.visibility = View.GONE; langItem.first.visibility = View.GONE
         ide.addView(statusBar.view)
-        ForgeSettings.onChange {
-            refreshTabItem()
-            editor.settingsChanged()
-            terminal.setFontSize(ForgeSettings.int("font_size", 13).coerceIn(8, 32) * 12.5f / 13f)
+        settingsListener = ForgeSettings.onChange { f ->
+            if (f == windowFolder()) Api.withFolder(f) {
+                refreshTabItem()
+                editor.settingsChanged()
+                terminal.setFontSize(ForgeSettings.int("font_size", 13).coerceIn(8, 32) * 12.5f / 13f)
+                askFolderTrust(f)
+            }
         }
         refreshTabItem()
     }
@@ -345,7 +373,7 @@ class MainActivity : Activity() {
         panelViews.add(logcat.view)
         for ((i, v) in panelViews.withIndex()) { content.addView(v, FrameLayout.LayoutParams(Ui.match, Ui.match)); v.visibility = if (i == 0) View.VISIBLE else View.GONE }
         panelTabs = Chrome.panelTabs(this, listOf("Terminal", "Agent log", "Problems", "Debug console", "Logcat")) { i -> selectPanel(i) }
-        panelTabs.actions.addView(Ui.miniButton(this, R.drawable.ic_maximize, "Maximize the panel") { maximizeBottom() })
+        panelTabs.actions.addView(Ui.miniButton(this, R.drawable.ic_maximize, "Maximize the panel (press again to restore it)") { maximizeBottom() })
         panelTabs.actions.addView(Ui.miniButton(this, R.drawable.ic_close, "Close the panel (Ctrl J)") { toggleBottomPanel() })
         col.addView(panelTabs.view)
         col.addView(Ui.divider(this, false))
@@ -396,6 +424,9 @@ class MainActivity : Activity() {
         Ui.setActive(topBar.terminalButton, bottomShown)
     }
 
+    /** Shows the AI panel when it is hidden (dictation and other routes that put text into the chat's input). */
+    fun ensureChatShown() { if (!chatShown) toggleChat() }
+
     fun toggleChat() {
         chatShown = !chatShown
         chat.view.visibility = if (chatShown) View.VISIBLE else View.GONE
@@ -404,7 +435,26 @@ class MainActivity : Activity() {
     }
 
     /** Shows or hides the Explorer tree, which is the first part of the editor panel's view. */
+    /** What the side bar showed before Ctrl B hid it: the side view (or null for the Explorer) and the Explorer flag. */
+    private var sideBarHidden: Pair<String?, Boolean>? = null
+
+    /** Ctrl B, as in Cursor: the whole side bar hides, whatever view it shows, and comes back with that view. */
+    private fun toggleSideBar() {
+        val hidden = sideBarHidden
+        if (hidden == null && (sideView != null || explorerShown)) {
+            sideBarHidden = Pair(sideView, explorerShown)
+            explorerShown = false
+            if (sideView != null) closeSide() else { setExplorerVisible(false); activityBar.setActive(null) }
+        } else {
+            sideBarHidden = null
+            explorerShown = hidden?.second ?: true
+            val s = hidden?.first
+            if (s != null) showSideById(s) else { setExplorerVisible(explorerShown); activityBar.setActive(if (explorerShown) "explorer" else null) }
+        }
+    }
+
     private fun toggleExplorer() {
+        sideBarHidden = null
         if (sideView != null) { explorerShown = true; closeSide(); return }
         explorerShown = !explorerShown
         setExplorerVisible(explorerShown)
@@ -419,10 +469,11 @@ class MainActivity : Activity() {
     }
 
     /** The debugger and the Android view keep state (a session, device polling), so they live as long as the window. */
-    val debugPanel: DebugPanel by lazy { DebugPanel(this, this) }
+    val debugPanel: DebugPanel by lazy { DebugPanel(this, this).also { d -> d.saveBeforeRun = { done -> editor.saveAll(done) }; d.runTask = { command, label, done -> showTerminal(); terminal.runTask(command, label, "", done) } } }
     val androidPanel: AndroidPanel by lazy {
         AndroidPanel(this, this).also { a ->
             a.runInTerminal = { command, label -> showTerminal(); terminal.runCommand(command, label) }
+            a.runTask = { command, label, done -> showTerminal(); terminal.runTask(command, label, "", done) }
             a.attachToChat = { record -> addToChat(record) }
             a.attachDebugger = { appId -> showSideById("debug"); debugPanel.attachAndroid(appId) }
             a.openLogcat = { appId -> if (!bottomShown) toggleBottomPanel(); selectPanel(4); logcat.openFor(appId) }
@@ -430,21 +481,36 @@ class MainActivity : Activity() {
     }
 
     /** The side views by their activity bar id. */
-    private fun showSideById(id: String) {
+    /** Shows a side view. [toggle] (the activity bar's icons): a second press closes it. Commands, keys and links only
+     *  ever show it, as Cursor's Show commands do. */
+    private fun showSideById(id: String, toggle: Boolean = false) {
+        if (sideView == id && !toggle) return
         when (id) {
             "git" -> showSide(id) { GitPanel(this, this).view }
             "debug" -> showSide(id) { debugPanel.view }
             "android" -> showSide(id) { androidPanel.view }
             "review" -> showSide(id) { ReviewPanel(this, this).view }
             "notepads" -> showSide(id) { NotepadsPanel(this, this).view }
+            "memories" -> showSide(id) { MemoriesPanel(this, this).view }
             "docs" -> showSide(id) { DocsPanel(this, this).view }
             "history" -> showSide(id) { HistoryPanel(this, this).view }
             "search" -> showSide(id) { searchPanel.view }
+            "extensions" -> showSide(id) { ExtensionsPanel(this, this).view }
         }
     }
 
+    /** The AI changes view kept part of an agent change: the editor's inline review follows. */
+    fun reviewBaseChanged(path: String, base: String) = editor.setReviewBase(path, base)
+
+    /** Opens a file as plain text even when it has its own view (a notebook's JSON). */
+    fun openFileAsText(path: String) = editor.openAsText(path)
+
+    /** The Android and toolchains view (the Extensions view links to it). */
+    fun showAndroidView() = showSideById("android")
+
     /** Shows one side view next to the activity bar; pressing its icon again closes it. */
     private fun showSide(id: String, make: () -> View) {
+        sideBarHidden = null
         if (sideView == id) { closeSide(); return }
         if (sideView == "android") androidPanel.onHidden()
         sideView = id
@@ -577,7 +643,7 @@ class MainActivity : Activity() {
         posItem.second.text = "Ln " + (line + 1) + ", Col " + (col + 1) + (if (sel > 0) "  ($sel selected)" else "")
         posItem.first.visibility = View.VISIBLE
         val lang = ed.lang.id
-        val client = Lsp.serverFor(path)?.let { Lsp.status().firstOrNull { s -> s.startsWith(it.first + ":") } }
+        val client = Lsp.serverFor(path)?.let { Lsp.status(windowFolder()).firstOrNull { s -> s.startsWith(it.first + ":") } }
         langItem.second.text = lang + (if (client != null) "  ·  " + (if (client.contains("ready")) "LSP" else "LSP starting") else "")
         langItem.first.visibility = View.VISIBLE
     }
@@ -644,16 +710,36 @@ class MainActivity : Activity() {
 
     fun setTabStatus(s: String?) { tabStatus = s; refreshTabItem() }
 
+    private var settingsListener: ((String) -> Unit)? = null
+    private val trustAsked = HashSet<String>()
+
+    /**
+     * Folder trust, as in Cursor and VS Code: a folder's own .forge settings and hooks that would loosen safety (Auto-run,
+     * allowed commands, a protection turned off, hooks) are ignored until you trust the folder. Asked once per window and
+     * folder; Settings, Folder has the same choice later.
+     */
+    private fun askFolderTrust(f: String) {
+        val wants = ForgeSettings.heldBack(f)
+        if (wants.isEmpty() || f in trustAsked) return
+        trustAsked.add(f)
+        val name = f.trimEnd('/').substringAfterLast('/')
+        AlertDialog.Builder(this).setTitle("Trust the folder $name?")
+            .setMessage("This folder's own Forge settings or hooks would:\n\n" + wants.joinToString("\n") { "• $it" } +
+                "\n\nForge ignores these until you trust the folder. Trust it only if you trust where its files came from.")
+            .setPositiveButton("Trust this folder") { _, _ -> ForgeSettings.trust(f, true) { ok, err -> flashStatus(if (ok) "This folder is trusted. Its settings and hooks apply." else "Not changed: $err") } }
+            .setNegativeButton("Not now", null).show()
+    }
+
     private fun refreshTabItem() {
         if (!::tabItem.isInitialized) return
-        val on = ForgeSettings.bool("tab_completions", false)
+        val on = ForgeSettings.bool("tab_completions", false, windowFolder())
         tabItem.second.text = tabStatus ?: (if (on) "Tab" else "Tab off")
         tabItem.second.setTextColor(if (tabStatus != null) Ui.accent2 else if (on) Ui.fg2 else Ui.fg3)
     }
 
     private fun toggleTabCompletions() {
-        val on = !ForgeSettings.bool("tab_completions", false)
-        ForgeSettings.set("tab_completions", on) { ok, err ->
+        val on = !ForgeSettings.bool("tab_completions", false, windowFolder())
+        ForgeSettings.set("tab_completions", on, windowFolder()) { ok, err ->
             flashStatus(if (!ok) "Not saved: $err" else if (on) "AI Tab completions are on: pause while typing to see a suggestion, Tab inserts it." else "AI Tab completions are off. Alt \\ still asks for one.")
             refreshTabItem()
         }
@@ -715,14 +801,25 @@ class MainActivity : Activity() {
     private fun showLspMenu(anchor: View) {
         val path = editor.activePath()
         val menu = android.widget.PopupMenu(this, anchor)
-        val status = Lsp.status()
+        val folder = windowFolder()
+        val status = Lsp.status(folder)
         menu.menu.add(if (status.isEmpty()) "No language server is running" else "Running: " + status.joinToString(", ")).isEnabled = false
         val restart = if (path.isNotEmpty() && Lsp.serverFor(path) != null) menu.menu.add("Restart the language server of this file") else null
-        val toggle = menu.menu.add(if (Lsp.enabled) "Turn the language servers off" else "Turn the language servers on")
+        val wasOn = Lsp.enabled(folder)
+        val toggle = menu.menu.add(if (wasOn) "Turn the language servers off" else "Turn the language servers on")
         menu.setOnMenuItemClickListener { item ->
             when {
-                item === restart -> { Lsp.restart(path); val t = editor.textOf(path); if (t != null) Lsp.open(path, t); flashStatus("Restarting the language server for " + path.substringAfterLast('/')) }
-                item === toggle -> ForgeSettings.set("lsp", !Lsp.enabled) { ok, _ -> if (ok) { if (!Lsp.enabled) Lsp.shutdownAll(); flashStatus(if (Lsp.enabled) "Language servers on. They start when you open a file." else "Language servers off.") } }
+                item === restart -> restartLanguageServer(path)
+                item === toggle -> {
+                    val on = !wasOn
+                    ForgeSettings.set("lsp", on, folder) { ok, err ->
+                        if (!ok) { flashStatus("Not changed: $err"); return@set }
+                        // Turning them off stops the running servers (ForgeSettings does that); turning them on starts
+                        // the servers of the files that are open now.
+                        if (on) for (p in editor.openPaths()) editor.textOf(p)?.let { Lsp.open(p, it, folder) }
+                        flashStatus(if (on) "Language servers on for this folder." else "Language servers off for this folder. The running ones were stopped.")
+                    }
+                }
             }
             true
         }
@@ -760,13 +857,14 @@ class MainActivity : Activity() {
             C("Quit Forge", "Ctrl Q") { quitForge() },
             C("File: Exit", "Ctrl Q") { quitForge() },
             C("Open a path anywhere on this computer") { openPalette("/") },
-            C("Add a folder to this window (several folders in one window)") { openFolderDialog() },
+            C("Add a folder to this window (several folders in one window)") { FolderDialog.show(this, onOpen = { path -> addRoot(path) }, onNewWindow = { path -> newWindow(path) }, onAdd = { path -> addRoot(path) }, addMode = true) },
             C("New file") { editor.newFileAt("") },
             C("Save", "Ctrl S") { editor.saveActive() },
             C("Save all", "Ctrl K, S") { editor.saveAll(null) },
             C("Close the editor tab", "Ctrl W") { editor.closeActive() },
             C("Split the editor", "Ctrl \\") { editor.toggleSplit() },
-            C("Markdown: open the preview to the side", "Ctrl Shift V") { editor.togglePreview() },
+            C("Markdown: open the preview to the side", "Ctrl K V") { editor.openPreview() },
+            C("Markdown: toggle the preview", "Ctrl Shift V") { editor.togglePreview() },
             C("Go to a file", "Ctrl P") { openPalette("") },
             C("Go to a line", "Ctrl G") { openPalette(":") },
             C("Go to a symbol in the file", "Ctrl Shift O") { openPalette("@") },
@@ -790,7 +888,8 @@ class MainActivity : Activity() {
             C("Show the chat history") { showSideById("history") },
             C("Source control", "Ctrl Shift G") { showSideById("git") },
             C("Run and debug", "Ctrl Shift D") { showSideById("debug") },
-            C("Debug: start debugging the open file", "F5") { debugPanel.start(false) },
+            C("Debug: start debugging the open file") { debugPanel.startOpenFile() },
+            C("Debug: start debugging the selected configuration", "F5") { debugPanel.start(false) },
             C("Debug: run without debugging", "Ctrl F5") { debugPanel.start(true) },
             C("Debug: stop", "Shift F5") { debugPanel.stop() },
             C("Debug: toggle a breakpoint", "F9") { toggleBreakpointAtCursor() },
@@ -799,19 +898,20 @@ class MainActivity : Activity() {
             C("Android: logcat") { if (!bottomShown) toggleBottomPanel(); selectPanel(4) },
             C("New Jupyter notebook") { editor.newFileAt("notebook.ipynb") },
             C("Notepads") { showSideById("notepads") },
+            C("Memories: see, add and edit what the agent remembers (global and this project)") { showSideById("memories") },
             C("Documentation for @docs") { showSideById("docs") },
             C("Agent log", "Ctrl Shift U") { if (!bottomShown) toggleBottomPanel(); selectPanel(1) },
             C("Debug console", "Ctrl Shift Y") { showDebugConsole() },
-            C("Voice input", "Ctrl Shift Space") { chat.dictateIntoPrompt() },
+            C("Voice input (start or stop dictation)", "Ctrl Shift Space") { chat.dictateIntoPrompt() },
             C("Export the chat as Markdown") { chat.exportChatPublic() },
             C("Toggle the verbose mode of the chat") { chat.toggleSettingPublic("verbose") },
-            C("Toggle the thinking display") { chat.toggleSettingPublic("thinking") },
+            C("Turn the model's thinking step on or off") { chat.toggleSettingPublic("thinking") },
             C("Chat with @codebase context") { if (!chatShown) toggleChat(); chat.insertText("@codebase ") },
             C("Chat with @web context") { if (!chatShown) toggleChat(); chat.insertText("@web ") },
             C("Settings", "Ctrl ,") { openSettings() },
-            C("Restart the language server of this file") { val p = editor.activePath(); if (p.isEmpty()) Ui.toast(this, "Open a file first.") else { Lsp.restart(p); editor.textOf(p)?.let { Lsp.open(p, it) } } },
+            C("Restart the language server of this file") { val p = editor.activePath(); if (p.isEmpty()) Ui.toast(this, "Open a file first.") else restartLanguageServer(p) },
             C("Refresh the Explorer") { editor.refresh() },
-            C("Unload the model from memory") { Api.async("unload", { Api.post("/api/unload", JSONObject()) }) { r, e -> flashStatus(if (r != null) "Model unloaded. It loads again on the next message." else "Not unloaded: " + (e?.message ?: "")) } },
+            C("Unload the model from memory") { unloadModels() },
         )
         // Every key binding is a command too, and so are the editing commands Cursor has without a key.
         val e = { editor.activeEditor() ?: run { flashStatus("Open a file first."); null } }
@@ -831,10 +931,11 @@ class MainActivity : Activity() {
             C("Join lines") { e()?.joinLines() },
             C("Transpose characters around the cursor") { e()?.transposeLetters() },
             C("Duplicate the selection") { e()?.duplicateSelection() },
-            C("Expand line selection", "Ctrl L in VS Code") { e()?.selectLine() },
+            C("Expand line selection") { e()?.selectLine() },
             C("Convert indentation to spaces") { e()?.indentationToSpaces() },
             C("Convert indentation to tabs") { e()?.indentationToTabs() },
-            C("Toggle render whitespace") { editor.forEachEditor { it.renderWhitespace = !it.renderWhitespace } },
+            // A setting, as in Cursor: every open editor and every editor opened later follows it.
+            C("Toggle render whitespace") { val on = !ForgeSettings.bool("render_whitespace", false, windowFolder()); ForgeSettings.set("render_whitespace", on, windowFolder()) { ok, err -> flashStatus(if (!ok) "Not saved: $err" else if (on) "Whitespace is shown." else "Whitespace is hidden.") } },
             C("Change file encoding") { encodingMenu() },
             C("Reopen with encoding") { pickEncoding(reopen = true) },
             C("Save with encoding") { pickEncoding(reopen = false) },
@@ -983,12 +1084,15 @@ class MainActivity : Activity() {
             // window of this app happened to leave in the shared Api.folder.
             if (r != null && (Api.folder.isEmpty() || myFolder.isEmpty())) Api.folder = r.optString("default_folder").ifEmpty { r.optString("workspace") }
             if (myFolder.isEmpty()) myFolder = Api.folder
-            ForgeSettings.refresh()
+            editor.bindLsp()
+            ForgeSettings.refresh(myFolder)
             editor.restoreReviews()
             setWindowTitle("")
             editor.refresh(); chat.load(); terminal.connect()
             startZoom()
-            hotExitRestore()
+            // The editors this folder had open come back (Reload Window, opening the folder again), then the unsaved
+            // files kept by hot exit.
+            editor.restoreOpenState { hotExitRestore() }
             intent?.getStringExtra("open_file")?.let { f -> intent?.removeExtra("open_file"); Api.main.postDelayed({ editor.openFile(f) }, 600) }
             Api.main.removeCallbacks(statusTask); Api.main.post(statusTask)
             Api.main.removeCallbacks(indexTask); Api.main.post(indexTask)
@@ -1129,6 +1233,21 @@ class MainActivity : Activity() {
     }
 
     // ---------------------------------------------------------------- folders and windows
+    /** Selected text from a chat message (or any rendered Markdown) into the chat input: quoted as a reply, or as
+     *  plain text. The AI panel opens when it is hidden. */
+    fun quoteToChat(text: String, reply: Boolean) {
+        if (!chatShown) toggleChat()
+        chat.quoteIntoPrompt(text, reply)
+        flashStatus(if (reply) "Quoted in your reply. Type your answer under it." else "Added to your prompt.")
+    }
+
+    /** The text selected in a chat message (or another rendered text) that has the focus, or an empty string. */
+    private fun selectedMessageText(): String {
+        val f = currentFocus as? TextView ?: return ""
+        if (f is android.widget.EditText) return ""
+        return Markdown.selectionOf(f)
+    }
+
     /** File: Open Recent: the folders opened lately, newest first; the one picked opens in this window. */
     private fun openRecentDialog() {
         Api.async("settings", { Api.get("/api/settings") }) { r, e ->
@@ -1154,17 +1273,82 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun goToFolder(path: String) {
-        Api.folder = path
-        myFolder = path
-        Api.async("workspace", { Api.post("/api/workspace", JSONObject().put("path", path)) }) { _, _ ->
-            setWindowTitle(""); editor.refresh(); chat.load(); terminal.connect()
+    /**
+     * Unload the model from memory: the GPU engine's model on the Googlebook (after a question, because it stops the
+     * engine) and every model Ollama holds in the Linux VM. The next message loads what it needs again.
+     */
+    private fun unloadModels() {
+        fun ollama(prefix: String) {
+            Api.async("unload", { Api.post("/api/unload", JSONObject()) }) { r, e ->
+                if (r == null) { flashStatus(prefix + "Ollama did not answer: " + (e?.message ?: "")); return@async }
+                val names = r.optJSONArray("unloaded")
+                val list = if (names == null) emptyList() else (0 until names.length()).map { names.optString(it).removeSuffix(":latest") }
+                flashStatus(prefix + (if (list.isEmpty()) "Ollama had no model loaded in the VM." else "Ollama unloaded " + list.joinToString(", ") + " from the VM.") + " The next message loads what it needs.")
+            }
+        }
+        val engineUp = EngineService.isRunning()
+        if (!engineUp) { ollama(""); return }
+        AlertDialog.Builder(this).setTitle("Unload the GPU engine's model?")
+            .setMessage("This stops the GPU engine, which frees its memory on the Googlebook. The next chat message starts it again (about 25 seconds). Ollama's models in the Linux VM are unloaded too.")
+            .setPositiveButton("Unload") { _, _ -> EngineService.stop(this, byUser = true); ollama("The GPU engine stopped. ") }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    /** The language server of a file stops and starts again with the file's current text. */
+    private fun restartLanguageServer(path: String) {
+        val folder = windowFolder()
+        Lsp.restart(path, folder)
+        editor.textOf(path)?.let { Lsp.open(path, it, folder) }
+        flashStatus("Restarting the language server for " + path.substringAfterLast('/'))
+    }
+
+    /** A folder as the server sees it: "~" expanded, links resolved, and checked to be a folder. */
+    private fun resolveFolder(path: String, then: (String) -> Unit) {
+        Api.async("dirs", { Api.get("/api/dirs", mapOf("path" to path)) }) { r, e ->
+            val p = r?.optString("path").orEmpty()
+            if (p.isEmpty()) { Ui.toast(this, "Cannot open $path: " + (e?.message ?: "it is not a folder.")); return@async }
+            then(p)
         }
     }
 
-    private fun newWindow(path: String = Api.folder) {
+    /**
+     * Opens another folder in this window, as Cursor's Open Folder does: unsaved files and running chat replies are
+     * asked about first, the open editors of this folder are remembered for when it is opened again, and the window is
+     * built again for the new folder (its Explorer, editors, chats, terminal, settings and language servers). The old
+     * folder's language servers stop when no other window shows it.
+     */
+    private fun goToFolder(path: String) = resolveFolder(path) { p ->
+        if (p == myFolder) { flashStatus("This window already shows $p."); return@resolveFolder }
+        val dirty = editor.dirtyCount()
+        val busy = chat.busyCount()
+        if (dirty == 0 && busy == 0) { switchFolder(p); return@resolveFolder }
+        val why = ArrayList<String>()
+        if (dirty > 0) why.add(if (dirty == 1) "One file has unsaved changes. Your changes are lost if you do not save them." else "$dirty files have unsaved changes. Your changes are lost if you do not save them.")
+        if (busy > 0) why.add(if (busy == 1) "A chat reply is still running, and opening another folder stops it." else "$busy chat replies are still running, and opening another folder stops them.")
+        val b = AlertDialog.Builder(this).setTitle("Open " + p.trimEnd('/').substringAfterLast('/') + " in this window?").setMessage(why.joinToString("\n\n"))
+            .setNegativeButton("Cancel", null)
+        if (dirty > 0) {
+            b.setPositiveButton("Save all and open") { _, _ -> editor.saveAll { if (editor.dirtyCount() == 0) switchFolder(p) else Ui.toast(this, "Some files could not be saved, so the folder was not opened.") } }
+            b.setNeutralButton("Do not save") { _, _ -> switchFolder(p) }
+        } else b.setPositiveButton("Open") { _, _ -> switchFolder(p) }
+        b.show()
+    }
+
+    private fun switchFolder(p: String) {
+        val old = myFolder
+        editor.saveOpenState()
+        Api.async("workspace", { Api.post("/api/workspace", JSONObject().put("path", p)) }) { r, e ->
+            if (r == null) { Ui.toast(this, "Cannot open $p: " + (e?.message ?: "")); return@async }
+            myFolder = r.optString("workspace").ifEmpty { p }
+            Api.folder = myFolder
+            if (old.isNotEmpty() && old != myFolder && windows.none { it !== this && it.myFolder == old }) Lsp.shutdownFolder(old)
+            doReload()
+        }
+    }
+
+    private fun newWindow(path: String = windowFolder()) = resolveFolder(path) { p ->
         val i = Intent(this, MainActivity::class.java)
-        i.putExtra("path", path)
+        i.putExtra("path", p)
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT or Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
         startActivity(i)
     }
@@ -1201,11 +1385,15 @@ class MainActivity : Activity() {
         val sm = { editor.activeSmarts() }
         return listOf(
             // ---- Cursor: the AI panel, agent and chat
-            b("Ctrl+I", A, "Toggle the AI panel (Agent)") { toggleChat(); if (chatShown) chat.focusPrompt() },
+            // In the Agent layout the chat is the whole window, so Ctrl I goes back to the editor layout instead of
+            // hiding the chat and leaving an empty window.
+            b("Ctrl+I", A, "Toggle the AI panel (Agent)") { if (agentLayout) toggleAgentLayout() else { toggleChat(); if (chatShown) chat.focusPrompt() } },
+            b("Ctrl+Shift+L", A, "Reply to the text selected in a chat message (quote it in your input)", { selectedMessageText().isNotBlank() }) { quoteToChat(selectedMessageText(), reply = true) },
+            b("Ctrl+L", A, "Add the text selected in a chat message to your prompt", { selectedMessageText().isNotBlank() }) { quoteToChat(selectedMessageText(), reply = false) },
             b("Ctrl+L", W, "Add the selection to a new chat (or toggle the AI panel)") { if (editor.selectionText().isNotEmpty()) { if (!chatShown) toggleChat(); chat.newChatTab(); Api.main.postDelayed({ addSelectionToChat() }, 400) } else { toggleChat(); if (chatShown) chat.focusPrompt() } },
             b("Ctrl+Shift+L", W, "Add the selection to the chat") { addSelectionToChat() },
             b("Ctrl+E", W, "Toggle the Agent layout (the chat takes the window)") { toggleAgentLayout() },
-            b("Ctrl+Shift+J", A, "Cursor settings (Forge's AI settings)") { openSettingsAt("ai") },
+            b("Ctrl+Shift+J", A, "Cursor settings (Forge's AI settings: model, agent, rules, memories and MCP)") { openSettingsAt("ai") },
             b("Ctrl+Alt+I", A, "Open the chat view") { if (!chatShown) toggleChat(); chat.focusPrompt() },
             b("Ctrl+Shift+Alt+I", A, "Open the chat in Agent mode") { if (!chatShown) toggleChat(); chat.setModePublic("agent"); chat.focusPrompt() },
             b("Ctrl+Shift+Alt+L", A, "Quick chat (ask a question in a small box)") { quickChatDialog() },
@@ -1227,15 +1415,16 @@ class MainActivity : Activity() {
             b("Up", C, "Edit your previous message (empty input)", { chat.promptEmpty() && !chat.isRunning() }) { chat.recallMessage(1) },
             b("Tab", C, "Cycle to the next message (your earlier messages)", { chat.promptEmpty() }) { chat.recallMessage(1) },
             b("Escape", C, "Leave the input (back to the editor)", { !chat.isRunning() }) { editor.focusEditor() },
-            b("Ctrl+Shift+Space", A, "Voice input") { chat.dictateIntoPrompt() },
+            // In the code editor these keys show the parameter hints (below), as in Cursor; everywhere else, voice input.
+            b("Ctrl+Shift+Space", A, "Voice input (start or stop dictation)", { currentFocus !is CodeEditor.CodeEditText }) { chat.dictateIntoPrompt() },
 
             // ---- general
             b("Ctrl+Shift+P", A, "Show all commands") { openPalette(">") },
             b("F1", W, "Show all commands") { openPalette(">") },
             b("Ctrl+P", A, "Go to file (Quick Open)") { openPalette("") },
             b("Ctrl+Shift+N", A, "New window") { newWindow() },
-            b("Ctrl+Shift+W", W, "Close the window") { closeWindow() },
-            b("Alt+F4", A, "Close the window") { closeWindow() },
+            b("Ctrl+Shift+W", W, "Close the window (the last window quits Forge; unsaved files are kept for next time)") { closeWindow() },
+            b("Alt+F4", A, "Close the window (the last window quits Forge; unsaved files are kept for next time)") { closeWindow() },
             b("Ctrl+,", A, "Settings") { openSettings() },
             b("Ctrl+K Ctrl+S", W, "Keyboard shortcuts") { showKeyboardShortcuts() },
             b("Ctrl+Q", A, "Quit Forge") { quitForge() },
@@ -1247,7 +1436,7 @@ class MainActivity : Activity() {
             b("Ctrl+N", W, "New file (Untitled)") { editor.newUntitled() },
             b("Ctrl+O", W, "Open a file") { openPalette("/") },
             b("Ctrl+K Ctrl+O", W, "Open a folder") { openFolderDialog() },
-            b("Ctrl+K F", W, "Close the folder") { closeFolder() },
+            b("Ctrl+K F", W, "Close the folder: close its editors and pick another folder") { closeFolder() },
             b("Ctrl+S", W, "Save") { editor.saveActive() },
             b("Ctrl+Shift+S", W, "Save as") { editor.saveAsActive() },
             b("Ctrl+K S", W, "Save all") { editor.saveAll(null) },
@@ -1294,7 +1483,7 @@ class MainActivity : Activity() {
             b("Ctrl+Alt+-", W, "Go back") { editor.goBack() },
             b("Ctrl+Shift+-", W, "Go forward") { editor.goForward() },
             b("Ctrl+K Ctrl+Q", W, "Go to the last edit location") { editor.goToLastEdit() },
-            b("Ctrl+Shift+;", W, "Focus the breadcrumbs (the symbols of the file)") { openPalette("@") },
+            b("Ctrl+Shift+;", W, "Breadcrumbs: pick a symbol of the file (the @ list)") { openPalette("@") },
 
             // ---- display
             b("F11", W, "Toggle full screen", { !debugPanel.active() }) { toggleFullScreen() },
@@ -1304,7 +1493,7 @@ class MainActivity : Activity() {
             b("Ctrl+-", A, "Zoom out") { zoomBy(-1) },
             b("Ctrl+Numpad0", A, "Reset the zoom") { zoomReset() },
             b("Ctrl+0", W, "Reset the zoom") { zoomReset() },
-            b("Ctrl+B", W, "Toggle the side bar") { toggleExplorer() },
+            b("Ctrl+B", W, "Toggle the side bar") { toggleSideBar() },
             b("Ctrl+Alt+B", W, "Toggle the secondary side bar (the AI panel)") { toggleChat() },
             b("Ctrl+J", W, "Toggle the panel") { toggleBottomPanel() },
             b("Ctrl+Shift+E", W, "Show the Explorer") { showExplorer() },
@@ -1312,13 +1501,13 @@ class MainActivity : Activity() {
             b("Ctrl+Shift+H", W, "Replace in files") { showSearch(editor.selectionText().takeIf { !it.contains('\n') } ?: "") },
             b("Ctrl+Shift+G", W, "Show source control") { showSideById("git") },
             b("Ctrl+Shift+D", W, "Show run and debug") { showSideById("debug") },
-            b("Ctrl+Shift+X", W, "Show the extensions (language servers and toolchains)") { showSideById("android") },
+            b("Ctrl+Shift+X", W, "Show the extensions (language servers and toolchains)") { showSideById("extensions") },
             b("Ctrl+K Ctrl+H", W, "Show the output (the agent log)") { if (!bottomShown) toggleBottomPanel(); selectPanel(1) },
             b("Ctrl+Shift+U", W, "Show the output (the agent log)") { if (!bottomShown) toggleBottomPanel(); selectPanel(1) },
             b("Ctrl+Shift+Y", W, "Show the debug console") { showDebugConsole() },
-            b("Ctrl+Shift+C", W, "Open a new external terminal (the Terminal app)") { openTerminalApp() },
+            b("Ctrl+Shift+C", W, "Bring the Linux Terminal app to the front (Cursor: open an external terminal)") { openTerminalApp() },
             b("Ctrl+Shift+V", E, "Toggle the Markdown preview") { editor.togglePreview() },
-            b("Ctrl+K V", W, "Open the Markdown preview to the side") { editor.togglePreview() },
+            b("Ctrl+K V", W, "Open the Markdown preview to the side") { editor.openPreview() },
             b("Ctrl+`", A, "Toggle the terminal") { if (currentFocus is TerminalView) { toggleBottomPanel(); editor.focusEditor() } else { showTerminal(); terminal.focusInput() } },
             b("Ctrl+Shift+`", A, "New terminal") { showTerminal(); terminal.addTerminal() },
             b("Ctrl+Shift+5", A, "Split the terminal") { showTerminal(); terminal.split() },
@@ -1372,7 +1561,7 @@ class MainActivity : Activity() {
             b("Ctrl+Shift+[", E, "Fold the region") { ed()?.foldAtCursor() },
             b("Ctrl+Shift+]", E, "Unfold the region") { ed()?.unfoldAtCursor() },
             b("Ctrl+K Ctrl+L", W, "Toggle the fold") { ed()?.toggleFold() },
-            b("Ctrl+K Ctrl+[", W, "Fold all subregions") { ed()?.foldRecursively(true) },
+            b("Ctrl+K Ctrl+[", W, "Fold recursively (the region at the cursor and every region inside it)") { ed()?.foldRecursively(true) },
             b("Ctrl+K Ctrl+]", W, "Unfold all subregions") { ed()?.foldRecursively(false) },
             b("Ctrl+K Ctrl+0", W, "Fold all regions") { ed()?.foldAll() },
             b("Ctrl+K Ctrl+J", W, "Unfold all regions") { ed()?.unfoldAll() },
@@ -1610,11 +1799,14 @@ class MainActivity : Activity() {
         problems.step(dir)
     }
 
-    /** Ctrl K F12: the definition opens in the other editor group. */
+    /** Ctrl K F12: the definition opens in the editor group to the right (made when there is none), even when its file
+     *  is already open in this group, as Cursor's Open Definition to the Side does. */
     private fun definitionToSide() {
         val smarts = editor.activeSmarts() ?: run { flashStatus("Open a file first."); return }
-        editor.focusGroupAt(1)
-        Api.main.postDelayed({ smarts.goToDefinition() }, 250)
+        smarts.findDefinition { loc ->
+            if (loc == null) { flashStatus("No definition found for this symbol."); return@findDefinition }
+            editor.openToSideAt(loc.path, loc.line, loc.col)
+        }
     }
 
     private fun quickChatDialog() {
@@ -1657,8 +1849,10 @@ class MainActivity : Activity() {
             if (pkg.isNotEmpty()) try { JSONObject(pkg).optJSONObject("scripts")?.keys()?.forEach { k -> out.add("npm: $k" to "npm run $k") } } catch (e: Exception) { }
             val mk = read("Makefile")
             if (mk.isNotEmpty()) { out.add("make" to "make"); Regex("^([A-Za-z0-9_.-]+):", RegexOption.MULTILINE).findAll(mk).map { it.groupValues[1] }.filter { !it.startsWith(".") }.distinct().take(15).forEach { out.add("make $it" to "make $it") } }
-            if (exists("gradlew")) { out.add("gradle: build" to "./gradlew build"); out.add("gradle: assembleDebug" to "./gradlew assembleDebug") }
-            if (exists("Cargo.toml")) { out.add("cargo build" to "cargo build"); out.add("cargo run" to "cargo run"); out.add("cargo test" to "cargo test") }
+            // Builds go through Forge's wrappers, which check the free memory first and run inside a memory cap, as the
+            // agent's builds do (a raw ./gradlew or cargo could squeeze the VM).
+            if (exists("gradlew")) { out.add("gradle: build" to "forge-gradle build"); out.add("gradle: assembleDebug" to "forge-gradle assembleDebug") }
+            if (exists("Cargo.toml")) { out.add("cargo build" to "forge-cargo build"); out.add("cargo run" to "forge-cargo run"); out.add("cargo test" to "forge-cargo test") }
             if (exists("go.mod")) { out.add("go build" to "go build ./..."); out.add("go test" to "go test ./...") }
             if (exists("CMakeLists.txt")) out.add("cmake: configure and build" to "cmake -S . -B build && cmake --build build")
             if (exists("build.sh")) out.add("./build.sh" to "bash ./build.sh")
@@ -1676,7 +1870,11 @@ class MainActivity : Activity() {
 
     /** Ctrl K Ctrl S: every key binding, searchable, with where it applies. */
     private fun showKeyboardShortcuts() {
-        val all = keymap.filter { it.title.isNotEmpty() }
+        // The debugger's keys are handled by the Run and debug view itself (DebugPanel.handleKey); they are listed too.
+        val debugKeys = listOf("F5" to "Start debugging, or continue when stopped", "Ctrl+F5" to "Run without debugging",
+            "Shift+F5" to "Stop debugging", "Ctrl+Shift+F5" to "Restart debugging", "F6" to "Pause", "F10" to "Step over",
+            "F11" to "Step into", "Shift+F11" to "Step out").map { (k, t) -> Keymap.Binding(k, Keymap.Where.WINDOW, t, {}) }
+        val all = keymap.filter { it.title.isNotEmpty() } + debugKeys
         val box = Ui.column(this)
         val search = Ui.input(this, "Type to search the keyboard shortcuts", mono = false)
         val list = Ui.column(this)
@@ -1731,9 +1929,14 @@ class MainActivity : Activity() {
         val ext = path.substringAfterLast('.', "")
         val lang = mapOf("kt" to "kotlin", "java" to "java", "py" to "python", "js" to "javascript", "ts" to "typescript", "json" to "json", "md" to "markdown",
             "sh" to "bash", "c" to "c", "cpp" to "cpp", "h" to "c", "html" to "html", "css" to "css", "yml" to "yaml", "yaml" to "yaml", "rs" to "rust", "go" to "go")[ext] ?: ""
-        val lines = text.count { it == '\n' } + 1
-        return JSONObject().put("kind", "selection").put("path", path).put("text", text).put("start", 1).put("end", lines).put("language", lang)
-            .put("name", path.substringAfterLast('/') + " (selection)")
+        // The selection's real lines in the file (1-based), so the model and the chip name the right place.
+        val ed = editor.activeEditor()
+        val a = ed?.let { minOf(it.edit.selectionStart, it.edit.selectionEnd) } ?: 0
+        val b = ed?.let { maxOf(it.edit.selectionStart, it.edit.selectionEnd) } ?: 0
+        val first = (ed?.lineColOf(a)?.first ?: 0) + 1
+        val last = first + text.trimEnd('\n').count { it == '\n' }
+        return JSONObject().put("kind", "selection").put("path", path).put("text", text).put("start", first).put("end", maxOf(first, last)).put("language", lang)
+            .put("name", path.substringAfterLast('/') + " (lines " + first + (if (last > first) " to $last" else "") + ")")
     }
 
     private var agentLogView: TextView? = null
@@ -1753,15 +1956,32 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if ((requestCode != PICK_IMAGE && requestCode != PICK_FILE) || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
-        val name = uri.lastPathSegment?.substringAfterLast('/') ?: "image.png"
-        Api.async("upload", {
-            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: throw Exception("cannot read the image")
-            if (bytes.size > 15 * 1024 * 1024) throw Exception("the image is larger than 15 MB")
-            Api.upload(name, bytes)
-        }) { r, e -> if (r == null) Ui.toast(this, "Not attached: " + (e?.message ?: "")) else chat.addAttachment(r) }
+        attachUri(uri)
     }
 
+    /**
+     * A picture or file that Android hands over (picked, pasted into the chat or dropped on it): uploaded to the Forge
+     * server and attached to the message. Pictures go to the vision model; text, code and PDF files are read for the
+     * model. 25 MB at most, read with a cap so a huge file cannot fill the app's memory.
+     */
+    fun attachUri(uri: android.net.Uri) {
+        val name = try {
+            contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        } catch (e: Exception) { null } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "attachment"
+        Api.async("upload", {
+            val cap = 25 * 1024 * 1024
+            val bytes = contentResolver.openInputStream(uri)?.use { s ->
+                val out = java.io.ByteArrayOutputStream(); val buf = ByteArray(64 * 1024)
+                while (true) { val n = s.read(buf); if (n < 0) break; if (out.size() + n > cap) throw Exception("$name is larger than 25 MB"); out.write(buf, 0, n) }
+                out.toByteArray()
+            } ?: throw Exception("cannot read $name")
+            Api.upload(name, bytes)
+        }) { r, e -> if (r == null) Ui.toast(this, "Not attached: " + (e?.message ?: "")) else { ensureChatShown(); chat.addAttachment(r); flashStatus("Attached $name.") } }
+    }
+
+    /** The microphone button and Ctrl Shift Space: dictation starts, or stops when it is already on. */
     fun dictate(into: EditText) {
+        if (voice?.listening == true) { stopDictation(); return }
         dictateInto = into
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             afterMic = Runnable { startVoice() }
@@ -1774,21 +1994,47 @@ class MainActivity : Activity() {
     private fun startVoice() {
         if (!Voice.available(this)) { Ui.toast(this, "No speech recognition service is installed"); return }
         val v = voice ?: Voice(this) { ev -> Api.main.post { onVoice(ev) } }.also { voice = it }
-        Ui.toast(this, "Listening. Speak, then press Mic again to stop.")
+        flashStatus("Listening. Speak, then press the microphone again (or Ctrl Shift Space) to stop.")
         v.start("")
         afterMic = null
     }
 
-    private var voiceBase = ""
+    /** Dictation stops (the microphone button again, sending the message, the window going to the background). */
+    fun stopDictation() {
+        val v = voice ?: return
+        if (!v.listening) return
+        v.stop()
+        flashStatus("Dictation stopped.")
+    }
+
+    // The dictated words go in at the cursor and replace only themselves as the recognizer improves them, so text
+    // typed meanwhile and the input's tokens stay as they are.
+    private var voiceAt = 0
+    private var voiceLen = 0
+    private fun putDictated(into: EditText, text: String, final: Boolean) {
+        val e = into.text
+        val a = voiceAt.coerceIn(0, e.length)
+        val b = (a + voiceLen).coerceIn(a, e.length)
+        val lead = if (a > 0 && !e[a - 1].isWhitespace() && text.isNotEmpty()) " " else ""
+        val piece = lead + text
+        e.replace(a, b, piece)
+        voiceLen = piece.length
+        into.setSelection((a + voiceLen).coerceAtMost(e.length))
+        if (final) { voiceAt = a + voiceLen; voiceLen = 0 }
+    }
+
     private fun onVoice(ev: JSONObject) {
         val kind = ev.optString("type", ev.optString("kind"))
         val text = ev.optString("text", ev.optString("value", ev.optString("message")))
         val into = dictateInto ?: return
         when (kind) {
-            "state" -> if (text == "listening") voiceBase = into.text.toString()
-            "partial" -> into.setText((voiceBase + " " + text).trim())
-            "final" -> { voiceBase = (voiceBase + " " + text).trim(); into.setText(voiceBase); into.setSelection(into.text.length) }
-            "error" -> Ui.toast(this, text)
+            "state" -> {
+                if (text == "listening") { voiceAt = into.selectionEnd.coerceAtLeast(0); voiceLen = 0 }
+                chat.setMicListening(voice?.listening == true)
+            }
+            "partial" -> putDictated(into, text, final = false)
+            "final" -> putDictated(into, text, final = true)
+            "error" -> { Ui.toast(this, text); chat.setMicListening(false) }
         }
     }
 
@@ -1838,7 +2084,7 @@ class MainActivity : Activity() {
             KeyEvent.KEYCODE_S -> { if (shift) editor.saveAll(null) else editor.saveActive(); return true }
             KeyEvent.KEYCODE_E -> if (!shift) { openPalette(""); return true } else { showExplorer(); return true }
             KeyEvent.KEYCODE_T -> if (!shift) { openPalette("#"); return true }
-            KeyEvent.KEYCODE_O -> { if (shift) openPalette("@") else openFolderDialog(); return true }
+            KeyEvent.KEYCODE_O -> { if (shift) openPalette("@") else openPalette("/"); return true }
             KeyEvent.KEYCODE_L -> if (!shift) { addSelectionToChat(); return true }
             KeyEvent.KEYCODE_N -> if (!shift) { if (!chatShown) toggleChat(); chat.newChatTab(); return true }
             KeyEvent.KEYCODE_B -> if (!shift) { toggleExplorer(); return true }
@@ -1874,13 +2120,29 @@ class MainActivity : Activity() {
         return false
     }
 
-    override fun onPause() { super.onPause(); resumed = false }
+    override fun onPause() {
+        super.onPause(); resumed = false
+        if (loaded && !testWindow) editor.saveOpenState()
+    }
 
     override fun onResume() {
         super.onResume()
         resumed = true
         if (myFolder.isNotEmpty() && Api.folder != myFolder) Api.folder = myFolder
-        if (loaded) ForgeSettings.refresh()
+        if (loaded) { ForgeSettings.refresh(windowFolder()); chat.reloadSettings() }
+        if (showShortcutsNext) { showShortcutsNext = false; Api.main.postDelayed({ showKeyboardShortcuts() }, 300) }
+    }
+
+    // The window in front decides the folder that requests carry (Api.folder); a window that gets the focus takes it
+    // back. Several Forge windows can be visible and resumed at once, so onResume alone is not enough.
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && myFolder.isNotEmpty()) Api.folder = myFolder
+    }
+
+    override fun onTopResumedActivityChanged(isTop: Boolean) {
+        super.onTopResumedActivityChanged(isTop)
+        if (isTop && myFolder.isNotEmpty()) Api.folder = myFolder
     }
 
     override fun onStart() {
@@ -1890,11 +2152,17 @@ class MainActivity : Activity() {
     override fun onStop() {
         super.onStop(); started = false
         Api.main.removeCallbacks(probeTask); Api.main.removeCallbacks(statusTask); Api.main.removeCallbacks(indexTask)
-        voice?.stop()
+        stopDictation()
     }
     override fun onDestroy() {
         val wasCounted = counted
         if (counted) { counted = false; liveWindows-- }
+        windows.remove(this)
+        settingsListener?.let { ForgeSettings.removeListener(it) }
+        try { editor.unbindLsp(closing = true); problems.release() } catch (e: Exception) { }
+        // A window that closes for good (not a reload) stops its folder's language servers when no other window shows
+        // that folder; closing the last window stops everything anyway.
+        if (isFinishing && !reloading && myFolder.isNotEmpty() && windows.none { it.myFolder == myFolder }) Lsp.shutdownFolder(myFolder)
         // The last Forge window was closed by its X (not reloaded, not a test window, not closing because Forge quits).
         if (wasCounted && isFinishing && !isChangingConfigurations && !reloading && !quitting && liveWindows <= 0 && loaded) lastWindowClosed()
         super.onDestroy()

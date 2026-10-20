@@ -55,7 +55,7 @@ object Chrome {
         val folderLabel = Ui.text(c, "workspace", 12.5f, Ui.fg2)
         folderLabel.maxLines = 1; folderLabel.ellipsize = TextUtils.TruncateAt.MIDDLE
         folderLabel.maxWidth = Ui.dp(c, 220)
-        val folderButton = Ui.button(c, R.drawable.ic_folder, "", "Open folder (Ctrl O)", onClick = onFolder)
+        val folderButton = Ui.button(c, R.drawable.ic_folder, "", "Open folder (Ctrl K, Ctrl O)", onClick = onFolder)
         folderButton.removeViewAt(1)
         folderLabel.setPadding(Ui.dp(c, 6), 0, Ui.dp(c, 4), 0)
         folderButton.addView(folderLabel, Ui.lp(Ui.wrap, Ui.wrap))
@@ -92,7 +92,7 @@ object Chrome {
         (chip.layoutParams as? LinearLayout.LayoutParams ?: Ui.lp(Ui.wrap, Ui.wrap)).also { it.rightMargin = Ui.dp(c, 6); chip.layoutParams = it }
         bar.addView(chip)
         val terminal = Ui.button(c, R.drawable.ic_terminal, null, "Terminal (Ctrl `)", active = true, onClick = onTerminal)
-        val chat = Ui.button(c, R.drawable.ic_chat, null, "AI panel (Ctrl L)", active = true, onClick = onChat)
+        val chat = Ui.button(c, R.drawable.ic_chat, null, "AI panel (Ctrl I)", active = true, onClick = onChat)
         bar.addView(terminal)
         bar.addView(chat)
         bar.addView(Ui.button(c, R.drawable.ic_new_window, null, "New window (Ctrl Shift N)", onClick = onNewWindow))
@@ -274,7 +274,7 @@ object Chrome {
         val index = item(""); index.visibility = View.GONE
         index.isClickable = true; index.background = Ui.states(null, Ui.rounded(Ui.bg4, 4), Ui.rounded(Ui.border2, 4))
         index.setOnClickListener(onIndexClick)
-        index.tooltipText = "Codebase index: click for settings"
+        index.tooltipText = "Codebase index: click to open its settings card"
         bar.addView(index)
         val leftBox = LinearLayout(c); leftBox.orientation = LinearLayout.HORIZONTAL; leftBox.gravity = Gravity.CENTER_VERTICAL
         bar.addView(leftBox, Ui.lp(Ui.wrap, Ui.wrap))

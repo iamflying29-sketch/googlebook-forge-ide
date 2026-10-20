@@ -29,11 +29,17 @@ import java.util.Date
  *
  * The lists are read with GET /api/devices and GET /api/android/status, and read again every 2.5 seconds only
  * while something is in motion (a device starting, booting or stopping, a download or an image update running)
- * and only while the view is shown; the main window calls onShown and onHidden. A build watch reads
- * /api/android/status every 5 seconds for at most 30 minutes after "Build, install and run", as the page did.
+ * and only while the view is shown; the main window calls onShown and onHidden. While a request to Google's device
+ * lab runs, only the lab's status is read, every 5 seconds, and the whole view again when it has finished.
+ *
+ * "Build, install and run" runs the Gradle build in a terminal tab and installs and starts the APK when that build
+ * exits with success (runTask reports its exit code); a failed build installs nothing, and every later Gradle or
+ * preview build button cancels an install that was still waiting for its build (the cargo buttons build Rust and leave
+ * it waiting). Without the runTask hook it falls back to watching
+ * /api/android/status every 5 seconds for a newer APK, for at most 30 minutes.
  *
  * Some actions reach other parts of the window: commands that run in a terminal, the chat's attachments, the
- * debugger and the logcat. The main window wires the four hooks below; until it does, the terminal commands are
+ * debugger and the logcat. The main window wires the hooks below; until it does, the terminal commands are
  * shown and copied to the clipboard, and the other actions say that they are not connected yet.
  */
 class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
@@ -41,6 +47,8 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
 
     /** Runs a shell command in a terminal tab (the page's ForgeTerm.run): the command and a label for the tab. */
     var runInTerminal: ((command: String, label: String) -> Unit)? = null
+    /** Runs a command in a new terminal tab and reports its exit code (-1 when the tab was killed first): TerminalTabs.runTask. */
+    var runTask: ((command: String, label: String, onDone: (Int) -> Unit) -> Unit)? = null
     /** Adds an attachment record (as /api/attachment returns it) to the chat composer (ChatPanel.addAttachment). */
     var attachToChat: ((record: JSONObject) -> Unit)? = null
     /** Starts the installed debug build on the target device and attaches the debugger (the page's ForgeDebug.attachAndroid). */
@@ -63,16 +71,26 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
     private var generation = 0
     private val handler = Api.main
     private val pollRunnable = Runnable { render() }
+    private val labPollRunnable = Runnable { pollLab() }
     private var watch: Runnable? = null
+    /** Goes up with every build button; an install that waits for a build goes ahead only while it is still current. */
+    private var buildToken = 0
     private var window: DeviceScreenWindow? = null
     private val prefs = ctx.getSharedPreferences("forge-android-view", Context.MODE_PRIVATE)
+
+    // Choices that survive the view being built again while it polls (the create form, the lab's pickers).
+    private var createType = ""
+    private var createPersona = ""
+    private var labPick = ""
+    private var labReservations: List<String> = emptyList()
+    private var labReservation = ""
+    private var labListText = ""
 
     // Inputs that keep their text across renders (the page rebuilt them, but the native view keeps what you typed).
     private val pairAddress = Ui.input(ctx, "Pairing address and port (shown under Pair device with pairing code)")
     private val pairCode = Ui.input(ctx, "Six-digit pairing code")
     private val connectAddress = Ui.input(ctx, "Device address and port (shown under Wireless debugging)")
     private val labProject = Ui.input(ctx, "Google Cloud project ID")
-    private val labReservation = Ui.input(ctx, "Reservation ID (from My reservations)")
     private val samsungAddress = Ui.input(ctx, "localhost:PORT shown by Remote Debug Bridge")
     private val createLabel = Ui.input(ctx, "Label for the new device (optional)")
 
@@ -103,7 +121,7 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
     fun onShown() { shown = true; render() }
 
     /** The main window calls this when the view is hidden: polling stops (the device window stays open). */
-    fun onHidden() { shown = false; handler.removeCallbacks(pollRunnable); generation++ }
+    fun onHidden() { shown = false; handler.removeCallbacks(pollRunnable); handler.removeCallbacks(labPollRunnable); generation++ }
 
     // ---------------------------------------------------------------- loading and polling
     private class Loaded(val dev: JSONObject, val info: JSONObject, val mode: String, val cargo: Boolean)
@@ -116,9 +134,9 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
         Api.async("android-view", {
             val dev = Api.get("/api/devices", timeoutMs = 60000)
             val st = Api.get("/api/android/status", timeoutMs = 60000)
-            val mode = try { Api.get("/api/settings").optJSONObject("effective")?.optString("vd_updates", "check") ?: "check" } catch (e: Exception) { "check" }
+            val mode = try { Api.get("/api/settings").optJSONObject("effective")?.optText("vd_updates", "check") ?: "check" } catch (e: Exception) { "check" }
             val cargo = try {
-                Api.get("/api/files", mapOf("q" to "Cargo.toml")).optJSONArray("files")?.let { a -> (0 until a.length()).any { Regex("(^|/)Cargo\\.toml$").containsMatchIn(a.optString(it)) } } ?: false
+                Api.get("/api/files", mapOf("q" to "Cargo.toml")).optJSONArray("files")?.let { a -> (0 until a.length()).any { Regex("(^|/)Cargo\\.toml$").containsMatchIn(a.optText(it)) } } ?: false
             } catch (e: Exception) { false }
             Loaded(dev, st, mode, cargo)
         }) { r, e ->
@@ -148,15 +166,48 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
         window?.dataChanged()
     }
 
-    /** The page polled every 2.5 seconds while a device, a download or an image update was in motion, and only while the view was shown. */
+    /**
+     * The page polled every 2.5 seconds while a device, a download or an image update was in motion, and only while
+     * the view was shown; when nothing is in motion, nothing is read until the view is shown again or a button is used.
+     */
     private fun keepPolling() {
         handler.removeCallbacks(pollRunnable)
         val v = devices?.optJSONObject("virtual") ?: return
         val u = v.optJSONObject("updates")
-        val active = (u != null && (u.optBoolean("checking") || u.optString("applying").isNotEmpty()))
-            || v.optJSONArray("devices").objs().any { it.optString("phase") in setOf("starting", "booting", "stopping") }
+        val active = (u != null && (u.optBoolean("checking") || u.optText("applying").isNotEmpty()))
+            || v.optJSONArray("devices").objs().any { it.optText("phase") in setOf("starting", "booting", "stopping") }
             || v.optJSONArray("versions").objs().any { it.optJSONObject("job")?.optBoolean("running") == true }
         if (active && shown) handler.postDelayed(pollRunnable, 2500)
+        keepPollingLab()
+    }
+
+    private fun labJobRunning(st: JSONObject?): Boolean {
+        val jobs = st?.optJSONObject("jobs") ?: return false
+        return jobs.keys().asSequence().any { jobs.optJSONObject(it)?.optBoolean("running") == true }
+    }
+
+    /** While a lab request runs (a reservation takes minutes), its status is read every 5 seconds. */
+    private fun keepPollingLab() {
+        handler.removeCallbacks(labPollRunnable)
+        if (shown && labJobRunning(googleStatus)) handler.postDelayed(labPollRunnable, 5000)
+    }
+
+    private fun pollLab() {
+        val my = generation
+        Api.async("cloud-google-poll", { Api.get("/api/cloud/google", timeoutMs = 60000) }) { st, _ ->
+            if (my != generation || !shown) return@async
+            if (st == null) { keepPollingLab(); return@async }
+            val wasRunning = labJobRunning(googleStatus)
+            googleStatus = st; googleStatusAt = System.currentTimeMillis()
+            if (wasRunning && !labJobRunning(st)) {
+                // The request finished: a reserved device is now connected (or the request failed); read everything again.
+                listReservations(quiet = true)
+                render()
+            } else {
+                rebuild()
+                keepPollingLab()
+            }
+        }
     }
 
     // ---------------------------------------------------------------- devices
@@ -167,12 +218,12 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
         var online = 0
         for (d in list) {
             val isTarget = same(d, target)
-            val state = d.optString("state")
+            val state = d.optText("state")
             if (state == "device") online++
-            val kind = d.optString("kind")
+            val kind = d.optText("kind")
             val facts = listOfNotNull(
-                d.optString("android").ifEmpty { null }?.let { "Android $it" },
-                d.optString("one_ui").ifEmpty { null },
+                d.optText("android").ifEmpty { null }?.let { "Android $it" },
+                d.optText("one_ui").ifEmpty { null },
                 if (d.optInt("width") > 0) d.optInt("width").toString() + "×" + d.optInt("height") else null,
                 kindNames[kind] ?: kind.ifEmpty { null }).joinToString(", ")
             val acts = FlowRow(ctx)
@@ -182,13 +233,13 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
                 acts.addView(btn("Screenshot to chat") { screenshotToChat(d) })
             }
             if (kind != "googlebook" && kind != "virtual") acts.addView(btn("Disconnect") {
-                postAction("/api/devices/disconnect", JSONObject().put("serial", d.optString("serial")).put("port", d.optInt("port")))
+                postAction("/api/devices/disconnect", JSONObject().put("serial", d.optText("serial")).put("port", d.optInt("port")))
             })
             val badges = if (isTarget) listOf(badge("target", false)) else emptyList()
-            box.addView(deviceRow(isTarget, if (state == "device") Ui.green else Ui.red, d.optString("name").ifEmpty { d.optString("serial") }, badges,
-                if (state == "device") facts else state + " (" + d.optString("serial") + ")", acts))
+            box.addView(deviceRow(isTarget, if (state == "device") Ui.green else Ui.red, d.optText("name").ifEmpty { d.optText("serial") }, badges,
+                if (state == "device") facts else state + " (" + d.optText("serial") + ")", acts))
         }
-        if (list.none { it.optString("kind") == "googlebook" }) {
+        if (list.none { it.optText("kind") == "googlebook" }) {
             box.addView(actions(btn("Connect this Googlebook") { postAction("/api/android/connect", JSONObject()) }))
         }
         if (online == 0) box.addView(muted("No device is connected. Connect the Googlebook, start a virtual device or pair a device below."))
@@ -196,14 +247,14 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     private fun useDevice(d: JSONObject) {
-        postAction("/api/devices/target", JSONObject().put("serial", d.optString("serial")).put("port", d.optInt("port")))
+        postAction("/api/devices/target", JSONObject().put("serial", d.optText("serial")).put("port", d.optInt("port")))
     }
 
     /** POSTs an action whose reply is {ok, message}, shows the message and reads the lists again. */
     private fun postAction(path: String, body: JSONObject, long: Boolean = false, rerender: Boolean = true, then: ((JSONObject) -> Unit)? = null) {
         Api.async("android-action", { Api.post(path, body, 120000) }) { r, e ->
             if (r == null) { notice(e?.message ?: "The action failed.", true); return@async }
-            notice(r.optString("message").ifEmpty { if (r.optBoolean("ok")) "Done." else "The action failed." }, long || !r.optBoolean("ok"))
+            notice(r.optText("message").ifEmpty { if (r.optBoolean("ok")) "Done." else "The action failed." }, long || !r.optBoolean("ok"))
             then?.invoke(r)
             if (rerender) render()
         }
@@ -218,55 +269,86 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
         }
         val guard = v.optBoolean("guard")
         if (!guard) box.addView(warn("The Forge Android guard service is not running. It protects the Linux VM while Android runs, so virtual devices will not start. Install it with guard/install.sh in the Forge folder."))
-        for (n in v.optJSONArray("notices").objs()) box.addView(warn(n.optString("message")))
+        for (n in v.optJSONArray("notices").objs()) box.addView(warn(n.optText("message")))
         val sh = v.optJSONObject("shield") ?: JSONObject()
-        if (guard && sh.optString("warning").isNotEmpty()) box.addView(warn(sh.optString("warning")))
+        if (guard && sh.optText("warning").isNotEmpty()) box.addView(warn(sh.optText("warning")))
         else if (guard && sh.has("fresh") && !sh.optBoolean("fresh")) box.addView(warn("The guard's VM shield has not reported for over a minute. Check it with: systemctl status forge-android-guard"))
         else if (guard && sh.optBoolean("fresh")) {
+            // Each sentence comes from what the guard reports now (forge_android_guard.py writes shield.json).
             val fixed = sh.optInt("fixed")
-            box.addView(hint("VM shield on: Android cannot suspend, hibernate, restart or crash the Linux VM, and Android's changes to the VM's kernel settings are put back." +
-                (if (fixed > 0) " In the last 15 minutes it put back $fixed " + (if (fixed == 1) "change." else "changes.") else "")))
+            val s = StringBuilder("VM shield on: the Forge Android guard ends an Android that starts to shut down or restart before the shutdown reaches the Linux VM, and puts back Android's changes to the VM's kernel settings and file permissions.")
+            if (sh.optBoolean("wake_lock_held")) s.append(" It holds a kernel wake lock, which makes Android's suspend service wait instead of suspending the VM.")
+            if (sh.optBoolean("hibernation_blocked")) s.append(" It holds a secret memory handle, and the kernel does not hibernate while one exists.")
+            if (fixed > 0) s.append(" In the last 15 minutes it put back $fixed " + (if (fixed == 1) "change." else "changes."))
+            box.addView(hint(s.toString()))
+            if (!sh.optBoolean("wake_lock_held")) box.addView(warn("The guard's wake lock is not held, so nothing stops Android's suspend service from putting the Linux VM to sleep. Restart the guard with: sudo systemctl restart forge-android-guard"))
+            if (!sh.optBoolean("hibernation_blocked")) box.addView(warn("The guard could not create its secret memory handle, so hibernation of the Linux VM is not blocked (the guard's log says why: journalctl -u forge-android-guard)."))
         }
         val profiles = dev.optJSONObject("profiles") ?: JSONObject()
         val target = dev.optJSONObject("target")
         val liveDevices = dev.optJSONArray("devices").objs()
         for (d in v.optJSONArray("devices").objs()) {
-            val phase = d.optString("phase")
+            val phase = d.optText("phase")
             val busy = phase in setOf("starting", "booting", "stopping")
             val running = d.optBoolean("running")
-            val live = liveDevices.firstOrNull { it.optString("serial") == d.optString("serial") && it.optInt("port") == 5041 && it.optString("state") == "device" }
+            val live = liveDevices.firstOrNull { it.optText("serial") == d.optText("serial") && it.optInt("port") == 5041 && it.optText("state") == "device" }
             val badges = ArrayList<View>()
-            if (d.optString("persona").isNotEmpty()) badges.add(badge("persona", false, "Android with this device's screen, identity, features and battery behavior. It is not the maker's own interface; for that, use a real device or a device lab."))
+            if (d.optText("persona").isNotEmpty()) badges.add(badge("persona", false, "Android with this device's screen, identity, features and battery behavior. It is not the maker's own interface; for that, use a real device or a device lab."))
             badges.add(badge(phase, true))
-            val profileLabel = profiles.optJSONObject(d.optJSONObject("look")?.optString("profile") ?: "")?.optString("label") ?: ""
-            val facts = listOf(d.optString("version_label"), profileLabel, if (d.optInt("memory_mb") > 0) d.optInt("memory_mb").toString() + " MB in use" else "", d.optString("message"))
+            val profileLabel = profiles.optJSONObject(d.optJSONObject("look")?.optText("profile") ?: "")?.optText("label") ?: ""
+            val facts = listOf(d.optText("version_label"), profileLabel, if (d.optInt("memory_mb") > 0) d.optInt("memory_mb").toString() + " MB in use" else "", d.optText("message"))
                 .filter { it.isNotEmpty() }.joinToString(", ")
             val acts = FlowRow(ctx)
+            val ver = v.optJSONArray("versions").objs().firstOrNull { it.optText("version") == d.optText("version") }
             if (running) acts.addView(btn("Stop", enabled = !busy) { vdAction("/api/vd/stop", d) })
-            else acts.addView(btn("Start", primary = true, enabled = !busy, tooltip = "Starts the device in the Linux VM; it becomes the target device when it is ready") { vdAction("/api/vd/start", d) })
+            else acts.addView(btn("Start", primary = true, enabled = !busy, tooltip = "Starts the device in the Linux VM; it becomes the target device when it is ready" +
+                (if (ver != null) ". It needs " + gb(ver.optInt("host_need_mb")) + " free on the Googlebook." else "")) { vdAction("/api/vd/start", d) })
             if (live != null) acts.addView(btn("Screen") { openScreen(live) })
+            else if (running) acts.addView(btn("Screen", tooltip = if (ver?.optText("backend") == "arm") "The emulated display, through QEMU, while Android starts"
+                else "The device's screen; it appears once Android answers adb, and until then the window says why it has none") { openScreen(startingDevice(d)) })
             if (live != null && !same(live, target)) acts.addView(btn("Use") { useDevice(live) })
             acts.addView(btn("Rename") {
-                SideKit.askText(ctx, "Rename " + d.optString("name"), d.optString("name"), "New name", "Rename") { name ->
-                    postAction("/api/vd/rename", JSONObject().put("id", d.optString("id")).put("name", name))
+                SideKit.askText(ctx, "Rename " + d.optText("name"), d.optText("name"), "New name", "Rename") { name ->
+                    postAction("/api/vd/rename", JSONObject().put("id", d.optText("id")).put("name", name))
                 }
             })
             val upgrades = d.optJSONArray("upgrades").objs()
             if (!running && upgrades.isNotEmpty()) {
                 val up = upgrades.last()
-                acts.addView(btn("Upgrade to " + up.optString("label"),
+                acts.addView(btn("Upgrade to " + up.optText("label"),
                     tooltip = "Moves this device to the newer installed version of its family and keeps its apps and data; Android migrates them on the next start, as a phone does after a system upgrade") {
-                    postAction("/api/vd/move", JSONObject().put("id", d.optString("id")).put("version", up.optString("version")), long = true)
+                    postAction("/api/vd/move", JSONObject().put("id", d.optText("id")).put("version", up.optText("version")), long = true)
                 })
             }
-            box.addView(deviceRow(live != null && same(live, target), if (running) Ui.green else Ui.red, d.optString("name"), badges, facts, acts))
+            box.addView(deviceRow(live != null && same(live, target), if (running) Ui.green else Ui.red, d.optText("name"), badges, facts, acts))
         }
         box.addView(updatesBlock(v))
         box.addView(createBlock(dev, v))
-        return section("Virtual devices", box, hint("Real Android running in the Linux VM, without hardware virtualization. One device needs its memory limit (2.5 to 3 GB) plus 2.3 GB free on the Googlebook, so stop it, or unload the Llama model, when memory is short. Screen profiles, dark theme and text size change live in the device window. Watches are watch-sized, round screens of phone Android, because Wear OS itself cannot run here. Versions marked (ARM, emulated) are the makers' own Android under ARM emulation: real but slow, 15 to 30 minutes to the first screen."))
+        return section("Virtual devices", box, hint("Real Android running in the Linux VM, without hardware virtualization. Each device runs inside its own memory limit and starts only when the Googlebook has that limit plus 2.3 GB free (the version you choose below shows its numbers), so stop a device, or unload the chat model (Unload the model from memory in the command palette), when memory is short. Screen profiles, dark theme and text size change live in the device window, and every start applies them again. Versions marked (ARM, emulated) are the makers' own Android under ARM emulation."))
     }
 
-    /** The create form: version, device type, persona and label, with the download hint of the chosen version. */
+    /** A running virtual device that adb does not list yet (it is still starting), in the form the device window takes. */
+    private fun startingDevice(d: JSONObject): JSONObject = JSONObject().put("serial", d.optText("serial")).put("port", 5041)
+        .put("kind", "virtual").put("state", "starting").put("name", d.optText("name")).put("virtual_id", d.optText("id"))
+
+    /** Megabytes as gigabytes with one decimal, the way the hints write them (3584 is 3.5 GB). */
+    private fun gb(mb: Int): String {
+        val s = String.format(java.util.Locale.US, "%.1f", mb / 1024.0)
+        return (if (s.endsWith(".0")) s.dropLast(2) else s) + " GB"
+    }
+
+    /** Where a version comes from and what starting it needs, from the server's facts about that version. */
+    private fun versionFacts(x: JSONObject): String {
+        val cap = x.optInt("cap_mb")
+        return x.optText("about") + (if (cap > 0) " It runs inside a memory limit of " + gb(cap) + ", so it starts only with " +
+            gb(x.optInt("host_need_mb")) + " free on the Googlebook and " + gb(x.optInt("vm_need_mb")) + " free in the Linux VM." else "")
+    }
+
+    /**
+     * The create form: version, device type, persona and label, with what the chosen version is, what starting it
+     * needs, its download, and what the chosen type and persona amount to on that version. The types and personas a
+     * version cannot take are grayed out, and the choices survive the view being built again while it polls.
+     */
     private fun createBlock(dev: JSONObject, v: JSONObject): View {
         val col = Ui.column(ctx)
         val versions = v.optJSONArray("versions").objs()
@@ -274,108 +356,136 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
         val profiles = dev.optJSONObject("profiles") ?: JSONObject()
         val personas = dev.optJSONArray("personas").objs()
         val ver = Dropdown(ctx, "Android version")
-        ver.setItems(versions.map { Dropdown.Item(it.optString("version"), it.optString("label") + (if (it.optBoolean("installed")) "" else " (download first)")) },
+        ver.setItems(versions.map { Dropdown.Item(it.optText("version"), it.optText("label") + (if (it.optBoolean("installed")) "" else " (download first)")) },
             prefs.getString("createVersion", "") ?: "")
         val typ = Dropdown(ctx, "Device type and screen")
         val typeKeys = types.keys().asSequence().toList()
         val pers = Dropdown(ctx, "Persona: Android dressed as a specific device (its screen, cutout, identity, features and the maker's battery behavior)")
-        val persItems = ArrayList<Dropdown.Item>()
-        persItems.add(Dropdown.Item("", "No persona"))
-        for (x in personas) persItems.add(Dropdown.Item(x.optString("id"), x.optString("name") + " persona" + (if (x.optString("certainty") == "exact") "" else " (approximate)"),
-            group = x.optString("maker") + " (" + x.optString("skin") + ")"))
-        pers.setItems(persItems, "")
+        val typeHint = hint("")
+        typeHint.visibility = View.GONE
         val persHint = hint("")
         persHint.visibility = View.GONE
         val dl = Ui.column(ctx)
+        fun chosen(): JSONObject? = versions.firstOrNull { it.optText("version") == ver.value }
         fun showDownload() {
             dl.removeAllViews()
-            val x = versions.firstOrNull { it.optString("version") == ver.value } ?: return
+            val x = chosen() ?: return
             val job = x.optJSONObject("job")
             if (job != null && job.optBoolean("running")) {
                 val lines = job.optJSONArray("lines")
-                val last = if (lines != null && lines.length() > 0) lines.optString(lines.length() - 1) else "starting"
-                dl.addView(hint("Downloading " + x.optString("label") + ": " + last))
+                val last = if (lines != null && lines.length() > 0) lines.optText(lines.length() - 1) else "starting"
+                dl.addView(hint("Downloading " + x.optText("label") + ": " + last))
             } else if (!x.optBoolean("installed")) {
-                val backend = x.optString("backend")
-                dl.addView(hint(x.optString("label") + " (" + x.optString("detail") + ") is not downloaded yet: " + x.optString("size") + "." +
-                    (if (backend == "waydroid") " It is LineageOS from the WayDroid-ATV project, a community build made for containers; Forge checks the published checksums." +
-                        (if (x.optString("version").contains("google")) " Its Google apps are the ones that project includes. Signing in to Google Play may first need the device registered at google.com/android/uncertified." else "")
-                    else " Android 11 to 16 come from the open-source Redroid project.")))
-                dl.addView(actions(btn("Download " + x.optString("label")) {
-                    postAction("/api/vd/download", JSONObject().put("version", x.optString("version")), long = true)
+                dl.addView(hint(x.optText("label") + " (" + x.optText("detail") + ") is not downloaded yet: " + x.optText("size") + ". " + versionFacts(x)))
+                dl.addView(actions(btn("Download " + x.optText("label")) {
+                    postAction("/api/vd/download", JSONObject().put("version", x.optText("version")), long = true)
                 }))
-            } else if (job != null && job.has("ok") && !job.isNull("ok") && !job.optBoolean("ok")) {
-                val lines = job.optJSONArray("lines")
-                val tail = if (lines != null) (maxOf(0, lines.length() - 2) until lines.length()).joinToString(" ") { lines.optString(it) } else ""
-                dl.addView(warn("The last download failed: $tail"))
+            } else {
+                dl.addView(hint(x.optText("label") + " (" + x.optText("detail") + "). " + versionFacts(x)))
+                if (job != null && job.has("ok") && !job.isNull("ok") && !job.optBoolean("ok")) {
+                    val lines = job.optJSONArray("lines")
+                    val tail = if (lines != null) (maxOf(0, lines.length() - 2) until lines.length()).joinToString(" ") { lines.optText(it) } else ""
+                    dl.addView(warn("The last download failed: $tail"))
+                }
+            }
+        }
+        fun showTypeNote() {
+            val note = chosen()?.optJSONObject("type_notes")?.optText(typ.value) ?: ""
+            typeHint.text = note
+            typeHint.visibility = if (note.isEmpty() || pers.value.isNotEmpty()) View.GONE else View.VISIBLE
+        }
+        fun personaChanged() {
+            createPersona = pers.value
+            val x = personas.firstOrNull { it.optText("id") == pers.value }
+            typ.enabled = x == null
+            showTypeNote()
+            val ver0 = chosen()
+            val off = ver0?.optText("personas_off") ?: ""
+            if (x == null) {
+                // Why personas are grayed out for this version, when they are.
+                val allowed = ver0?.optJSONArray("types")?.let { a -> (0 until a.length()).map { a.optText(it) } } ?: emptyList()
+                val text = if (off.isNotEmpty()) off
+                    else if (personas.any { it.optText("kind") !in allowed }) "A persona is grayed out when " + (ver0?.optText("label") ?: "this version") + " cannot be that kind of device."
+                    else ""
+                persHint.text = text
+                persHint.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
+            } else {
+                val behavior = x.optText("behavior")
+                persHint.visibility = View.VISIBLE
+                persHint.text = x.optText("name") + ": " + x.optInt("width") + "×" + x.optInt("height") + " at " + x.optInt("density") + " dpi" +
+                    (if (x.optJSONObject("cutout") != null) ", camera hole" else "") + ", " + x.optText("maker") + " identity and features" +
+                    (if (behavior.isNotEmpty() && behavior != "stock" && behavior != "pixel") ", " + x.optText("maker") + " battery behavior available" else "") + ". " +
+                    (if (x.optText("certainty") == "exact") "Screen values from the maker's published data or the device's own source tree. " else "Some screen values are approximate. ") + x.optText("note")
             }
         }
         fun versionChanged() {
             prefs.edit().putString("createVersion", ver.value).apply()
-            val x = versions.firstOrNull { it.optString("version") == ver.value }
-            val allowed = x?.optJSONArray("types")?.let { a -> (0 until a.length()).map { a.optString(it) } }
-            typ.setItems(typeKeys.map { k -> Dropdown.Item(k, profiles.optJSONObject(types.optString(k))?.optString("label") ?: k, enabled = allowed == null || k in allowed) }, typ.value)
+            val x = chosen()
+            val allowed = x?.optJSONArray("types")?.let { a -> (0 until a.length()).map { a.optText(it) } }
+            val labels = x?.optJSONObject("type_labels")
+            typ.setItems(typeKeys.map { k -> Dropdown.Item(k, labels?.optText(k)?.ifEmpty { null } ?: profiles.optJSONObject(types.optText(k))?.optText("label")?.ifEmpty { null } ?: k,
+                enabled = allowed == null || k in allowed) }, createType.ifEmpty { typ.value })
+            createType = typ.value
+            // A persona fits a version when its kind is one of the version's types; the makers' ARM systems take none.
+            val off = x?.optText("personas_off") ?: ""
+            val items = ArrayList<Dropdown.Item>()
+            items.add(Dropdown.Item("", "No persona"))
+            for (p in personas) items.add(Dropdown.Item(p.optText("id"), p.optText("name") + " persona" + (if (p.optText("certainty") == "exact") "" else " (approximate)"),
+                group = p.optText("maker") + " (" + p.optText("skin") + ")", enabled = off.isEmpty() && (allowed == null || p.optText("kind") in allowed)))
+            pers.setItems(items, createPersona)
+            pers.enabled = off.isEmpty()
+            personaChanged()
             showDownload()
         }
-        pers.onChange = { id ->
-            val x = personas.firstOrNull { it.optString("id") == id }
-            typ.enabled = x == null
-            if (x == null) { persHint.visibility = View.GONE; persHint.text = "" } else {
-                val behavior = x.optString("behavior")
-                persHint.visibility = View.VISIBLE
-                persHint.text = x.optString("name") + ": " + x.optInt("width") + "×" + x.optInt("height") + " at " + x.optInt("density") + " dpi" +
-                    (if (x.optJSONObject("cutout") != null) ", camera hole" else "") + ", " + x.optString("maker") + " identity and features" +
-                    (if (behavior.isNotEmpty() && behavior != "stock" && behavior != "pixel") ", " + x.optString("maker") + " battery behavior available" else "") + ". " +
-                    (if (x.optString("certainty") == "exact") "Screen values from the maker's published data or the device's own source tree. " else "Some screen values are approximate. ") + x.optString("note")
-            }
-        }
+        typ.onChange = { t -> createType = t; showTypeNote() }
+        pers.onChange = { personaChanged() }
         ver.onChange = { versionChanged() }
         versionChanged()
         val create = btn("Create") {
-            val x = versions.firstOrNull { it.optString("version") == ver.value }
+            val x = chosen()
             if (x == null) { notice("Choose an Android version.", false); return@btn }
-            if (!x.optBoolean("installed")) { notice("Download " + x.optString("label") + " first.", false); return@btn }
+            if (!x.optBoolean("installed")) { notice("Download " + x.optText("label") + " first.", false); return@btn }
             val body = JSONObject().put("version", ver.value).put("type", typ.value).put("persona", pers.value).put("name", createLabel.text.toString().trim())
             postAction("/api/vd/create", body) { createLabel.setText("") }
         }
         val form = FlowRow(ctx)
         form.addView(ver.view, full()); form.addView(typ.view, full()); form.addView(pers.view, full()); form.addView(own(createLabel), full()); form.addView(create)
         form.setPadding(0, dp(6), 0, dp(6))
-        col.addView(form); col.addView(persHint); col.addView(dl)
+        col.addView(form); col.addView(typeHint); col.addView(persHint); col.addView(dl)
         return col
     }
 
     /** Updates and upgrades of the images: what the daily check found, buttons to install, and the daily mode. */
     private fun updatesBlock(v: JSONObject): View {
         val u = v.optJSONObject("updates") ?: JSONObject()
-        val applying = u.optString("applying")
+        val applying = u.optText("applying")
         val checking = u.optBoolean("checking")
         val available = u.optInt("available")
         val col = rowCard(false)
         val state = if (checking) "checking" else if (applying.isNotEmpty()) "installing $applying" else if (available > 0) "$available available" else "current"
         col.addView(nameLine(0, "Updates and upgrades", listOf(badge(state, true))))
         val when_ = if (u.optDouble("checked", 0.0) > 0) formatTime(u.optDouble("checked")) else "never"
-        col.addView(facts("Last check: " + when_ + (if (u.optString("error").isNotEmpty()) ". " + u.optString("error") else "") +
+        col.addView(facts("Last check: " + when_ + (if (u.optText("error").isNotEmpty()) ". " + u.optText("error") else "") +
             ". Every image comes from its project's own release feed: a newer build of the same version is an update, and the same family for a newer Android is an upgrade."))
         val errors = u.optJSONArray("errors")
-        if (errors != null) for (i in 0 until errors.length()) col.addView(warn("The check could not reach " + errors.optString(i)))
+        if (errors != null) for (i in 0 until errors.length()) col.addView(warn("The check could not reach " + errors.optText(i)))
         for (it in u.optJSONArray("items").objs()) {
             val update = it.optJSONObject("update"); val upgrade = it.optJSONObject("upgrade")
-            val err = it.optString("error"); val blocked = it.optString("upgrade_blocked")
+            val err = it.optText("error"); val blocked = it.optText("upgrade_blocked")
             if (update == null && upgrade == null && err.isEmpty() && blocked.isEmpty()) continue
-            val sb = StringBuilder(it.optString("label") + ": ")
+            val sb = StringBuilder(it.optText("label") + ": ")
             if (err.isNotEmpty()) sb.append("check failed: ").append(err)
-            if (update != null) sb.append("update available, ").append(update.optString("label")).append(" (").append(update.optString("size")).append("). ")
-            if (upgrade != null) sb.append(if (update != null) " " else "").append("upgrade available: ").append(upgrade.optString("label")).append(" (").append(upgrade.optString("size")).append(")")
+            if (update != null) sb.append("update available, ").append(update.optText("label")).append(" (").append(update.optText("size")).append("). ")
+            if (upgrade != null) sb.append(if (update != null) " " else "").append("upgrade available: ").append(upgrade.optText("label")).append(" (").append(upgrade.optText("size")).append(")")
                 .append(if (upgrade.optBoolean("installed")) ", installed; devices can move to it with their Upgrade button. " else ". ")
             if (blocked.isNotEmpty()) sb.append(" ").append(blocked)
             col.addView(facts(sb.toString()))
             val acts = FlowRow(ctx)
             if (update != null) acts.addView(btn("Update", primary = true, enabled = applying.isEmpty()) {
-                postAction("/api/vd/updates/apply", JSONObject().put("version", it.optString("version")).put("kind", "update"), long = true)
+                postAction("/api/vd/updates/apply", JSONObject().put("version", it.optText("version")).put("kind", "update"), long = true)
             })
             if (upgrade != null && !upgrade.optBoolean("installed")) acts.addView(btn("Upgrade", primary = true, enabled = applying.isEmpty()) {
-                postAction("/api/vd/updates/apply", JSONObject().put("version", it.optString("version")).put("kind", "upgrade"), long = true)
+                postAction("/api/vd/updates/apply", JSONObject().put("version", it.optText("version")).put("kind", "upgrade"), long = true)
             })
             if (acts.childCount > 0) col.addView(actions(acts))
         }
@@ -400,12 +510,12 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
         })
         acts.addView(mode.view, full())
         col.addView(actions(acts))
-        for (l in u.optJSONArray("log").objs()) col.addView(muted(formatTime(l.optDouble("time")) + " " + l.optString("message")))
+        for (l in u.optJSONArray("log").objs()) col.addView(muted(formatTime(l.optDouble("time")) + " " + l.optText("message")))
         return col
     }
 
     private fun vdAction(path: String, d: JSONObject) {
-        postAction(path, JSONObject().put("id", d.optString("id")), long = true)
+        postAction(path, JSONObject().put("id", d.optText("id")), long = true)
     }
 
     // ---------------------------------------------------------------- device labs (the makers' real software)
@@ -427,6 +537,7 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
             if (st == null) { gBody.addView(hint(e?.message ?: "Google's lab could not be read.")); return@async }
             googleStatus = st; googleStatusAt = System.currentTimeMillis()
             fillGoogle(gBody, st)
+            keepPollingLab()
         }
         // Samsung's Remote Test Lab
         val s = labCard("Samsung Remote Test Lab (free)",
@@ -442,12 +553,12 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
             Api.async("cloud-samsung", { Api.get("/api/cloud/samsung", timeoutMs = 90000) }) { r, e ->
                 sBody.removeAllViews()
                 if (r == null) { sBody.addView(hint(e?.message ?: "Samsung's device list could not be read.")); return@async }
-                if (!r.optBoolean("ok")) { sBody.addView(hint(r.optString("message"))); return@async }
+                if (!r.optBoolean("ok")) { sBody.addView(hint(r.optText("message"))); return@async }
                 sBody.addView(hint(r.optInt("units").toString() + " Android devices in Samsung's labs (and " + r.optInt("tizen_units") + " Samsung TVs, which run Tizen, not Android). The newest:"))
                 for (p in r.optJSONArray("products").objs().take(25)) {
                     val vs = p.optJSONArray("versions")
-                    val two = if (vs != null) (0 until minOf(2, vs.length())).joinToString(", ") { vs.optString(it) } else ""
-                    sBody.addView(factRow(null, p.optString("name"), two + " (" + p.optInt("units") + ")"))
+                    val two = if (vs != null) (0 until minOf(2, vs.length())).joinToString(", ") { vs.optText(it) } else ""
+                    sBody.addView(factRow(null, p.optText("name"), two + " (" + p.optInt("units") + ")"))
                 }
             }
         })
@@ -469,46 +580,55 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
             gBody.addView(hint("Sign in once with your Google account: run \"android auth login\" in a terminal and follow the link it shows. Forge never sees your password."))
             gBody.addView(actions(btn("Open a terminal for sign-in") { terminal("android auth login", "Google sign-in") }))
         }
-        val price = st.optString("price")
+        val price = st.optText("price")
         gBody.addView(hint(price))
         val pick = Dropdown(ctx, "Device and Android version")
         pick.setItems(listOf(Dropdown.Item("", "Loading the lab's devices…")), "")
-        val out = Ui.text(ctx, "", 11f, Ui.fg2, mono = true)
+        pick.onChange = { t -> labPick = t }
+        val out = Ui.text(ctx, labListText, 11f, Ui.fg2, mono = true)
         out.setTextIsSelectable(true)
-        out.visibility = View.GONE
+        out.visibility = if (labListText.isEmpty()) View.GONE else View.VISIBLE
+        val resv = Dropdown(ctx, "The reservation that Extend and Return act on (My reservations lists yours)")
+        resv.setItems(if (labReservations.isEmpty()) listOf(Dropdown.Item("", "No reservation listed: press My reservations"))
+            else labReservations.map { Dropdown.Item(it, "Reservation $it") }, labReservation)
+        labReservation = resv.value
+        resv.onChange = { id -> labReservation = id }
         val reserve = btn("Reserve", primary = true, enabled = signedIn) {
             val target = pick.value; val pj = labProject.text.toString().trim()
             if (target.isEmpty() || pj.isEmpty()) { notice("Choose a device and enter your project ID.", false); return@btn }
             prefs.edit().putString("labProject", pj).apply()
             SideKit.confirm(ctx, "Reserve " + pick.label() + " in Google's device lab?", price + "\n\nReturn the device when you are done, so it stops costing money.", "Reserve") {
-                postAction("/api/cloud/google/reserve", JSONObject().put("target", target).put("project", pj).put("confirmed", true), long = true, rerender = false)
+                // The reservation runs for minutes on the server; the view follows it and reads everything again when it ends.
+                postAction("/api/cloud/google/reserve", JSONObject().put("target", target).put("project", pj).put("confirmed", true), long = true, rerender = false) { r ->
+                    if (r.optBoolean("ok")) { googleStatusAt = 0; render() }
+                }
             }
         }
-        val list = btn("My reservations", enabled = signedIn) {
-            val pj = labProject.text.toString().trim()
-            Api.async("cloud-list", { Api.get("/api/cloud/google/list", mapOf("project" to pj), 90000) }) { r, e ->
-                out.visibility = View.VISIBLE
-                out.text = r?.optString("text")?.ifEmpty { "No reservations." } ?: (e?.message ?: "The list could not be read.")
-            }
-        }
+        val list = btn("My reservations", enabled = signedIn) { listReservations(quiet = false) }
         val giveBack = btn("Return device", enabled = signedIn) {
-            postAction("/api/cloud/google/release", JSONObject().put("reservation", labReservation.text.toString().trim()).put("project", labProject.text.toString().trim()), long = true)
+            val id = resv.value
+            if (id.isEmpty()) { notice("Choose the reservation to return: press My reservations first.", true); return@btn }
+            postAction("/api/cloud/google/release", JSONObject().put("reservation", id).put("project", labProject.text.toString().trim()), long = true, rerender = false) {
+                googleStatusAt = 0; listReservations(quiet = true); render()
+            }
         }
         val extend = btn("Extend 15 minutes", enabled = signedIn) {
-            SideKit.confirm(ctx, "Extend this reservation by 15 minutes?", price, "Extend") {
-                postAction("/api/cloud/google/extend", JSONObject().put("reservation", labReservation.text.toString().trim()).put("project", labProject.text.toString().trim())
-                    .put("minutes", 15).put("confirmed", true), long = true, rerender = false)
+            val id = resv.value
+            if (id.isEmpty()) { notice("Choose the reservation to extend: press My reservations first.", true); return@btn }
+            SideKit.confirm(ctx, "Extend reservation $id by 15 minutes?", price, "Extend") {
+                postAction("/api/cloud/google/extend", JSONObject().put("reservation", id).put("project", labProject.text.toString().trim())
+                    .put("minutes", 15).put("confirmed", true), long = true, rerender = false) { listReservations(quiet = true) }
             }
         }
         val f1 = FlowRow(ctx); f1.addView(pick.view, full()); f1.addView(own(labProject), full()); f1.addView(reserve)
-        val f2 = FlowRow(ctx); f2.addView(list); f2.addView(own(labReservation), full()); f2.addView(giveBack); f2.addView(extend)
+        val f2 = FlowRow(ctx); f2.addView(list); f2.addView(resv.view, full()); f2.addView(giveBack); f2.addView(extend)
         gBody.addView(f1); gBody.addView(f2); gBody.addView(out)
         val jobs = st.optJSONObject("jobs")
         if (jobs != null) for (k in jobs.keys()) {
             val j = jobs.optJSONObject(k) ?: continue
             val lines = j.optJSONArray("lines")
-            val tail = if (lines != null && lines.length() > 0) ". " + (maxOf(0, lines.length() - 3) until lines.length()).joinToString(" ") { lines.optString(it) } else ""
-            val text = j.optString("what") + (if (j.optBoolean("running")) ": running" else if (j.optBoolean("ok")) ": done" else ": failed") + tail
+            val tail = if (lines != null && lines.length() > 0) ". " + (maxOf(0, lines.length() - 3) until lines.length()).joinToString(" ") { lines.optText(it) } else ""
+            val text = j.optText("what") + (if (j.optBoolean("running")) ": running" else if (j.optBoolean("ok")) ": done" else ": failed") + tail
             gBody.addView(if (!j.optBoolean("running") && !j.optBoolean("ok")) warn(text) else hint(text))
         }
         fun fillModels(m: JSONObject) {
@@ -516,16 +636,16 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
             items.add(Dropdown.Item("", if (m.optBoolean("ok")) "Choose a device" else "The device list could not be read"))
             for (mk in m.optJSONArray("makers").objs()) {
                 val models = mk.optJSONArray("models").objs()
-                val group = mk.optString("maker") + " (" + models.size + ")"
+                val group = mk.optText("maker") + " (" + models.size + ")"
                 for (md in models) {
                     val ts = md.optJSONArray("targets") ?: continue
                     for (i in 0 until ts.length()) {
-                        val t = ts.optString(i)
-                        items.add(Dropdown.Item(t, md.optString("name") + ", Android API " + t.substringAfter('/'), group = group))
+                        val t = ts.optText(i)
+                        items.add(Dropdown.Item(t, md.optText("name") + ", Android API " + t.substringAfter('/'), group = group))
                     }
                 }
             }
-            pick.setItems(items, "")
+            pick.setItems(items, labPick)
         }
         val models = googleModels
         if (models != null) fillModels(models)
@@ -533,6 +653,19 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
             if (m == null) { pick.setItems(listOf(Dropdown.Item("", e?.message ?: "The device list could not be read")), ""); return@async }
             googleModels = m
             if (pick.view.isAttachedToWindow) fillModels(m)
+        }
+    }
+
+    /** My reservations: Google's listing for reading, and the reservation IDs that Extend and Return choose from. */
+    private fun listReservations(quiet: Boolean) {
+        val pj = labProject.text.toString().trim()
+        Api.async("cloud-list", { Api.get("/api/cloud/google/list", mapOf("project" to pj), 150000) }) { r, e ->
+            if (r == null) { if (!quiet) notice(e?.message ?: "The list could not be read.", true); return@async }
+            labListText = r.optText("text").ifEmpty { "No reservations." }
+            val a = r.optJSONArray("ids")
+            labReservations = if (a != null) (0 until a.length()).map { a.optText(it) }.filter { it.isNotEmpty() } else emptyList()
+            if (labReservation !in labReservations) labReservation = labReservations.firstOrNull() ?: ""
+            if (devices != null) rebuild()
         }
     }
 
@@ -578,7 +711,7 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
                 if (r == null) { found.addView(muted(e?.message ?: "The scan failed.")); return@async }
                 val list = r.optJSONArray("found").objs()
                 if (list.isEmpty()) found.addView(muted("No announcements reached the Linux VM. Type the address shown on the device instead."))
-                for (x in list) found.addView(factRow(Ui.green, x.optString("service"), x.optString("name") + " " + x.optString("address")))
+                for (x in list) found.addView(factRow(Ui.green, x.optText("service"), x.optText("name") + " " + x.optText("address")))
             }
         })
         return section("Pair a phone, tablet, watch or TV",
@@ -589,7 +722,7 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
     // ---------------------------------------------------------------- this project, Kotlin Multiplatform, toolchains, Rust
     private fun targetName(): String {
         val t = devices?.optJSONObject("target") ?: return "no device"
-        return t.optString("name").ifEmpty { t.optString("serial") }
+        return t.optText("name").ifEmpty { t.optText("serial") }
     }
 
     private fun projectSection(dev: JSONObject): View? {
@@ -598,11 +731,11 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
         val t = dev.optJSONObject("target")
         val box = Ui.column(ctx)
         val modules = p.optJSONArray("modules").objs()
-        appId = modules.firstOrNull { it.optBoolean("application") && it.optString("application_id").isNotEmpty() }?.optString("application_id") ?: ""
+        appId = modules.firstOrNull { it.optBoolean("application") && it.optText("application_id").isNotEmpty() }?.optText("application_id") ?: ""
         for (m in modules.filter { it.optBoolean("application") }) {
-            val apk = m.optString("apk")
-            val id = m.optString("application_id")
-            box.addView(factRow(if (apk.isNotEmpty()) Ui.green else Ui.red, m.optString("module") + " (" + id.ifEmpty { "unknown id" } + ")",
+            val apk = m.optText("apk")
+            val id = m.optText("application_id")
+            box.addView(factRow(if (apk.isNotEmpty()) Ui.green else Ui.red, m.optText("module") + " (" + id.ifEmpty { "unknown id" } + ")",
                 if (apk.isNotEmpty()) "APK built " + formatTime(m.optDouble("apk_time")) else "not built yet"))
             val acts = FlowRow(ctx)
             acts.addView(btn("Build, install and run", primary = true, tooltip = "Builds the debug APK in a terminal, then installs it on " + targetName() + " and starts it") { buildInstallRun(m, true) })
@@ -618,17 +751,17 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
                 if (f == null) notice("Open the LOGCAT tab in the bottom panel and enter the app id $id.", true) else f(id)
             })
             acts.addView(btn("Compose previews", tooltip = "Renders every @Preview of this module as pictures on phone, foldable, tablet, round and square watch and TV screens, without a device (forge-preview)") {
-                val mod = m.optString("module")
-                terminal("forge-preview " + (if (mod == ".") ":" else ":" + mod.split("/").joinToString(":")), "Compose previews")
+                val mod = m.optText("module")
+                build("forge-preview " + (if (mod == ".") ":" else ":" + mod.split("/").joinToString(":")), "Compose previews")
             })
             box.addView(actions(acts))
         }
         val more = FlowRow(ctx)
-        more.addView(btn("Lint") { terminal("forge-gradle lint", "Android lint") })
-        more.addView(btn("Unit tests") { terminal("forge-gradle test", "Gradle tests") })
-        more.addView(btn("Release bundle (AAB)") { terminal("forge-gradle bundleRelease", "Gradle bundle") })
+        more.addView(btn("Lint") { build("forge-gradle lint", "Android lint") })
+        more.addView(btn("Unit tests") { build("forge-gradle test", "Gradle tests") })
+        more.addView(btn("Release bundle (AAB)") { build("forge-gradle bundleRelease", "Gradle bundle") })
         box.addView(actions(more))
-        if (!p.optBoolean("gradlew")) box.addView(hint("This project has no gradlew; forge-gradle uses Gradle " + (info?.optJSONObject("toolchains")?.optString("gradle") ?: "") + " instead."))
+        if (!p.optBoolean("gradlew")) box.addView(hint("This project has no gradlew; forge-gradle uses Gradle " + (info?.optJSONObject("toolchains")?.optText("gradle") ?: "") + " instead."))
         box.addView(hint("Target device: " + targetName() + "."))
         return section("This Android project", box)
     }
@@ -641,11 +774,11 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
             "iosX64" to "iOS", "iosSimulatorArm64" to "iOS", "native" to "Native", "apple" to "Apple", "web" to "Web", "linuxX64" to "Linux", "macos" to "macOS")
         val box = Ui.column(ctx)
         for (m in mods) {
-            val path = m.optString("gradle_path")
-            val targets = m.optJSONArray("targets")?.let { a -> (0 until a.length()).map { a.optString(it) } } ?: emptyList()
+            val path = m.optText("gradle_path")
+            val targets = m.optJSONArray("targets")?.let { a -> (0 until a.length()).map { a.optText(it) } } ?: emptyList()
             val shown = targets.map { names[it] ?: it }.distinct()
-            box.addView(factRow(Ui.green, m.optString("module"), "targets: " + (shown.joinToString(", ").ifEmpty { "none found" })))
-            fun task(text: String, task: String, title: String? = null) = btn(text, tooltip = title ?: task) { terminal("forge-gradle $path:$task", text) }
+            box.addView(factRow(Ui.green, m.optText("module"), "targets: " + (shown.joinToString(", ").ifEmpty { "none found" })))
+            fun task(text: String, task: String, title: String? = null) = btn(text, tooltip = title ?: task) { build("forge-gradle $path:$task", text) }
             val acts = FlowRow(ctx)
             acts.addView(task("Check common code", "compileCommonMainKotlinMetadata"))
             if ("jvm" in targets) { acts.addView(task("Build JVM", "compileKotlinJvm")); acts.addView(task("JVM tests", "jvmTest")) }
@@ -665,8 +798,8 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
 
     private fun toolchainSection(): View? {
         val t = info?.optJSONObject("toolchains") ?: return null
-        fun strs(key: String): List<String> = t.optJSONArray(key)?.let { a -> (0 until a.length()).map { a.optString(it) } } ?: emptyList()
-        fun s(key: String): String = if (t.isNull(key)) "" else t.optString(key)
+        fun strs(key: String): List<String> = t.optJSONArray(key)?.let { a -> (0 until a.length()).map { a.optText(it) } } ?: emptyList()
+        fun s(key: String): String = if (t.isNull(key)) "" else t.optText(key)
         fun b(key: String): Boolean = !t.isNull(key) && (t.optBoolean(key) || s(key).isNotEmpty())
         val tc = Ui.column(ctx)
         val sdk = s("android_sdk")
@@ -700,12 +833,12 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
     fun screenshotToChat(d: JSONObject?, then: ((JSONObject) -> Unit)? = null) {
         val t = d ?: devices?.optJSONObject("target")
         val body = JSONObject()
-        if (t != null) body.put("serial", t.optString("serial")).put("port", t.optInt("port"))
+        if (t != null) body.put("serial", t.optText("serial")).put("port", t.optInt("port"))
         Api.async("screenshot", { Api.post("/api/android/screenshot", body, 40000) }) { meta, e ->
             if (meta == null) { notice(e?.message ?: "The screenshot failed.", true); return@async }
-            val record = JSONObject(meta.toString()).put("kind", "image").put("name", (t?.optString("name")?.ifEmpty { null } ?: "Device") + " screen")
+            val record = JSONObject(meta.toString()).put("kind", "image").put("name", (t?.optText("name")?.ifEmpty { null } ?: "Device") + " screen")
             val f = attachToChat
-            if (f == null) { notice("The chat is not connected to the Android view yet, so the screenshot stays on the server as image " + meta.optString("id") + ".", true); return@async }
+            if (f == null) { notice("The chat is not connected to the Android view yet, so the screenshot stays on the server as image " + meta.optText("id") + ".", true); return@async }
             f(record)
             notice("Screenshot attached to the chat.", false)
             then?.invoke(record)
@@ -718,39 +851,77 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     private fun installApk(m: JSONObject, then: (Boolean) -> Unit) {
-        notice("Installing " + m.optString("apk") + " on " + targetName() + "…", false)
-        Api.async("install", { Api.post("/api/android/install", JSONObject().put("apk", m.optString("apk")), 300000) }) { r, e ->
+        notice("Installing " + m.optText("apk") + " on " + targetName() + "…", false)
+        Api.async("install", { Api.post("/api/android/install", JSONObject().put("apk", m.optText("apk")), 300000) }) { r, e ->
             val ok = r?.optBoolean("ok") == true
-            notice(if (ok) "Installed on " + targetName() + "." else "Install failed: " + (r?.optString("message") ?: e?.message ?: ""), true)
+            notice(if (ok) "Installed on " + targetName() + "." else "Install failed: " + (r?.optText("message") ?: e?.message ?: ""), true)
             then(ok)
         }
     }
 
     private fun launchApp(m: JSONObject) {
-        val id = m.optString("application_id")
+        val id = m.optText("application_id")
         Api.async("launch", { Api.post("/api/android/launch", JSONObject().put("app_id", id), 60000) }) { r, e ->
             val ok = r?.optBoolean("ok") == true
-            notice(if (ok) "Started $id." else "Could not start it: " + (r?.optString("message") ?: e?.message ?: ""), true)
+            notice(if (ok) "Started $id." else "Could not start it: " + (r?.optText("message") ?: e?.message ?: ""), true)
         }
     }
 
-    /** Builds in a terminal (visible, stoppable with Ctrl C); when a newer APK appears, installs and runs it. */
+    /** A Gradle or preview build in a terminal; like every Gradle build button, it cancels an install that waited for an earlier build. */
+    private fun build(command: String, label: String) {
+        cancelPendingInstall()
+        terminal(command, label)
+    }
+
+    /** Cancels an install that waits for a build (the watch, or a build's exit code still to come). Returns the new build's token. */
+    private fun cancelPendingInstall(): Int {
+        val waiting = watch != null || installWaits
+        watch?.let { handler.removeCallbacks(it) }
+        watch = null
+        installWaits = false
+        if (waiting) notice("The install that waited for the earlier build is cancelled, because a new build started.", false)
+        return ++buildToken
+    }
+
+    private var installWaits = false
+
+    /**
+     * Builds in a terminal (visible, stoppable with Ctrl C); with [thenRun], installs and starts the APK once that
+     * build exits with success. A failed or interrupted build installs nothing.
+     */
     private fun buildInstallRun(m: JSONObject, thenRun: Boolean) {
         val started = System.currentTimeMillis() / 1000.0
-        val module = m.optString("module")
+        val module = m.optText("module")
         val cdir = if (module.isNotEmpty() && module != ".") ":" + module.replace("/", ":") + ":" else ""
-        terminal("forge-gradle " + cdir + "assembleDebug", "Gradle build")
+        val command = "forge-gradle " + cdir + "assembleDebug"
+        val token = cancelPendingInstall()
+        val task = runTask
+        if (task != null) {
+            installWaits = thenRun
+            task(command, "Gradle build") { code ->
+                if (token != buildToken) return@task   // a later build button took over
+                installWaits = false
+                when {
+                    code == 0 && thenRun -> installBuilt(module)
+                    code == 0 -> { notice("The debug APK of $module is built.", false); if (shown) render() }
+                    code < 0 -> notice("The build's terminal was closed before the build finished" + (if (thenRun) ", so nothing was installed." else "."), true)
+                    else -> notice("The build failed (exit code $code)" + (if (thenRun) ", so nothing was installed" else "") + ". The terminal shows why.", true)
+                }
+            }
+            return
+        }
+        // Without the exit code: watch for a newer APK of the module, for at most 30 minutes.
+        terminal(command, "Gradle build")
         if (!thenRun) return
-        watch?.let { handler.removeCallbacks(it) }
         var waited = 0
         lateinit var tick: Runnable
         tick = Runnable {
             waited += 5
             if (waited > 1800) { watch = null; return@Runnable }
             Api.async("apk-watch", { Api.get("/api/android/status", timeoutMs = 60000) }) { s, _ ->
-                if (watch !== tick) return@async
-                val mm = s?.optJSONObject("project")?.optJSONArray("modules").objs()?.firstOrNull { it.optString("module") == module }
-                if (mm != null && mm.optString("apk").isNotEmpty() && mm.optDouble("apk_time", 0.0) > started) {
+                if (watch !== tick || token != buildToken) return@async
+                val mm = s?.optJSONObject("project")?.optJSONArray("modules").objs().firstOrNull { it.optText("module") == module }
+                if (mm != null && mm.optText("apk").isNotEmpty() && mm.optDouble("apk_time", 0.0) > started) {
                     watch = null
                     installApk(mm) { ok -> if (ok) launchApp(mm); render() }
                 } else handler.postDelayed(tick, 5000)
@@ -758,6 +929,18 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
         }
         watch = tick
         handler.postDelayed(tick, 5000)
+    }
+
+    /** After a successful build: the module's newest APK is installed on the target device and started. */
+    private fun installBuilt(module: String) {
+        Api.async("apk-built", { Api.get("/api/android/status", timeoutMs = 60000) }) { s, e ->
+            val mm = s?.optJSONObject("project")?.optJSONArray("modules").objs().firstOrNull { it.optText("module") == module }
+            if (mm == null || mm.optText("apk").isEmpty()) {
+                notice("The build succeeded, but Forge found no APK of $module to install" + (if (e != null) ": " + e.message else "."), true)
+                return@async
+            }
+            installApk(mm) { ok -> if (ok) launchApp(mm); render() }
+        }
     }
 
     /** A command for a terminal tab; without the terminal hook, the command is shown and put on the clipboard. */
@@ -777,7 +960,7 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
     private fun dp(v: Int) = Ui.dp(ctx, v)
     private fun okColor(ok: Boolean) = if (ok) Ui.green else Ui.red
     private fun full(): ViewGroup.LayoutParams = ViewGroup.LayoutParams(Ui.match, Ui.wrap)
-    private fun same(a: JSONObject?, b: JSONObject?): Boolean = a != null && b != null && a.optString("serial") == b.optString("serial") && a.optInt("port") == b.optInt("port")
+    private fun same(a: JSONObject?, b: JSONObject?): Boolean = a != null && b != null && a.optText("serial") == b.optText("serial") && a.optInt("port") == b.optInt("port")
     private fun formatTime(seconds: Double): String = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date((seconds * 1000).toLong()))
     private fun notice(s: String, long: Boolean) { Toast.makeText(ctx, s, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show() }
     /** Takes a persistent input out of the row of the previous render before it is added again. */
@@ -880,6 +1063,21 @@ class AndroidPanel(private val ctx: Context, private val host: MainActivity) {
         if (tooltip != null) { b.tooltipText = tooltip; b.contentDescription = tooltip }
         return b
     }
+}
+
+/**
+ * A text field, or [fallback] when the field is missing or JSON null. Android's optString returns the text "null"
+ * for a JSON null, which made a missing APK look built and an install that runs nothing look busy.
+ */
+internal fun JSONObject?.optText(key: String, fallback: String = ""): String {
+    if (this == null || isNull(key)) return fallback
+    return opt(key)?.toString() ?: fallback
+}
+
+/** The same for an element of an array. */
+internal fun JSONArray?.optText(index: Int, fallback: String = ""): String {
+    if (this == null || isNull(index)) return fallback
+    return opt(index)?.toString() ?: fallback
 }
 
 /** The objects of a JSON array (missing arrays and non-object items give an empty list or are skipped). */

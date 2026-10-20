@@ -6,7 +6,9 @@ Configuration: ~/.forge-ide/mcp.json
     "filesystem": {"command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/home/you/projects"]}
   }
 }
-Every call has a timeout; a server that does not answer is dropped. Servers are started lazily on first use.
+Every call has a timeout; a server that does not answer is stopped. Servers are started lazily on first use, and a
+server that failed to start is not tried again for ten minutes (the MCP card's Connect button tries at once), so a
+broken server never delays every message.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 CONFIG = os.path.expanduser(os.path.join(os.environ.get("FORGE_HOME", "~/.forge-ide"), "mcp.json"))
+RETRY_AFTER_S = 600
 
 
 class MCPServer:
@@ -31,6 +34,7 @@ class MCPServer:
         self.next_id = 1
         self.tools: List[dict] = []
         self.error: Optional[str] = None
+        self.failed_at = 0.0
 
     def start(self) -> bool:
         if self.proc and self.proc.poll() is None:
@@ -42,6 +46,7 @@ class MCPServer:
                                          cwd=self.cwd or None, env=env, text=True, bufsize=1)
         except OSError as e:
             self.error = f"cannot start: {e}"
+            self.failed_at = time.time()
             return False
         try:
             self._request("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -53,6 +58,7 @@ class MCPServer:
             return True
         except Exception as e:  # noqa: BLE001
             self.error = f"handshake failed: {e}"
+            self.failed_at = time.time()
             self.stop()
             return False
 
@@ -168,8 +174,12 @@ class MCP:
         self._ensure()
         out = []
         for name, s in self.servers.items():
+            wait = int(max(0.0, RETRY_AFTER_S - (time.time() - s.failed_at))) if s.failed_at else 0
+            err = s.error
+            if err and wait > 0:
+                err += f" (Forge tries again in {max(1, wait // 60)} min, or press Connect)"
             out.append({"name": name, "running": bool(s.proc and s.proc.poll() is None), "tools": [t.get("name") for t in s.tools],
-                        "error": s.error, "command": s.command})
+                        "error": err, "command": s.command})
         return out
 
     def connect_all(self) -> List[dict]:
@@ -185,13 +195,25 @@ class MCP:
         self._ensure()
         lines = []
         for n, s in self.servers.items():
-            if not s.tools and not s.proc:
+            # A server that failed recently is skipped until its retry time, so the message does not wait for it.
+            if not s.tools and not s.proc and time.time() - s.failed_at >= RETRY_AFTER_S:
                 s.start()
             for t in s.tools:
                 props = (t.get("inputSchema") or {}).get("properties") or {}
                 params = ", ".join(f'"{k}": {v.get("type", "any")}' for k, v in props.items())
                 lines.append(f"- mcp_{n}_{t.get('name')}: {(t.get('description') or '').strip()[:300]}\n  arguments: {{{params}}}")
         return "\n".join(lines)
+
+    def schemas(self) -> List[dict]:
+        """The MCP tools of the running servers in the native tool-calling format (Ollama's), for native mode."""
+        out = []
+        for n, s in self.servers.items():
+            for t in s.tools:
+                params = t.get("inputSchema") or {"type": "object", "properties": {}}
+                out.append({"type": "function", "function": {"name": f"mcp_{n}_{t.get('name')}",
+                                                             "description": (t.get("description") or "").strip()[:500],
+                                                             "parameters": params}})
+        return out
 
     def call_tool(self, full_name: str, args: dict) -> str:
         self._ensure()

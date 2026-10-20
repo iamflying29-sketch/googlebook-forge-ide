@@ -29,6 +29,7 @@ KEYS = {"back": 4, "home": 3, "recents": 187, "enter": 66, "delete": 67, "tab": 
         "volume_up": 24, "volume_down": 25, "up": 19, "down": 20, "left": 21, "right": 22, "center": 23}
 
 # Screen profiles for virtual devices: (label, width, height, density). Switching is live (wm size and wm density).
+NATIVE_PROFILE = "native"
 PROFILES: Dict[str, Tuple[str, int, int, int]] = {
     "phone": ("Phone", 1080, 2400, 420),
     "small-phone": ("Small phone", 720, 1600, 320),
@@ -41,6 +42,9 @@ PROFILES: Dict[str, Tuple[str, int, int, int]] = {
     "desktop": ("Desktop window", 1920, 1080, 160),
     "car": ("Car display", 1408, 792, 160),   # Google's Automotive emulator profile, 1408 by 792 at 160 dpi
     "xr": ("XR headset panel", 1920, 1080, 320),   # the 2D panel of Google's XR emulator; approximate
+    # Emulated ARM devices only: no override, so Android uses the emulated display's own size and density
+    # (`wm size reset` and `wm density reset`). Container devices are sized at their start, so it means nothing there.
+    NATIVE_PROFILE: ("The emulated display's own size", 0, 0, 0),
 }
 PROFILES.update(personas.profiles())   # persona:<id>, each device persona's own screen
 
@@ -315,6 +319,21 @@ def is_googlebook(serial: str, port: int) -> bool:
     return port == MAIN_PORT and (serial == googlebook_serial() or serial in _published_addresses())
 
 
+def display_name(serial: str, port: int) -> str:
+    """A device's name as the Android view shows it: a virtual device's own name, this Googlebook, or the maker and
+    model from the probe (cached for a minute), with the serial when nothing else is known."""
+    from . import vdevice
+    vd = vdevice.by_serial(serial) if port == FORGE_PORT else None
+    if vd:
+        return vd["name"]
+    if is_googlebook(serial, port):
+        return "this Googlebook"
+    info = probe(serial, port)
+    maker, model = info.get("maker", ""), info.get("model", "")
+    name = " ".join(x for x in (maker.title() if maker.lower() not in model.lower() else "", model) if x)
+    return f"{name} ({serial})" if name else serial
+
+
 def env_for_commands() -> Dict[str, str]:
     """ANDROID_SERIAL and ANDROID_ADB_SERVER_PORT for one agent command, so plain `adb` reaches the target device."""
     saved = _read_target()
@@ -398,8 +417,7 @@ def send_input(serial: str, port: int, kind: str, a: dict) -> dict:
         text = str(a.get("text", ""))[:500]
         if not text:
             return {"ok": True, "message": ""}
-        # `input text` takes %s for spaces; the whole text is quoted for the device's shell.
-        cmd = "input text " + shlex.quote(text.replace("%", "\\%").replace(" ", "%s"))
+        cmd = "; ".join("input text " + shlex.quote(part) for part in input_text_parts(text))
     elif kind == "key":
         code = KEYS.get(str(a.get("key", "")))
         if code is None:
@@ -408,7 +426,27 @@ def send_input(serial: str, port: int, kind: str, a: dict) -> dict:
     else:
         return {"ok": False, "message": "Unknown input."}
     rc, out, err = adb(["shell", cmd], serial=serial, port=port, timeout=12)
-    return {"ok": rc == 0, "message": ((out or "") + (err or "")).strip()[-200:]}
+    text_out = ((out or "") + (err or "")).strip()
+    if kind == "text" and "Exception" in text_out:
+        # Android's input command types only what its virtual keyboard has (plain ASCII) and fails on the rest.
+        return {"ok": False, "message": "Android's input command could not type this text; it types only plain ASCII characters."}
+    return {"ok": rc == 0, "message": text_out[-200:]}
+
+
+def input_text_parts(text: str) -> List[str]:
+    """The text for `input text`, which turns "%s" into a space and has no escape at all: spaces become "%s", every
+    other character stays as it is (a "%" before anything but "s" is typed as a "%"), and the text is cut between a
+    "%" and a following "s" so that pair reaches the device in two separate calls and is typed as it is."""
+    parts: List[str] = []
+    cur = ""
+    for ch in text:
+        if ch == "s" and cur.endswith("%"):
+            parts.append(cur)
+            cur = ""
+        cur += "%s" if ch == " " else ch
+    if cur:
+        parts.append(cur)
+    return parts
 
 
 def set_look(serial: str, port: int, a: dict) -> dict:
@@ -421,11 +459,17 @@ def set_look(serial: str, port: int, a: dict) -> dict:
     cmds = []
     look = dict(vd.get("look") or {})
     if "profile" in a:
-        prof = PROFILES.get(str(a["profile"]))
+        key = str(a["profile"])
+        prof = PROFILES.get(key)
         if not prof:
             return {"ok": False, "message": "Unknown screen profile."}
-        look["profile"] = str(a["profile"])
-        cmds += [f"wm size {prof[1]}x{prof[2]}", f"wm density {prof[3]}"]
+        if key == NATIVE_PROFILE:
+            if vdevice.VERSIONS.get(vd["version"], {}).get("backend") != "arm":
+                return {"ok": False, "message": "The emulated display's own size is a choice for emulated ARM devices only; this device's screen is sized when it starts."}
+            cmds += ["wm size reset", "wm density reset"]
+        else:
+            cmds += [f"wm size {prof[1]}x{prof[2]}", f"wm density {prof[3]}"]
+        look["profile"] = key
     if "dark" in a:
         look["dark"] = bool(a["dark"])
         cmds.append("cmd uimode night " + ("yes" if look["dark"] else "no"))
@@ -442,7 +486,12 @@ def set_look(serial: str, port: int, a: dict) -> dict:
     rc, out, err = adb(["shell", "; ".join(cmds)], serial=serial, port=port, timeout=20)
     vdevice.save_look(vd["id"], look)
     forget_probe(serial, port)
-    return {"ok": rc == 0, "message": ((out or "") + (err or "")).strip()[-300:], "look": look}
+    text = ((out or "") + (err or "")).strip()[-300:]
+    if rc != 0:
+        # Every start applies the saved look once Android is up, so the change is not lost.
+        text = ("The device did not take the change now, so Forge saved it and applies it the next time the device "
+                "finishes starting" + (f" (adb said: {text})" if text else "") + ".")
+    return {"ok": rc == 0, "message": text, "look": look}
 
 
 # ------------------------------------------------------------------ install, run, screenshot on any device

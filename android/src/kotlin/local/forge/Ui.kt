@@ -67,6 +67,8 @@ object Ui {
     val blue = Color.parseColor("#82aaff")
 
     fun dp(c: Context, v: Int): Int = (v * c.resources.displayMetrics.density + 0.5f).toInt()
+    /** The screen density, for drawing code that has no Context at hand. */
+    val density: Float get() = android.content.res.Resources.getSystem().displayMetrics.density
 
     fun text(c: Context, s: CharSequence, size: Float = 13f, color: Int = fg, mono: Boolean = false, bold: Boolean = false): TextView {
         val t = TextView(c)

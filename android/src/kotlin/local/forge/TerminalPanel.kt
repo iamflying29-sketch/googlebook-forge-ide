@@ -29,6 +29,11 @@ class TerminalPanel(private val ctx: Context, private val host: MainActivity, pr
     private val resizeTask = Runnable { sendResize() }
     private val gray = Ui.fg3
 
+    /** The shell's session id on the server ("main", "t2" and so on). */
+    val id: String get() = termId
+    /** Tasks typed into this shell that still wait for their exit code (TerminalTabs.runTask), by token. */
+    private val tasks = HashMap<String, (Int) -> Unit>()
+
     init {
         view.orientation = LinearLayout.VERTICAL
         view.setBackgroundColor(Ui.bg)
@@ -36,6 +41,8 @@ class TerminalPanel(private val ctx: Context, private val host: MainActivity, pr
         // No header of its own: TerminalTabs shows one bar for all shells with this shell's state on it.
         state = capsLabel("NOT CONNECTED", gray)
         terminal.onMenuAction = { action, text -> if (action == "add-to-chat") host.addTerminalToChat(text) }
+        // A task's shell line ends with an OSC 7737 that carries its token and exit code.
+        terminal.term.onTaskDone = { token, code -> tasks.remove(token)?.invoke(code) }
 
         // The terminal itself, inset like the web page's .term-host (4 px top and bottom, 10 px left, 6 px right).
         terminal.setPadding(Ui.dp(ctx, 10), Ui.dp(ctx, 4), Ui.dp(ctx, 6), Ui.dp(ctx, 4))
@@ -106,7 +113,7 @@ class TerminalPanel(private val ctx: Context, private val host: MainActivity, pr
     private fun onMessage(text: String) {
         if (!connected) { connected = true; reconnectDelayS = 3; setState("CONNECTED", Ui.green); sendResize() }
         if (text.length < 200 && text.startsWith("{\"type\"") && text.endsWith("}")) {
-            val type = try { JSONObject(text).optString("type") } catch (e: Exception) { "" }
+            val type = try { JSONObject(text).optText("type") } catch (e: Exception) { "" }
             if (type == "exit") { terminal.write("\r\n\u001b[90m[process exited]\u001b[0m\r\n"); return }
             if (type == "pong") return
         }
@@ -142,12 +149,31 @@ class TerminalPanel(private val ctx: Context, private val host: MainActivity, pr
 
     fun focusInput() { terminal.requestFocus() }
 
-    /** Ends this shell on the server (the Kill button of the terminal tabs). */
-    fun kill() {
+    /**
+     * Types a task's line into the shell; [onDone] gets its exit code when the line has run (the line prints an
+     * OSC 7737 with [token]), or -1 when the shell is killed first.
+     */
+    fun runTask(line: String, token: String, onDone: (Int) -> Unit) {
+        tasks[token] = onDone
+        pasteText(line)
+    }
+
+    /**
+     * Ends this shell on the server (the Kill button and a middle click on its tab). [then] runs once the server has
+     * answered, so a new shell started then is a fresh one and never the dying one. Tasks still waiting get -1.
+     */
+    fun kill(then: (() -> Unit)? = null) {
         close()
-        Api.async("terminal-kill", { Api.post("/api/terminal/kill", JSONObject().put("id", termId)) }) { _, _ -> }
+        val waiting = ArrayList(tasks.values)
+        tasks.clear()
+        for (t in waiting) t(-1)
         terminal.reset()
-        setState("KILLED")
+        setState("KILLING")
+        Api.async("terminal-kill", { Api.post("/api/terminal/kill", JSONObject().put("id", termId)) }) { _, e ->
+            setState("KILLED")
+            if (e != null) terminal.write("\u001b[90m[The shell could not be ended on the server: ${e.message}]\u001b[0m\r\n")
+            then?.invoke()
+        }
     }
 
     fun close() {

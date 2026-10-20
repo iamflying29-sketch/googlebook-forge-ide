@@ -147,14 +147,14 @@ class CommandPalette(private val ctx: Context, private val host: MainActivity) {
                     val known = host.currentSymbols()
                     if (known.isNotEmpty() || path.isEmpty()) fill(known)
                     else {
-                        val client = Lsp.clientFor(path)
+                        val client = Lsp.clientFor(path, host.windowFolder())
                         if (client == null) fill(emptyList()) else client.documentSymbols(path) { l, _ -> if (g == generation) fill(l) }
                     }
                 }
                 q.startsWith("#") -> {
                     val needle = q.substring(1).trim()
                     val path = host.activeFile()
-                    val client = if (path.isNotEmpty()) Lsp.clientFor(path) else null
+                    val client = if (path.isNotEmpty()) Lsp.clientFor(path, host.windowFolder()) else null
                     if (client == null || needle.isEmpty()) { show(listOf(Item(if (client == null) "Open a file whose language has a language server" else "Type part of a name", "", "", R.drawable.ic_braces, null, null) { })); return }
                     client.workspaceSymbols(needle) { l, err ->
                         if (g != generation) return@workspaceSymbols
