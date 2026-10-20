@@ -324,7 +324,7 @@ object Chrome {
         return v
     }
 
-    // ---------------------------------------------------------------- placeholder panels
+    // ---------------------------------------------------------------- panel headers
     /** A side panel header: uppercase title on the left, small action buttons on the right. */
     fun panelHeader(c: Context, title: String, vararg actions: View): LinearLayout {
         val row = Ui.row(c, Ui.sectionLabel(c, title).also { it.layoutParams = Ui.lp(0, Ui.wrap, 1f) }, *actions)
@@ -333,25 +333,4 @@ object Chrome {
         return row
     }
 
-    /** A native "coming next" panel for the views the native window does not have yet, in the Forge look. */
-    fun placeholder(c: Context, icon: Int, title: String, body: String): LinearLayout {
-        val col = Ui.column(c)
-        col.setBackgroundColor(Ui.panel)
-        col.addView(panelHeader(c, title))
-        val inner = Ui.column(c)
-        inner.gravity = Gravity.CENTER_HORIZONTAL
-        inner.setPadding(Ui.dp(c, 20), Ui.dp(c, 28), Ui.dp(c, 20), Ui.dp(c, 20))
-        inner.addView(Ui.iconView(c, icon, Ui.fg3, 32))
-        val h = Ui.text(c, title, 14f, Ui.fg, bold = true); h.gravity = Gravity.CENTER; h.setPadding(0, Ui.dp(c, 12), 0, Ui.dp(c, 6))
-        inner.addView(h, Ui.lp(Ui.match, Ui.wrap))
-        val p = Ui.text(c, body, 12.5f, Ui.fg2); p.gravity = Gravity.CENTER
-        inner.addView(p, Ui.lp(Ui.match, Ui.wrap))
-        val tag = Ui.text(c, "Coming next in the native window", 11f, Ui.accent2, bold = true)
-        tag.background = Ui.rounded(Ui.accentSoft, 99)
-        tag.setPadding(Ui.dp(c, 10), Ui.dp(c, 3), Ui.dp(c, 10), Ui.dp(c, 4))
-        val tagLp = Ui.lp(Ui.wrap, Ui.wrap); tagLp.topMargin = Ui.dp(c, 16)
-        inner.addView(tag, tagLp)
-        col.addView(inner, Ui.lp(Ui.match, Ui.wrap))
-        return col
-    }
 }
