@@ -1701,7 +1701,35 @@ class Handler(BaseHTTPRequestHandler):
             runs = s.get("runs", [])
             idx = next((i for i, r in enumerate(runs) if r.get("run_id") == rid), None)
             if idx is None:
-                return self._error(404, "that reply has no checkpoint")
+                # A reply that died before Forge recorded it (a crash, a memory wait that never ended) has no
+                # checkpoint of its own. Any file it changed under its own id is put back, and nothing else is touched.
+                done = list(st.checkpoints.changes(rid)) if rid else []
+                msgs = []
+                for ch in done:
+                    if ch.kind != "reverted":
+                        try:
+                            msgs.append(self._run_ws(rid, ws).revert(rid, ch.path))
+                        except Exception as e:  # noqa: BLE001
+                            msgs.append(f"{ch.path}: {e}")
+                # The model's context is cut where this message was sent: the user turn of the transcript that
+                # carries the run id gives the text, and its last copy in the model's messages marks the cut. A
+                # second restore finds no copy and cuts nothing.
+                text = next((str(t.get("text", "")) for t in s.get("transcript", []) if t.get("role") == "user" and t.get("run_id") == rid), "")
+                hist = s.get("messages", [])
+                cut = None
+                if text.strip():
+                    for k in range(len(hist) - 1, -1, -1):
+                        m = hist[k]
+                        c = m.get("content")
+                        c = c if isinstance(c, str) else json.dumps(c)
+                        if m.get("role") == "user" and c.startswith(text.strip()[:200]):
+                            cut = k
+                            break
+                if cut is not None:
+                    s["messages"] = hist[:cut]
+                    s["runs"] = [r for r in runs if int(r.get("msg_index", 0)) < cut]
+                    st.save_session(s)
+                return self._json(200, {"ok": True, "messages": msgs})
             msgs = []
             for r in reversed(runs[idx:]):
                 rws = self._run_ws(r["run_id"], ws)

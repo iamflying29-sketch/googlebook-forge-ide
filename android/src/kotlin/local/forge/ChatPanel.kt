@@ -97,6 +97,8 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
     private val verboseToggle: TextView
     private val autoToggle: TextView
     private val send: ImageButton
+    private val stopButton: ImageButton
+    private val queueButton: ImageButton
     private val statsText: TextView
 
     private val tabs = ArrayList<Tab>()
@@ -176,10 +178,13 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
                 val blocks = turn.optJSONArray("blocks") ?: JSONArray()
                 var failed = false; var answered = false
                 for (b in blocks.objects()) { if (b.optString("type") == "status" && b.optBoolean("error")) failed = true; if (b.optString("type") == "text" || b.optString("type") == "tool") answered = true }
-                if (failed && !answered && prev != null && prev.optString("role") == "user" && k == n - 1) {
+                val lastBlock = blocks.optJSONObject(blocks.length() - 1)
+                val endedInError = lastBlock != null && lastBlock.optString("type") == "status" && lastBlock.optBoolean("error")
+                if ((failed || endedInError) && endedInError && prev != null && prev.optString("role") == "user" && k == n - 1) {
                     val item = JSONObject().put("text", prev.optString("text")).put("attachments", prev.optJSONArray("attachments") ?: JSONArray()).put("mode", turn.optString("mode", mode))
                     val tab = this
-                    m.addView(retryRow(tab, item) {
+                    // A reply that failed partway keeps what came back, and the new attempt follows below it.
+                    if (answered) m.addView(retryRow(tab, item, null)) else m.addView(retryRow(tab, item) {
                         if (tab.transcript.length() >= 2) { tab.transcript.remove(tab.transcript.length() - 1); tab.transcript.remove(tab.transcript.length() - 1) }
                         val idx = pane.indexOfChild(m)
                         pane.removeView(m)
@@ -284,7 +289,7 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         prompt.setOnKeyListener { _, code, ev ->
             when {
                 mentions.handleKey(code, ev) -> true
-                code == KeyEvent.KEYCODE_ENTER && !ev.isShiftPressed -> { if (ev.action == KeyEvent.ACTION_DOWN) send(); true }
+                code == KeyEvent.KEYCODE_ENTER && !ev.isShiftPressed -> { if (ev.action == KeyEvent.ACTION_DOWN) send(now = !ev.isAltPressed); true }
                 code == KeyEvent.KEYCODE_ESCAPE && ev.action == KeyEvent.ACTION_DOWN && active?.run != null -> { stopActive(); true }
                 else -> false
             }
@@ -308,16 +313,32 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         send.scaleType = ImageView.ScaleType.CENTER_INSIDE
         send.setPadding(dp(8), dp(8), dp(8), dp(8))
         send.tooltipText = "Send (Enter)"; send.contentDescription = "Send"
-        send.setOnClickListener { sendOrStop() }
-        val spacer = View(ctx)
-        val bar = Ui.row(ctx, modePill, modelPill, spacer, statsText, attach, image, mic, send)
-        modelPill.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = dp(6) }
-        modelPill.maxWidth = dp(150); modelPill.ellipsize = TextUtils.TruncateAt.MIDDLE
-        spacer.layoutParams = Ui.lp(0, 1, 1f)
-        statsText.layoutParams = Ui.lp(Ui.wrap, Ui.wrap).also { it.rightMargin = dp(8) }
+        send.setOnClickListener { send() }
+        // While a reply runs, Stop sits next to Send, and Send queues the message (like Cursor).
+        stopButton = ImageButton(ctx)
+        stopButton.setImageDrawable(Ui.icon(ctx, R.drawable.ic_stop, Ui.fg))
+        stopButton.background = Ui.rounded(Ui.bg4, 17, border2)
+        stopButton.scaleType = ImageView.ScaleType.CENTER_INSIDE
+        stopButton.setPadding(dp(9), dp(9), dp(9), dp(9))
+        stopButton.tooltipText = "Stop the reply (Escape)"; stopButton.contentDescription = "Stop"
+        stopButton.setOnClickListener { stopActive() }
+        stopButton.visibility = View.GONE
+        queueButton = Ui.miniButton(ctx, R.drawable.ic_queue, "Queue this message (Alt Enter): it is sent when the current reply finishes") { send(now = false) }
+        queueButton.visibility = View.GONE
+        // The model pill takes the room that is left and shortens its name, so the buttons always stay on screen.
+        val bar = Ui.row(ctx, modePill, modelPill, attach, image, mic, queueButton, stopButton, send)
+        modelPill.layoutParams = Ui.lp(0, Ui.wrap, 1f).also { it.leftMargin = dp(6); it.rightMargin = dp(4) }
+        modelPill.isSingleLine = true; modelPill.ellipsize = TextUtils.TruncateAt.END
+        modePill.isSingleLine = true
         for (b in listOf(attach, image, mic)) b.layoutParams = Ui.lp(dp(28), dp(28)).also { it.leftMargin = dp(2) }
-        send.layoutParams = Ui.lp(dp(34), dp(34)).also { it.leftMargin = dp(8) }
-        composer.addView(bar, Ui.lp(Ui.match, Ui.wrap).also { it.topMargin = dp(6) })
+        queueButton.layoutParams = Ui.lp(dp(28), dp(28)).also { it.leftMargin = dp(2) }
+        stopButton.layoutParams = Ui.lp(dp(34), dp(34)).also { it.leftMargin = dp(6) }
+        send.layoutParams = Ui.lp(dp(34), dp(34)).also { it.leftMargin = dp(6) }
+        // The speed and context readout has its own line, so it can never push the buttons away.
+        statsText.isSingleLine = true; statsText.ellipsize = TextUtils.TruncateAt.END
+        statsText.gravity = Gravity.END
+        composer.addView(statsText, Ui.lp(Ui.match, Ui.wrap).also { it.topMargin = dp(3) })
+        composer.addView(bar, Ui.lp(Ui.match, Ui.wrap).also { it.topMargin = dp(4) })
         view.addView(composer, Ui.lp(Ui.match, Ui.wrap))
         mode = prefs.getString("mode", "agent") ?: "agent"
         if (mode.isEmpty()) mode = "agent"
@@ -1291,13 +1312,22 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
     private fun retryRow(tab: Tab, item: JSONObject, before: (() -> Unit)?): View {
         val row = Ui.row(ctx)
         row.setPadding(0, dp(4), 0, dp(6))
-        row.addView(Ui.button(ctx, "Retry") {
-            if (tab.run != null || tab.pending) { Ui.toast(ctx, "Wait until this chat has finished, or stop it first."); return@button }
+        // A real button: a filled accent pill with an icon, so it reads as something to press.
+        val label = Ui.text(ctx, "Retry", 13f, Ui.onAccent, bold = true)
+        val btn = Ui.row(ctx, Ui.iconView(ctx, R.drawable.ic_refresh, Ui.onAccent, 16), label)
+        label.setPadding(dp(6), 0, 0, 0)
+        btn.background = Ui.states(Ui.rounded(Ui.accent, 8), Ui.rounded(Ui.accent2, 8), Ui.rounded(Ui.accent2, 8))
+        btn.setPadding(dp(14), dp(7), dp(16), dp(7))
+        btn.isClickable = true; btn.isFocusable = true
+        btn.tooltipText = "Send the same message again"
+        btn.setOnClickListener {
+            if (tab.run != null || tab.pending) { Ui.toast(ctx, "Wait until this chat has finished, or stop it first."); return@setOnClickListener }
             (row.parent as? ViewGroup)?.removeView(row)
             before?.invoke()
             val copy = JSONObject().put("text", item.optString("text")).put("attachments", JSONArray(item.optJSONArray("attachments")?.toString() ?: "[]")).put("mode", item.optString("mode", mode))
             startRun(tab, copy)
-        })
+        }
+        row.addView(btn, Ui.lp(Ui.wrap, Ui.wrap))
         return row
     }
 
@@ -1348,8 +1378,10 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
 
     private fun refreshComposer() {
         val busy = active?.run != null
-        send.setImageDrawable(Ui.icon(ctx, if (busy) R.drawable.ic_stop else R.drawable.ic_send, Ui.onAccent))
-        send.tooltipText = if (busy) "Stop the reply (Escape)" else "Send (Enter)"
+        send.setImageDrawable(Ui.icon(ctx, R.drawable.ic_send, Ui.onAccent))
+        send.tooltipText = if (busy) "Send now (Enter): stops the current reply and sends this message at once" else "Send (Enter)"
+        stopButton.visibility = if (busy) View.VISIBLE else View.GONE
+        queueButton.visibility = if (busy) View.VISIBLE else View.GONE
     }
 
     private fun stopActive() { val t = active ?: return; cancelRun(t) }
@@ -1359,15 +1391,8 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         Api.async("cancel", { Api.post("/api/cancel", JSONObject().put("run_id", r.id)) }) { _, _ -> }
     }
 
-    /** The send button: stops a running reply, otherwise sends. */
-    private fun sendOrStop() {
-        val t = active
-        if (t != null && t.run != null && prompt.text.isBlank()) { cancelRun(t); return }
-        send()
-    }
-
     /** Sends the prompt; while a reply runs the message waits in the queue and goes out when the reply ends. */
-    private fun send() {
+    private fun send(now: Boolean = true) {
         val t = active
         if (t == null) { newChat { send() }; return }
         if (t.pending) return
@@ -1404,7 +1429,14 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         prompt.setText(""); t.draft = ""
         prefs.edit().remove(draftKey()).apply()
         attachments.clear(); renderAttachments()
-        if (t.run != null) { t.queue.add(item); renderQueue(); host.flashStatus("Queued. It is sent when the current reply finishes."); return }
+        if (t.run != null) {
+            if (now) {
+                // Send now: the running reply stops, and this message goes out first as soon as it has ended.
+                t.queue.add(0, item); renderQueue(); cancelRun(t)
+                host.flashStatus("Stopping the current reply and sending your message.")
+            } else { t.queue.add(item); renderQueue(); host.flashStatus("Queued. It is sent when the current reply finishes.") }
+            return
+        }
         startRun(t, item)
     }
 

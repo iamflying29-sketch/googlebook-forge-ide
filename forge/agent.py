@@ -20,7 +20,8 @@ READ_ONLY_TOOLS = {"read_file", "list_dir", "find_files", "search", "web_fetch",
                    "look_at_image", "todo_write", "docs_search", "remember"}
 # The tool call tag is Forge's own name on purpose: Ollama's parsers for Qwen models intercept "<tool_call>" in the
 # model's output, try to read it as Qwen's XML format and drop the reply when that fails (seen 2026-10-19).
-TAGS = ("<thinking>", "</thinking>", "<forge_tool>", "</forge_tool>")
+# Qwen3.5 on the GPU engine sometimes writes its native <tool_call> tag instead; it is read the same way (2026-10-20).
+TAGS = ("<thinking>", "</thinking>", "<forge_tool>", "</forge_tool>", "<tool_call>", "</tool_call>")
 
 
 # ---------------------------------------------------------------------- stream segmenter
@@ -66,14 +67,14 @@ def segment(text: str) -> Tuple[List[Dict[str, str]], bool]:
                 mode = "thinking"
             elif matched == "</thinking>":
                 mode = "text"
-            elif matched == "<forge_tool>":
+            elif matched in ("<forge_tool>", "<tool_call>"):
                 if mode == "tool_call":
                     # A second opening tag before the first closed: keep the first call only.
                     i += len(matched)
                     continue
                 mode = "tool_call"
                 segs.append({"type": "tool_call", "text": ""})
-            elif matched == "</forge_tool>":
+            elif matched in ("</forge_tool>", "</tool_call>"):
                 closed = True
                 mode = "text"
             i += len(matched)
@@ -229,7 +230,15 @@ def parse_tool_call(raw: str) -> Tuple[Optional[dict], Optional[str]]:
 
 
 def estimate_tokens(text: str) -> int:
-    return int(len(text) / 3.3) + 1
+    """A cautious token count. Prose is about 3.3 characters per token, but JSON, logs, hashes and escaped text are
+    closer to 2 (a session transcript read on 2026-10-20 counted 18,647 real tokens where len/3.3 said about 11,000),
+    so text with few letters is counted at 2.1 characters per token."""
+    if not text:
+        return 1
+    sample = text[:4000]
+    letters = sum(1 for ch in sample if ch.isalpha() or ch == " ")
+    per = 3.3 if letters >= 0.72 * len(sample) else 2.1
+    return int(len(text) / per) + 1
 
 
 # ---------------------------------------------------------------------- run state
@@ -325,7 +334,7 @@ class Agent:
             "top_k": int(s.get("top_k", 40)),
             "repeat_penalty": float(s.get("repeat_penalty", 1.05)),
             "num_predict": int(s.get("num_predict", 3072)),
-            "stop": ["</forge_tool>", "<|eot_id|>", "<|start_header_id|>"],
+            "stop": ["</forge_tool>", "</tool_call>", "<|eot_id|>", "<|start_header_id|>"],
         }
         if s.get("num_thread"):
             opts["num_thread"] = int(s["num_thread"])
@@ -468,10 +477,13 @@ class Agent:
                 base += "\n\n## Indexed documentation for docs_search\n" + ", ".join(docs)
         return base
 
-    def _trim(self, messages: List[dict], run: Run) -> List[dict]:
-        """Keep the conversation inside the context window. Old tool outputs go first, then old turns."""
+    def _trim(self, messages: List[dict], run: Run, budget_override: Optional[int] = None) -> List[dict]:
+        """Keep the conversation inside the context window. Old tool outputs go first, then old turns, and when that
+        is not enough the largest remaining messages are shortened (their start and end are kept)."""
         budget = int(self.settings.get("num_ctx", 8192)) - int(self.settings.get("num_predict", 3072)) // 2 - 512
         budget = max(budget, 2048)
+        if budget_override:
+            budget = max(1024, min(budget, budget_override))
 
         def total() -> int:
             return sum(estimate_tokens(m.get("content", "")) for m in messages)
@@ -489,6 +501,21 @@ class Agent:
         while total() > budget and len(messages) > 4:
             # messages[0] is the system prompt, [1] the first user message; drop the oldest after that.
             del messages[2]
+            trimmed += 1
+        # Still too long (one huge file or tool output): shorten the largest messages after the system prompt.
+        guard = 0
+        while total() > budget and guard < 12:
+            guard += 1
+            idx = max(range(1, len(messages)), key=lambda i: len(messages[i].get("content", "") if isinstance(messages[i].get("content"), str) else ""), default=None)
+            if idx is None:
+                break
+            c = messages[idx].get("content", "")
+            if not isinstance(c, str) or len(c) < 1200:
+                break
+            over = total() - budget
+            keep = max(800, len(c) - int(over * 2.4) - 200)
+            head, tail = c[: keep * 2 // 3], c[-(keep // 3):]
+            messages[idx]["content"] = head + f"\n\n[... {len(c) - len(head) - len(tail):,} characters left out to fit the model's context window; read a smaller part if you need them ...]\n\n" + tail
             trimmed += 1
         if trimmed:
             run.emit("verbose", kind="trim", text=f"Context trimmed: {trimmed} old messages or tool outputs shortened "
@@ -548,7 +575,19 @@ class Agent:
                 run.finish("paused")
                 return
             self._trim(msgs, run)
-            assistant_text, tool_call, stats = self._stream_assistant(run, msgs, model, native)
+            try:
+                assistant_text, tool_call, stats = self._stream_assistant(run, msgs, model, native)
+            except OllamaError as e:
+                # The engine counted more tokens than the estimate: shrink to its own numbers and try once more.
+                m = re.search(r'"n_prompt_tokens":\s*(\d+).*?"n_ctx":\s*(\d+)', str(e))
+                if not m:
+                    raise
+                n_prompt, n_ctx = int(m.group(1)), int(m.group(2))
+                est = sum(estimate_tokens(x.get("content", "") if isinstance(x.get("content"), str) else "") for x in msgs)
+                target = int(est * (n_ctx - int(self.settings.get("num_predict", 3072)) // 2 - 512) / max(1, n_prompt))
+                run.emit("status", text=f"The conversation was too long for the model ({n_prompt:,} of {n_ctx:,} tokens); Forge shortened it and tries again.")
+                self._trim(msgs, run, budget_override=target)
+                assistant_text, tool_call, stats = self._stream_assistant(run, msgs, model, native)
             if run.cancel.is_set():
                 msgs.append({"role": "assistant", "content": assistant_text})
                 run.emit("status", text="Stopped by user.")
