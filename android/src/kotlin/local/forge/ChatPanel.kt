@@ -97,7 +97,7 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
     private val verboseToggle: TextView
     private val autoToggle: TextView
     private val send: ImageButton
-    private val stopButton: ImageButton
+    private val sendNowButton: ImageButton
     private val queueButton: ImageButton
     private val statsText: TextView
 
@@ -289,7 +289,7 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         prompt.setOnKeyListener { _, code, ev ->
             when {
                 mentions.handleKey(code, ev) -> true
-                code == KeyEvent.KEYCODE_ENTER && !ev.isShiftPressed -> { if (ev.action == KeyEvent.ACTION_DOWN) send(now = !ev.isAltPressed); true }
+                code == KeyEvent.KEYCODE_ENTER && !ev.isShiftPressed -> { if (ev.action == KeyEvent.ACTION_DOWN) send(now = ev.isCtrlPressed); true }
                 code == KeyEvent.KEYCODE_ESCAPE && ev.action == KeyEvent.ACTION_DOWN && active?.run != null -> { stopActive(); true }
                 else -> false
             }
@@ -313,26 +313,27 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         send.scaleType = ImageView.ScaleType.CENTER_INSIDE
         send.setPadding(dp(8), dp(8), dp(8), dp(8))
         send.tooltipText = "Send (Enter)"; send.contentDescription = "Send"
-        send.setOnClickListener { send() }
-        // While a reply runs, Stop sits next to Send, and Send queues the message (like Cursor).
-        stopButton = ImageButton(ctx)
-        stopButton.setImageDrawable(Ui.icon(ctx, R.drawable.ic_stop, Ui.fg))
-        stopButton.background = Ui.rounded(Ui.bg4, 17, border2)
-        stopButton.scaleType = ImageView.ScaleType.CENTER_INSIDE
-        stopButton.setPadding(dp(9), dp(9), dp(9), dp(9))
-        stopButton.tooltipText = "Stop the reply (Escape)"; stopButton.contentDescription = "Stop"
-        stopButton.setOnClickListener { stopActive() }
-        stopButton.visibility = View.GONE
-        queueButton = Ui.miniButton(ctx, R.drawable.ic_queue, "Queue this message (Alt Enter): it is sent when the current reply finishes") { send(now = false) }
+        // Send turns into Stop while a reply runs, like Cursor.
+        send.setOnClickListener { if (active?.run != null) stopActive() else send() }
+        // While a reply runs, two more buttons appear before Stop: Queue (waits for the reply) and Send now.
+        sendNowButton = ImageButton(ctx)
+        sendNowButton.setImageDrawable(Ui.icon(ctx, R.drawable.ic_bolt, Ui.accent))
+        sendNowButton.background = Ui.rounded(Ui.bg4, 17, Ui.accent)
+        sendNowButton.scaleType = ImageView.ScaleType.CENTER_INSIDE
+        sendNowButton.setPadding(dp(9), dp(9), dp(9), dp(9))
+        sendNowButton.tooltipText = "Send now (Ctrl Enter): stops the current reply and sends this message at once"; sendNowButton.contentDescription = "Send now"
+        sendNowButton.setOnClickListener { send(now = true) }
+        sendNowButton.visibility = View.GONE
+        queueButton = Ui.miniButton(ctx, R.drawable.ic_queue, "Queue this message (Enter): it is sent when the current reply finishes") { send(now = false) }
         queueButton.visibility = View.GONE
         // The model pill takes the room that is left and shortens its name, so the buttons always stay on screen.
-        val bar = Ui.row(ctx, modePill, modelPill, attach, image, mic, queueButton, stopButton, send)
+        val bar = Ui.row(ctx, modePill, modelPill, attach, image, mic, queueButton, sendNowButton, send)
         modelPill.layoutParams = Ui.lp(0, Ui.wrap, 1f).also { it.leftMargin = dp(6); it.rightMargin = dp(4) }
         modelPill.isSingleLine = true; modelPill.ellipsize = TextUtils.TruncateAt.END
         modePill.isSingleLine = true
         for (b in listOf(attach, image, mic)) b.layoutParams = Ui.lp(dp(28), dp(28)).also { it.leftMargin = dp(2) }
         queueButton.layoutParams = Ui.lp(dp(28), dp(28)).also { it.leftMargin = dp(2) }
-        stopButton.layoutParams = Ui.lp(dp(34), dp(34)).also { it.leftMargin = dp(6) }
+        sendNowButton.layoutParams = Ui.lp(dp(34), dp(34)).also { it.leftMargin = dp(6) }
         send.layoutParams = Ui.lp(dp(34), dp(34)).also { it.leftMargin = dp(6) }
         // The speed and context readout has its own line, so it can never push the buttons away.
         statsText.isSingleLine = true; statsText.ellipsize = TextUtils.TruncateAt.END
@@ -593,6 +594,8 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     fun newChatTab() = newChat(null)
+    fun typeForTest(text: String) = setPromptText(text)
+    fun stopForTest() = stopActive()
     fun exportChatPublic() = exportChat()
     fun toggleSettingPublic(key: String) = toggleSetting(key)
     fun dictateIntoPrompt() { prompt.requestFocus(); host.dictate(prompt) }
@@ -1378,9 +1381,12 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
 
     private fun refreshComposer() {
         val busy = active?.run != null
-        send.setImageDrawable(Ui.icon(ctx, R.drawable.ic_send, Ui.onAccent))
-        send.tooltipText = if (busy) "Send now (Enter): stops the current reply and sends this message at once" else "Send (Enter)"
-        stopButton.visibility = if (busy) View.VISIBLE else View.GONE
+        send.setImageDrawable(Ui.icon(ctx, if (busy) R.drawable.ic_stop else R.drawable.ic_send, Ui.onAccent))
+        send.tooltipText = if (busy) "Stop the reply (Escape)" else "Send (Enter)"
+        send.contentDescription = if (busy) "Stop" else "Send"
+        prompt.hint = if (busy) "The agent is working. Enter queues your message, Ctrl Enter sends it now, Escape stops the reply."
+                      else "Ask, or tell the agent what to build. Enter sends, Shift+Enter is a new line."
+        sendNowButton.visibility = if (busy) View.VISIBLE else View.GONE
         queueButton.visibility = if (busy) View.VISIBLE else View.GONE
     }
 

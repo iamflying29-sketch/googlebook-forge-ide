@@ -73,7 +73,7 @@ Habits that help:
 ## 6. Chat tabs, the queue and the to-do list
 
 - **Tabs**: every chat opens in its own tab at the top of the AI panel, and several chats can work at the same time. The + button (Ctrl N) starts a new chat in a new tab. A pulsing dot marks a chat that is working, and a yellow dot marks one that finished or needs your approval while you were in another tab. Ctrl Tab switches tabs and Ctrl W closes the current tab while you are in the AI panel. Your open tabs come back when you reopen the folder.
-- **Sending while the agent works**: you can keep typing while the agent works. Three buttons sit at the end of the input bar then. **Send** (or Enter) sends your message right away: the current reply stops and your message goes out at once. **Queue** (or Alt Enter) puts it in a queue above the input box instead, and queued messages are sent one after another when the reply finishes; each queued message has Send now, Edit and Remove. **Stop** stops the reply. The speed and context readout has its own small line above these buttons, so the buttons always stay on screen, even in a narrow chat pane.
+- **Sending while the agent works**: you can keep typing while the agent works. The Send button at the end of the input bar turns into an orange **Stop** button (or Escape), like in Cursor, and two more buttons appear before it. **Queue** (the lines icon, or Enter) puts your message in a queue above the input box, and queued messages are sent one after another when the reply finishes; each queued message has Send now, Edit and Remove. **Send now** (the lightning icon, or Ctrl Enter) stops the current reply and sends your message at once. The input box's hint lists these keys while the agent works. The speed and context readout has its own small line above these buttons, so the buttons always stay on screen, even in a narrow chat pane.
 - **To-do list**: for bigger tasks the agent writes a to-do list at the top of its reply and ticks items off as it goes.
 - **Chat history**: the clock button, or the Chats view, lists the chats of this folder, with a switch to see all folders. Open chats are marked with a dot.
 - **Export**: the download button saves the chat as a Markdown file in Documents, in the Forge/Chats folder.
@@ -361,8 +361,8 @@ Do not run Waydroid, a second model or a large build at the same time as a model
 | Ctrl K | Edit with AI in the editor; in the terminal, write a command with AI |
 | Ctrl V in the chat | Paste a screenshot or a file |
 | Ctrl Shift Space | Voice input (in the editor: signature help) |
-| Enter | Send (while the agent works: stop the reply and send this message at once) |
-| Alt Enter | While the agent works: add the message to the queue |
+| Enter | Send (while the agent works: add the message to the queue) |
+| Ctrl Enter | While the agent works: stop the reply and send this message at once |
 | Esc | Stop the agent, close a menu, a popup or the inline edit |
 | Ctrl ` | Focus or hide the terminal; Ctrl Shift ` opens a new one |
 | Ctrl B, Ctrl J | Toggle the Explorer, the bottom panel |

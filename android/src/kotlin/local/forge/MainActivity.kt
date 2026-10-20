@@ -172,6 +172,11 @@ class MainActivity : Activity() {
                     step.startsWith("panel:") -> { if (!bottomShown) toggleBottomPanel(); selectPanel(step.removePrefix("panel:").toIntOrNull() ?: 0) }
                     step.startsWith("open:") -> editor.openFile(step.removePrefix("open:"))
                     step == "chat:history" -> openChatHistory()
+                    // Chat steps for pictures of a running reply: a new chat, a question, text left in the box, Stop.
+                    step == "chat:new" -> chat.newChatTab()
+                    step.startsWith("chat:ask:") -> chat.quickAsk(step.removePrefix("chat:ask:"), "ask")
+                    step.startsWith("chat:type:") -> chat.typeForTest(step.removePrefix("chat:type:"))
+                    step == "chat:stop" -> chat.stopForTest()
                     step == "explorer" -> toggleExplorer()
                     step == "settings" -> startActivity(Intent(this, SettingsActivity::class.java).putExtra("snapshot", "settings"))
                 }
