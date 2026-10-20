@@ -64,11 +64,12 @@ internal fun glyphButton(ctx: Context, glyph: String, description: String, onCli
  * Enter in the path field opens the typed path; Enter on a selected folder in the list opens that folder.
  */
 object FolderDialog {
-    fun show(activity: Activity, onOpen: (String) -> Unit, onNewWindow: (String) -> Unit) {
-        Browser(activity, onOpen, onNewWindow).show()
+    /** [onAdd], when given, adds an "Add to this window" button (several folders in one window, like Cursor). */
+    fun show(activity: Activity, onOpen: (String) -> Unit, onNewWindow: (String) -> Unit, onAdd: ((String) -> Unit)? = null) {
+        Browser(activity, onOpen, onNewWindow, onAdd).show()
     }
 
-    private class Browser(val activity: Activity, val onOpen: (String) -> Unit, val onNewWindow: (String) -> Unit) {
+    private class Browser(val activity: Activity, val onOpen: (String) -> Unit, val onNewWindow: (String) -> Unit, val onAdd: ((String) -> Unit)?) {
         private val dialog: Dialog
         private val pathField: EditText = Ui.input(activity, "/path/to/folder", mono = true)
         private val crumbs = LinearLayout(activity)
@@ -150,9 +151,14 @@ object FolderDialog {
 
             // Footer: Cancel on the left, the two actions on the right.
             val spacer = View(c); spacer.layoutParams = Ui.lp(0, 1, 1f)
-            val foot = Ui.row(c, Ui.button(c, "Cancel") { dialog.dismiss() }, spacer,
-                Ui.button(c, "New window here") { openTyped(true) }, gap(c, 8),
-                Ui.button(c, "Open this folder", primary = true) { openTyped(false) })
+            val foot = Ui.row(c, Ui.button(c, "Cancel") { dialog.dismiss() }, spacer)
+            if (onAdd != null) {
+                val add = Ui.button(c, "Add to this window") { val typed = pathField.text.toString().trim(); dialog.dismiss(); onAdd.invoke(if (typed.isEmpty()) current else typed) }
+                add.tooltipText = "Show this folder in this window next to the current one"
+                foot.addView(add); foot.addView(gap(c, 8))
+            }
+            foot.addView(Ui.button(c, "New window here") { openTyped(true) }); foot.addView(gap(c, 8))
+            foot.addView(Ui.button(c, "Open this folder", primary = true) { openTyped(false) })
             foot.setPadding(Ui.dp(c, 12), Ui.dp(c, 8), Ui.dp(c, 12), Ui.dp(c, 10))
             root.addView(foot)
 

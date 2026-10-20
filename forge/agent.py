@@ -1225,8 +1225,37 @@ def complete(client: OllamaClient, settings: dict, path: str, language: str, pre
     """Tab completion: a short insertion at the cursor."""
     prefix = prefix[-2500:]
     suffix = suffix[:600]
+    # The line being written, spelled out: small models otherwise start a new statement in the middle of one
+    # (after "math." they wrote a whole print call instead of the attribute).
+    line_before = prefix.rsplit("\n", 1)[-1]
+    line_after = suffix.split("\n", 1)[0]
+    if hasattr(client, "infill"):
+        # The GPU engine fills in the middle with the model's own FIM tokens: faster and far more accurate than asking
+        # for the insertion in words (measured 2026-10-20 with Qwen3.5 4B: 1.5 s, "pi" after "math.").
+        try:
+            out = client.infill(prefix, suffix, n_predict=64, timeout=60)
+            if line_before:
+                out = out.lstrip("\n")   # an unfinished (or indented) line goes on where it stopped
+                if not line_before.strip():
+                    out = out.lstrip(" \t")   # the cursor already stands after the indentation
+            # FIM models sometimes repeat the code that already follows the cursor; that is no suggestion.
+            if out.strip() and suffix.lstrip().startswith(out.strip().split("\n", 1)[0].strip()):
+                return ""
+            lines = out.split("\n")
+            kept = []
+            for ln in lines:
+                if not ln.strip() and kept:
+                    break
+                kept.append(ln)
+                if len(kept) >= 3:
+                    break
+            return "\n".join(kept).rstrip()
+        except Exception:  # noqa: BLE001
+            pass
     user = (f"File: {path} ({language})\n\n<prefix>\n{prefix}\n</prefix>\n<suffix>\n{suffix}\n</suffix>\n\n"
-            "Output only the text to insert at the cursor (between prefix and suffix).")
+            f"The cursor is in this line, at the |: `{line_before}|{line_after}`\n"
+            "Output only the text to insert at the cursor (between prefix and suffix). If the line is unfinished, finish it "
+            "first; continue with at most two more lines.")
     opts = {"num_ctx": min(int(settings.get("num_ctx", 8192)), 4096), "temperature": 0.0, "num_predict": 64,
             "stop": ["<|eot_id|>", "\n\n\n", "</prefix>", "<suffix>"]}
     if settings.get("num_thread"):

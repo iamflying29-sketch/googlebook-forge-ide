@@ -313,9 +313,22 @@ class EngineService : Service() {
                 state = "downloading"
                 download(FORGE + model.getString("download"), modelFile, size)
             }
+            // The vision projector lets the engine itself look at images (Qwen3.5), so a screenshot never makes the GPU
+            // unload this model and load a second one.
+            val mm = cfg.optJSONObject("mmproj")
+            var mmFile: File? = null
+            if (mm != null && !plainRetry) {
+                val f = File(modelsDir, mm.getString("filename"))
+                val msize = mm.getLong("size")
+                try {
+                    if (!f.exists() || f.length() != msize) { state = "downloading"; download(FORGE + mm.getString("download"), f, msize) }
+                    mmFile = f
+                } catch (e: Exception) { log("vision projector not available: " + e.message) }
+            }
             val bin = File(applicationInfo.nativeLibraryDir, "libllama-server.so")
             if (!bin.exists()) throw Exception("Engine binary missing from this build of the app.")
-            val needMb = size / (1024 * 1024) + 1200   // weights + KV cache + compute buffers + margin
+            // Weights + KV cache + compute buffers + margin, plus the projector and its image encoder when it sees.
+            val needMb = size / (1024 * 1024) + 1200 + (mmFile?.let { it.length() / (1024 * 1024) + 300 } ?: 0L)
             GpuBudget.poolCreditPercent = cfg.optLong("pool_credit_percent", 0)
             // The free-memory check (GpuBudget), never bypassed. Ask the VM to hand memory back while waiting.
             var why = GpuBudget.check(this, needMb)
@@ -359,6 +372,12 @@ class EngineService : Service() {
             cmd.add("--slot-save-path"); cmd.add(slots.absolutePath)
             extraUsed = false
             if (!plainRetry) for (extra in cfg.optString("extra_args", "").trim().split(Regex("\\s+"))) if (extra.isNotEmpty()) { cmd.add(extra); extraUsed = true }
+            val mmf = mmFile
+            if (mmf != null) {
+                cmd.add("--mmproj"); cmd.add(mmf.absolutePath)
+                cmd.add("--image-max-tokens"); cmd.add(cfg.optInt("image_max_tokens", 640).toString())
+                extraUsed = true   // a projector the engine refuses is dropped by the plain retry, like the extra flags
+            }
             if (key.isNotEmpty()) { cmd.add("--api-key"); cmd.add(key) }
             log("launch: " + cmd.joinToString(" ").let { if (key.isNotEmpty()) it.replace(key, "<key>") else it })
             val pb = ProcessBuilder(cmd)

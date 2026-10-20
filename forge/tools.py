@@ -553,10 +553,20 @@ class Workspace:
 
     # ------------------------------------------------------------------ searching
     def search(self, pattern: str, rel: str = ".", glob: Optional[str] = None, regex: bool = False,
-               max_results: int = 200, timeout: float = 25.0) -> str:
+               max_results: int = 200, timeout: float = 25.0, ignore_case: bool = False, whole_word: bool = False,
+               exclude: Optional[str] = None) -> str:
         p = self.resolve(rel, must_exist=True)
         # -D skip: never open devices, FIFOs or sockets (reading one could block forever).
         cmd = ["grep", "-rnI", "-D", "skip", "--color=never", "-m", "50"]
+        if ignore_case:
+            cmd.append("-i")
+        if whole_word:
+            cmd.append("-w")
+        if exclude:
+            for g in str(exclude).split(","):
+                g = g.strip()
+                if g:
+                    cmd += ["--exclude", g, "--exclude-dir", g.rstrip("/")]
         for d in IGNORED_DIRS:
             cmd += ["--exclude-dir", d]
         if p == "/":

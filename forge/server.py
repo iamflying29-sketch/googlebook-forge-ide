@@ -6,7 +6,6 @@ approvals, sessions, checkpoints, inline edit, completions, and a WebSocket term
 from __future__ import annotations
 
 import json
-import mimetypes
 import re
 import os
 import subprocess
@@ -32,7 +31,6 @@ from .tools import Checkpoints, Workspace
 from .wsproto import handshake
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STATIC = os.path.join(os.path.dirname(HERE), "static")
 DATA_DIR = os.path.expanduser(os.environ.get("FORGE_HOME", "~/.forge-ide"))
 SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
 
@@ -82,6 +80,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # path on Vulkan (llama.cpp issue 17012: minutes instead of seconds on integrated GPUs), so it is off by default.
     "vision_extra_args": "-fa off",   # "--fit off" made the vision server fail to load its model (2026-10-19)
     "font_size": 13,
+    "minimap": True,                     # the editor's minimap on the right of the code
     "theme": "forge-dark",
     "workspace": os.path.expanduser("~/projects"),
     "recent_workspaces": [],
@@ -92,6 +91,15 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "gpu_model": "forge-coder",         # Ollama model whose weights the app downloads from this server
     "gpu_ctx": 8192,
     "gpu_layers": 99,
+    # The GPU engine also sees images when its model has a vision projector (Qwen3.5): screenshots then go straight to
+    # the engine instead of a second vision model, so the GPU never unloads one model to load another for a picture.
+    "gpu_vision": True,
+    "gpu_image_tokens": 640,             # the most image tokens one picture becomes (time and memory grow with it)
+}
+
+# Vision projectors for GPU engine models that can see, in ~/.forge-ide/models (F16: the Intel GPU has no bf16).
+GPU_MMPROJ = {
+    "qwen3.5:4b": ("qwen35-vision", "mmproj-F16.gguf", "Qwen3.5 4B"),
 }
 
 
@@ -99,7 +107,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 # Machine-wide things (the engine, Ollama, the GPU engine, how long the model stays loaded) stay user settings.
 FOLDER_SETTING_KEYS = {"command_allowlist", "command_denylist", "vision", "model", "temperature", "top_p", "top_k", "repeat_penalty", "num_ctx", "num_predict", "thinking",
                        "verbose", "tool_mode", "max_iterations", "auto_approve_commands", "external_file_protection",
-                       "repo_map_chars", "tab_completions", "completion_delay_ms", "font_size", "prewarm", "lsp",
+                       "repo_map_chars", "tab_completions", "completion_delay_ms", "font_size", "minimap", "prewarm", "lsp",
                        "semantic_index", "custom_modes", "kotlin_project_model"}
 
 MODEL_LOAD_NEED_MB = 5800   # loading llama3.1 8B Q4_K_M needs about 5.2 GB plus headroom
@@ -173,6 +181,7 @@ class State:
         self.engine_idle_stopped = False     # the app unloaded the engine because it was idle; no autostart until asked
         self.engine_stop_sent = 0.0
         self.engine_asked_ts = 0.0           # when a chat asked for the engine (a reply then waits for it)
+        self.engine_alive_since = 0.0        # when the engine was first seen answering (the idle unload waits three minutes)
         self.checkpoints = Checkpoints(os.path.join(DATA_DIR, "checkpoints"))
         self.vision = VisionManager(self, DATA_DIR)
         self.attachments = Attachments(os.path.join(DATA_DIR, "attachments"))
@@ -267,12 +276,14 @@ class State:
                                 cached = int(line.split()[1]) // 1024
                 except OSError:
                     pass
-                # The VM's file cache is memory the Googlebook cannot use until the VM gives it back. When the
-                # Googlebook is short (under 3 GB free by the app's report), hand it back from 700 MB of cache on;
-                # otherwise only a large cache is worth the disk re-reads.
+                # The VM's file cache is memory the Googlebook cannot use until the VM gives it back. Hand it back only
+                # when the Googlebook is short (under 3 GB free by the app's report). Shrinking on a schedule while the
+                # Googlebook has room made the VM free and re-fault gigabytes every few minutes, and every round trip
+                # makes the host compact and split its memory again: the fragmentation that slows the GPU's reads
+                # (measured 2026-10-20: 98 percent of the host's compaction attempts failed after 9 days of uptime).
                 host = self.vision.app.get("host_mem_mb") if time.time() - self.vision.app_seen < 120 else None
                 tight = isinstance(host, (int, float)) and 0 <= host < 3000
-                if cached > (700 if tight else 1500):
+                if tight and cached > 700:
                     self.shrink_vm_memory()
 
     # ------------------------------------------------------------ engines
@@ -299,6 +310,38 @@ class State:
                                              str(self.settings.get("gpu_engine_key", "")))
             return self.gpu_client
         return self.ollama
+
+    def gpu_speed(self) -> dict:
+        """The GPU engine's writing speed: the median of its last replies, and the best ever measured for this model
+        (kept in gpu_speed.json). The status bar warns when the recent speed is far below the best."""
+        from .llamacpp_client import SPEEDS
+        model = str(self.settings.get("gpu_model") or "")
+        recent = [x for x in SPEEDS[-8:] if time.time() - x["ts"] < 7200]
+        med = sorted(x["gen_tps"] for x in recent)[len(recent) // 2] if recent else None
+        path = os.path.join(DATA_DIR, "gpu_speed.json")
+        best = _load_json(path, {})
+        best = best if isinstance(best, dict) else {}
+        entry = best.get(model) or {}
+        top = max((x["gen_tps"] for x in recent), default=0.0)
+        if top > float(entry.get("gen_tps", 0) or 0):
+            entry = {"gen_tps": top, "ts": time.time()}
+            best[model] = entry
+            _save_json(path, best)
+        return {"model": model, "recent_tps": med, "samples": len(recent), "best_tps": entry.get("gen_tps"), "best_ts": entry.get("ts"),
+                "last": SPEEDS[-1] if SPEEDS else None}
+
+    def gpu_mmproj_file(self) -> Optional[dict]:
+        """The vision projector for the GPU engine's model, when one is installed and gpu_vision is on."""
+        if not self.settings.get("gpu_vision", True):
+            return None
+        name = str(self.settings.get("gpu_model") or "")
+        entry = GPU_MMPROJ.get(name) or GPU_MMPROJ.get(name.split(":")[0] + ":" + (name.split(":")[1] if ":" in name else "latest"))
+        if not entry:
+            return None
+        path = os.path.join(DATA_DIR, "models", entry[0], entry[1])
+        if not os.path.isfile(path):
+            return None
+        return {"path": path, "size": os.path.getsize(path), "filename": name.replace(":", "-") + "-" + entry[1], "label": entry[2]}
 
     def gpu_model_file(self) -> Optional[dict]:
         """Locate the GGUF blob of the chosen Ollama model so the app can download it (no second copy in the VM).
@@ -490,6 +533,10 @@ class State:
                 mf = self.gpu_model_file()
                 if mf and mf.get("size"):
                     self._need_mb = int(mf["size"]) // (1024 * 1024) + 1200
+                    # The vision projector and its image encoder, when the engine loads one (EngineService adds the same).
+                    pf = self.gpu_mmproj_file()
+                    if pf:
+                        self._need_mb += int(pf["size"]) // (1024 * 1024) + 300
             except Exception:  # noqa: BLE001
                 pass
         return self._need_mb or self.ENGINE_START_NEED_MB
@@ -533,6 +580,14 @@ class State:
         if self.vision.want() or any(not r.done for r in self.runs.values()):
             return False
         if not self.gpu_client.alive():
+            self.engine_alive_since = 0.0
+            return False
+        # A freshly started engine must not be unloaded by a poll that races its own "running" report (seen 2026-10-19).
+        if self.engine_alive_since == 0.0:
+            self.engine_alive_since = now
+            self.engine_last_use = now
+            return False
+        if now - self.engine_alive_since < 180:
             return False
         self.engine_idle_stopped = True
         self.engine_stop_sent = now
@@ -782,39 +837,22 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self._error(500, str(e))
 
-    # ------------------------------------------------------------ static files
+    # ------------------------------------------------------------ no web page
     def _static(self, path: str) -> None:
+        """Forge's window is the native Forge app on the Googlebook; this server has no browser page any more. The
+        root answers with one plain sentence so a browser pointed here learns where the IDE is; nothing else is served."""
         if path in ("", "/"):
-            path = "/index.html"
-        rel = posixpath.normpath(urllib.parse.unquote(path)).lstrip("/")
-        full = os.path.realpath(os.path.join(STATIC, rel))
-        if not full.startswith(os.path.realpath(STATIC) + os.sep) or not os.path.isfile(full):
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
+            body = ("Forge IDE runs as the native Forge app on the Googlebook. This server answers only the app (its API is "
+                    "under /api), so there is no page to show here.\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
             return
-        ctype, _ = mimetypes.guess_type(full)
-        if full.endswith(".js"):
-            ctype = "application/javascript"
-        elif full.endswith(".css"):
-            ctype = "text/css"
-        elif full.endswith(".html"):
-            ctype = "text/html; charset=utf-8"
-        size = os.path.getsize(full)
-        self.send_response(200)
-        self.send_header("Content-Type", ctype or "application/octet-stream")
-        self.send_header("Content-Length", str(size))
-        if "/vendor/" in full:
-            self.send_header("Cache-Control", "public, max-age=604800")
-        else:
-            self.send_header("Cache-Control", "no-cache")
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
         self.end_headers()
-        with open(full, "rb") as fh:
-            while True:
-                chunk = fh.read(256 * 1024)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
 
     # ------------------------------------------------------------ GET api
     def _api_get(self, path: str, q: Dict[str, list]) -> None:
@@ -824,7 +862,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             ws = self._ws(q)
         except ValueError as e:
-            if path not in ("/api/status", "/api/dirs", "/api/events", "/api/run", "/api/engine/config", "/api/engine/model",
+            if path not in ("/api/status", "/api/dirs", "/api/events", "/api/run", "/api/engine/config", "/api/engine/model", "/api/engine/mmproj",
                             "/api/engine/status", "/api/settings", "/api/image", "/api/image/analysis", "/api/engine/control",
                             "/api/engine/vision_file", "/api/vision/status", "/api/memcheck", "/api/toolchains",
                             "/api/devices", "/api/devices/screen", "/api/devices/scan", "/api/notebook/kernels",
@@ -854,7 +892,9 @@ class Handler(BaseHTTPRequestHandler):
                                     "running": running, "pid": os.getpid(), "default_folder": st.workspace.root,
                                     "folder_missing": folder_missing,
                                     "host_mem_mb": (st.vision.app.get("host_mem_mb") if time.time() - st.vision.app_seen < 60 else None),
-                                    "home": os.path.expanduser("~"), "mem": mem_info(), "mem_event": st.last_mem_event})
+                                    "home": os.path.expanduser("~"), "mem": mem_info(), "mem_event": st.last_mem_event,
+                                    "gpu_speed": st.gpu_speed() if st.active_engine() == "gpu" else None,
+                                    "gpu_vision": st.vision.engine_sees() if st.active_engine() == "gpu" and gpu.get("status") == "ok" else False})
         if path == "/api/settings":
             return self._json(200, st.settings_payload(ws.root) if not folder_missing else
                               {**st.settings_payload(ws.root), "folder": {}, "effective": dict(st.settings)})
@@ -981,10 +1021,11 @@ class Handler(BaseHTTPRequestHandler):
             p = ws.resolve(rel)
             return self._json(200, {"path": rel, "content": text, "mtime": os.path.getmtime(p), "size": len(text)})
         if path == "/api/search":
-            result = ws.search(arg("q"), arg("path", ".") or ".", arg("glob") or None, arg("regex") == "1", max_results=400)
+            opts = {"ignore_case": arg("case") == "0", "whole_word": arg("word") == "1", "exclude": arg("exclude") or None}
+            result = ws.search(arg("q"), arg("path", ".") or ".", arg("glob") or None, arg("regex") == "1", max_results=int(arg("max") or 400), **opts)
             if (arg("path", ".") or ".") == ".":
                 for extra in st.extra_roots(ws.root):
-                    more = ws.search(arg("q"), extra, arg("glob") or None, arg("regex") == "1", max_results=200)
+                    more = ws.search(arg("q"), extra, arg("glob") or None, arg("regex") == "1", max_results=200, **opts)
                     if more and not more.startswith("No matches"):
                         result = (result + "\n" + more) if result and not result.startswith("No matches") else more
             return self._json(200, {"result": result})
@@ -1048,7 +1089,7 @@ class Handler(BaseHTTPRequestHandler):
             props = st.gpu_client.props() if h.get("status") in ("ok", "no slot available") else {}
             mf = st.gpu_model_file()
             return self._json(200, {"engine": st.active_engine(), "url": st.gpu_client.base_url, "health": h,
-                                    "props": {k: props.get(k) for k in ("model_path", "build_info", "total_slots", "default_generation_settings") if k in props},
+                                    "props": {k: props.get(k) for k in ("model_path", "build_info", "total_slots", "default_generation_settings", "modalities") if k in props},
                                     "model_file": {k: v for k, v in (mf or {}).items() if k != "path"}})
         if path == "/api/image":
             found = st.vision.images.find(arg("id"))
@@ -1115,13 +1156,31 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/engine/config":
             # Read by the Forge app (host side) to launch llama-server with the right arguments.
             mf = st.gpu_model_file()
+            pf = st.gpu_mmproj_file()
             return self._json(200, {"host_ip": st.host_ip(), "port": int(st.settings.get("gpu_engine_port", 8081)),
                                     "api_key": st.settings.get("gpu_engine_key", ""), "ctx": int(st.settings.get("gpu_ctx", 8192)),
                                     "gpu_layers": int(st.settings.get("gpu_layers", 99)),
                                     "extra_args": str(st.settings.get("gpu_extra_args", "") or ""),
                                     "pool_credit_percent": int(st.settings.get("gpu_pool_credit", 0) or 0),
                                     "model": None if not mf else {"filename": mf["filename"], "size": mf["size"], "digest": mf["digest"],
-                                                                  "download": "/api/engine/model"}})
+                                                                  "download": "/api/engine/model"},
+                                    "mmproj": None if not pf else {"filename": pf["filename"], "size": pf["size"], "download": "/api/engine/mmproj"},
+                                    "image_max_tokens": int(st.settings.get("gpu_image_tokens", 640) or 640)})
+        if path == "/api/engine/mmproj":
+            pf = st.gpu_mmproj_file()
+            if not pf:
+                return self._error(404, "no vision projector for the GPU engine's model")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(pf["size"]))
+            self.end_headers()
+            with open(pf["path"], "rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            return None
         if path == "/api/engine/model":
             mf = st.gpu_model_file()
             if not mf:
@@ -1283,6 +1342,22 @@ class Handler(BaseHTTPRequestHandler):
             if r:
                 r.cancel.set()
             return self._json(200, {"ok": bool(r)})
+        if path == "/api/engine/bench":
+            # One measured reply on the GPU engine (no loop): a fixed prompt and 128 tokens, as a speed check.
+            if st.active_engine() != "gpu" or not st.gpu_client.alive():
+                return self._error(503, "The GPU engine is not running.")
+            from .llamacpp_client import record_speed
+            body = {"model": "bench", "messages": [{"role": "user", "content": "Write a Python function that parses an ISO 8601 date string without any library, with comments."}],
+                    "stream": False, "cache_prompt": False, "max_tokens": 128, "temperature": 0, "ignore_eos": True,
+                    "chat_template_kwargs": {"enable_thinking": False}}
+            t0 = time.time()
+            r = st.gpu_client._json("POST", "/v1/chat/completions", body, timeout=300)
+            tm = r.get("timings") or {}
+            gen = float(tm.get("predicted_per_second") or 0)
+            if gen > 0:
+                record_speed(gen, float(tm.get("prompt_per_second") or 0), int(tm.get("predicted_n") or 0), "bench")
+            return self._json(200, {"gen_tps": round(gen, 2), "prompt_tps": round(float(tm.get("prompt_per_second") or 0), 1),
+                                    "tokens": tm.get("predicted_n"), "seconds": round(time.time() - t0, 1), "speed": st.gpu_speed()})
         if path == "/api/inline_edit":
             run = Run("inline:" + str(b.get("session_id") or ""), "edit")
             st.runs[run.id] = run
@@ -1492,10 +1567,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "nothing to search for")
             rep = str(b.get("replacement", ""))
             try:
-                pat = re.compile(q if b.get("regex") else re.escape(q), 0 if b.get("case", True) else re.IGNORECASE)
+                body = q if b.get("regex") else re.escape(q)
+                if b.get("word"):
+                    body = r"(?<![A-Za-z0-9_])(?:" + body + r")(?![A-Za-z0-9_])"
+                pat = re.compile(body, 0 if b.get("case", True) else re.IGNORECASE)
             except re.error as e:
                 return self._error(400, f"invalid regular expression: {e}")
             glob = str(b.get("glob") or "").strip()
+            exclude = [g.strip() for g in str(b.get("exclude") or "").split(",") if g.strip()]
             dry = bool(b.get("dry_run"))
             files = list(ws.all_files(refresh=True))
             for extra in st.extra_roots(ws.root):
@@ -1503,6 +1582,13 @@ class Handler(BaseHTTPRequestHandler):
             if glob:
                 pats = [g.strip() for g in glob.split(",") if g.strip()]
                 files = [f for f in files if any(fnmatch.fnmatch(f, g) or fnmatch.fnmatch(os.path.basename(f), g) for g in pats)]
+            if exclude:
+                files = [f for f in files if not any(fnmatch.fnmatch(f, g) or fnmatch.fnmatch(os.path.basename(f), g) or
+                                                     f.startswith(g.rstrip("/") + "/") for g in exclude)]
+            only = b.get("paths")
+            if isinstance(only, list) and only:
+                wanted = {str(x) for x in only}
+                files = [f for f in files if f in wanted]
             run_id = "replace-" + uuid.uuid4().hex[:10]
             found, total = [], 0
             for rel in files[:20000]:
@@ -1559,6 +1645,19 @@ class Handler(BaseHTTPRequestHandler):
             except RuntimeError as e:
                 return self._error(503, str(e))
             return self._json(200, {"text": text})
+        if path == "/api/snapshot":
+            # A picture of the native window that the Forge app rendered by itself (its snapshot mode), so its look
+            # can be checked while the Googlebook's screen is off. Kept in ~/.forge-ide/snapshots, one file per name.
+            import base64 as _b64
+            name = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(b.get("name") or "snapshot"))[:80] or "snapshot"
+            raw = _b64.b64decode(str(b.get("data", "")), validate=False)
+            if not raw.startswith(b"\x89PNG") or len(raw) > 20 * 1024 * 1024:
+                raise ValueError("a PNG of at most 20 MB is expected")
+            folder = os.path.join(os.path.expanduser("~"), ".forge-ide", "snapshots")
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, name + ".png"), "wb") as fh:
+                fh.write(raw)
+            return self._json(200, {"ok": True, "name": name})
         if path == "/api/attachment":
             import base64 as _b64
             from .images import sniff

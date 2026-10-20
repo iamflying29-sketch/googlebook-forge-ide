@@ -129,6 +129,27 @@ object Api {
         return withConnection(c, path) { parse(c) }
     }
 
+    /** GET raw bytes (an image for the image viewer) with at most [cap] bytes; runs on the calling (background) thread. */
+    fun bytes(path: String, params: Map<String, String> = emptyMap(), cap: Int = 40 * 1024 * 1024, timeoutMs: Int = 30000): ByteArray {
+        val q = params.entries.joinToString("&") { encodeComponent(it.key) + "=" + encodeComponent(it.value) }
+        val full = if (q.isEmpty()) path else path + (if (path.contains("?")) "&" else "?") + q
+        val c = open(full, "GET", timeoutMs)
+        try {
+            if (c.responseCode >= 400) throw ApiError(readBody(c, 4096).let { b -> try { JSONObject(b).optString("error", b) } catch (e: Exception) { b } }.ifEmpty { "HTTP " + c.responseCode }, c.responseCode)
+            val out = java.io.ByteArrayOutputStream()
+            c.inputStream.use { inp ->
+                val buf = ByteArray(65536)
+                while (true) {
+                    val n = inp.read(buf)
+                    if (n < 0) break
+                    if (out.size() + n > cap) throw ApiError("larger than " + (cap / (1024 * 1024)) + " MB")
+                    out.write(buf, 0, n)
+                }
+            }
+            return out.toByteArray()
+        } finally { try { c.disconnect() } catch (e: Exception) { } }
+    }
+
     /** POST a JSON body; runs on the calling (background) thread. */
     fun post(path: String, body: JSONObject, timeoutMs: Int = 60000): JSONObject {
         val c = open(path, "POST", timeoutMs)
@@ -251,7 +272,11 @@ object Api {
                             id = -1L
                             if (ev != null) {
                                 if (ev.optString("type") == "end") { deliverOnce(ev); return Outcome.ENDED }
-                                main.post { if (!stopped.get() && !finished.get()) onEvent(ev) }
+                                // Only stop() silences an event. The end event is posted after this one, and the main
+                                // thread runs posts in order, so checking "finished" here dropped the last events of a
+                                // reply (the final code of Ctrl K, the closing words and the statistics) whenever they
+                                // arrived just before the end.
+                                main.post { if (!stopped.get()) onEvent(ev) }
                             }
                         }
                     }

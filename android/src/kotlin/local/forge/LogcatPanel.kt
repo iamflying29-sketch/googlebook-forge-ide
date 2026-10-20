@@ -126,4 +126,11 @@ class LogcatPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     fun close() { stop() }
+
+    /** Shows one app's log (the Android view's App logcat button): the app id goes in and the stream restarts. */
+    fun openFor(app: String) {
+        appId.setText(app)
+        if (ws != null) stop()
+        start()
+    }
 }

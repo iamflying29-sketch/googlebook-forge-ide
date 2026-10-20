@@ -168,6 +168,15 @@ object Chrome {
     class PanelTabs(val view: LinearLayout, private val tabs: List<TextView>, private val underlines: List<View>, val actions: LinearLayout) {
         var selected = 0
             private set
+        private val names = tabs.map { it.text.toString() }
+        /** A count after a tab's name (the number of problems); an empty text removes it. */
+        fun setBadge(i: Int, badge: String) {
+            val t = tabs.getOrNull(i) ?: return
+            if (badge.isEmpty()) { t.text = names[i]; return }
+            val sb = android.text.SpannableStringBuilder(names[i] + "  " + badge)
+            sb.setSpan(android.text.style.ForegroundColorSpan(Ui.accent2), names[i].length + 2, sb.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            t.text = sb
+        }
         fun select(i: Int) {
             selected = i
             for (k in tabs.indices) {
@@ -212,7 +221,24 @@ object Chrome {
 
     // ---------------------------------------------------------------- status bar
     class StatusBar(val view: LinearLayout, val ollamaDot: View, val ollama: TextView, val engine: TextView, val memory: TextView,
-                    val index: TextView, val right: TextView) {
+                    val index: TextView, val right: TextView, val rightBox: LinearLayout, val leftBox: LinearLayout) {
+        /** A clickable status item (icon and text) in the right group, like VS Code's position and language items. */
+        fun addItem(c: Context, icon: Int, tooltip: String, left: Boolean = false, onClick: (View) -> Unit): Pair<LinearLayout, TextView> {
+            val t = Ui.text(c, "", 11.5f, Ui.fg2)
+            t.maxLines = 1
+            val row = LinearLayout(c)
+            row.orientation = LinearLayout.HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            if (icon != 0) row.addView(Ui.iconView(c, icon, Ui.fg2, 13), Ui.lp(Ui.dp(c, 13), Ui.dp(c, 13)).also { it.rightMargin = Ui.dp(c, 4) })
+            row.addView(t)
+            row.setPadding(Ui.dp(c, 6), Ui.dp(c, 2), Ui.dp(c, 6), Ui.dp(c, 2))
+            row.background = Ui.states(null, Ui.rounded(Ui.bg4, 4), Ui.rounded(Ui.border2, 4))
+            row.isClickable = true
+            row.tooltipText = tooltip
+            row.setOnClickListener(onClick)
+            (if (left) leftBox else rightBox).addView(row, Ui.lp(Ui.wrap, Ui.wrap).also { it.rightMargin = Ui.dp(c, 4) })
+            return row to t
+        }
         fun setOllama(up: Boolean?) {
             ollama.text = when (up) { true -> "Ollama connected"; false -> "Ollama offline"; null -> "Server unreachable" }
             ollama.setTextColor(if (up == true) Ui.green else Ui.red)
@@ -249,10 +275,15 @@ object Chrome {
         index.setOnClickListener(onIndexClick)
         index.tooltipText = "Codebase index: click for settings"
         bar.addView(index)
+        val leftBox = LinearLayout(c); leftBox.orientation = LinearLayout.HORIZONTAL; leftBox.gravity = Gravity.CENTER_VERTICAL
+        bar.addView(leftBox, Ui.lp(Ui.wrap, Ui.wrap))
         bar.addView(View(c), Ui.lp(0, 1, 1f))
+        val rightBox = LinearLayout(c); rightBox.orientation = LinearLayout.HORIZONTAL; rightBox.gravity = Gravity.CENTER_VERTICAL
+        bar.addView(rightBox, Ui.lp(Ui.wrap, Ui.wrap))
         val right = Ui.text(c, "", 11.5f, Ui.fg3); right.maxLines = 1
+        right.setPadding(Ui.dp(c, 6), 0, 0, 0)
         bar.addView(right)
-        return StatusBar(bar, dot, ollama, engine, memory, index, right)
+        return StatusBar(bar, dot, ollama, engine, memory, index, right, rightBox, leftBox)
     }
 
     // ---------------------------------------------------------------- splitters

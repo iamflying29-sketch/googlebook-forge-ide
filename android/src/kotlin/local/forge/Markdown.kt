@@ -18,6 +18,7 @@ import android.text.style.ClickableSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StrikethroughSpan
 import android.text.style.StyleSpan
+import android.text.style.ForegroundColorSpan
 import android.text.style.TypefaceSpan
 import android.util.TypedValue
 import android.view.MotionEvent
@@ -433,25 +434,51 @@ object Markdown {
         }
     }
 
-    /** A fenced code block: a dark monospace box with a thin border, the language and a Copy button. */
+    /** Extra buttons on chat code blocks (Insert at the cursor, Apply to the open file), set by the window. */
+    var codeActions: ((Context, String, String) -> List<View>)? = null
+
+    /** Fence names to the highlighter's languages. */
+    private val fenceLangs = mapOf("kotlin" to "kotlin", "kt" to "kotlin", "kts" to "kotlin", "python" to "python", "py" to "python",
+        "javascript" to "javascript", "js" to "javascript", "jsx" to "javascript", "typescript" to "typescript", "ts" to "typescript",
+        "tsx" to "typescript", "bash" to "shell", "sh" to "shell", "shell" to "shell", "zsh" to "shell", "console" to "shell",
+        "json" to "json", "java" to "java", "c" to "c", "h" to "c", "cpp" to "cpp", "c++" to "cpp", "rust" to "rust", "rs" to "rust",
+        "go" to "go", "html" to "html", "xml" to "xml", "css" to "css", "yaml" to "yaml", "yml" to "yaml", "markdown" to "markdown",
+        "md" to "markdown", "dockerfile" to "dockerfile", "ini" to "ini", "toml" to "ini", "gradle" to "groovy", "groovy" to "groovy")
+
+    /** The code in the highlighter's colors (at most 30,000 characters are colored). */
+    fun highlighted(lang: String, body: String): CharSequence {
+        val id = fenceLangs[lang.lowercase().trim()] ?: return body
+        val l = Highlighter.lang(id)
+        if (l.id == "plaintext" || body.length > 30000) return body
+        val sb = SpannableStringBuilder(body)
+        val tokens = ArrayList<Highlighter.Token>()
+        try { l.tokenize(body, 0, tokens) } catch (e: Exception) { return body }
+        for (t in tokens) if (t.start in 0 until t.end && t.end <= sb.length) sb.setSpan(ForegroundColorSpan(t.color), t.start, t.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        return sb
+    }
+
+    /** A fenced code block: a dark monospace box with the language, colored code and icon buttons (Copy, and the
+     *  window's Insert and Apply). */
     fun codeBlock(c: Context, lang: String, body: String, onCopy: (String) -> Unit): View {
         val box = LinearLayout(c); box.orientation = LinearLayout.VERTICAL
         box.background = Ui.rounded(codeBg, 6, Ui.border)
         val label = Ui.text(c, if (lang.isNotEmpty()) lang else "code", 10.5f, Ui.fg3)
-        val copy = Ui.text(c, "Copy", 11f, Ui.fg2)
-        copy.background = Ui.rounded(Ui.bg3, 5, Ui.border)
-        copy.setPadding(Ui.dp(c, 8), Ui.dp(c, 2), Ui.dp(c, 8), Ui.dp(c, 2))
-        copy.setOnClickListener { onCopy(body); copy.text = "Copied"; copy.postDelayed({ copy.text = "Copy" }, 1200) }
-        val head = Ui.row(c, label, copy)
+        val head = Ui.row(c, label)
         label.layoutParams = Ui.lp(0, Ui.wrap, 1f)
-        head.setPadding(Ui.dp(c, 10), Ui.dp(c, 4), Ui.dp(c, 6), Ui.dp(c, 4))
+        val copy = Ui.miniButton(c, R.drawable.ic_copy, "Copy") { v -> onCopy(body); (v as? android.widget.ImageButton)?.setImageDrawable(Ui.icon(c, R.drawable.ic_check, Ui.green)); v.postDelayed({ (v as? android.widget.ImageButton)?.setImageDrawable(Ui.icon(c, R.drawable.ic_copy, 0)) }, 1200) }
+        head.addView(copy, Ui.lp(Ui.dp(c, 24), Ui.dp(c, 24)))
+        codeActions?.invoke(c, lang, body)?.forEach { head.addView(it, Ui.lp(Ui.dp(c, 24), Ui.dp(c, 24)).also { lp -> lp.leftMargin = Ui.dp(c, 2) }) }
+        head.setPadding(Ui.dp(c, 10), Ui.dp(c, 2), Ui.dp(c, 4), Ui.dp(c, 2))
         head.background = Ui.rounded(Ui.bg2, 6).also { it.cornerRadii = floatArrayOf(18f, 18f, 18f, 18f, 0f, 0f, 0f, 0f) }
-        val code = textView(c, body, CODE_SP, Ui.fg, mono = true)
+        val code = textView(c, highlighted(lang, body), CODE_SP, Ui.fg, mono = true)
         code.setPadding(Ui.dp(c, 10), Ui.dp(c, 8), Ui.dp(c, 10), Ui.dp(c, 8))
         code.setOnLongClickListener { onCopy(body); Ui.toast(c, "Copied"); true }
         box.addView(head, Ui.lp(Ui.match, Ui.wrap))
         box.addView(Ui.divider(c, false))
-        box.addView(code, Ui.lp(Ui.match, Ui.wrap))
+        val hs = HorizontalScrollView(c)
+        hs.isHorizontalScrollBarEnabled = true
+        hs.addView(code)
+        box.addView(hs, Ui.lp(Ui.match, Ui.wrap))
         return box
     }
 

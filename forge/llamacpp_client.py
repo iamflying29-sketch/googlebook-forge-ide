@@ -14,6 +14,17 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from .ollama_client import OllamaError
 
+# The GPU engine's measured speeds (newest last): one entry per reply of at least 24 tokens, for the status bar's
+# speed item and its warning when the GPU writes much slower than its best measured speed.
+SPEEDS: List[Dict[str, Any]] = []
+_SPEEDS_LOCK = threading.Lock()
+
+
+def record_speed(gen_tps: float, prompt_tps: float, tokens: int, model: str) -> None:
+    with _SPEEDS_LOCK:
+        SPEEDS.append({"ts": time.time(), "gen_tps": round(gen_tps, 2), "prompt_tps": round(prompt_tps, 1), "tokens": tokens, "model": model})
+        del SPEEDS[:-40]
+
 
 class LlamaCppClient:
     def __init__(self, base_url: str, api_key: str = "", connect_timeout: float = 5.0):
@@ -212,6 +223,12 @@ class LlamaCppClient:
             except OSError:
                 pass
         total = time.monotonic() - started
+        try:
+            pn, pms = float(timings.get("predicted_n") or 0), float(timings.get("predicted_ms") or 0)
+            if pn >= 24 and pms > 0:
+                record_speed(pn * 1000.0 / pms, float(timings.get("prompt_per_second") or 0), int(pn), str(model or ""))
+        except (TypeError, ValueError):
+            pass
         pe = int(usage.get("prompt_tokens") or timings.get("prompt_n") or 0)
         ec = int(usage.get("completion_tokens") or timings.get("predicted_n") or 0)
         ped = int(timings.get("prompt_ms", 0) * 1e6) if timings.get("prompt_ms") else (int((t_first - started) * 1e9) if t_first else 0)
@@ -220,13 +237,22 @@ class LlamaCppClient:
                "prompt_eval_count": pe, "prompt_eval_duration": ped, "eval_count": ec, "eval_duration": ed,
                "total_duration": int(total * 1e9), "load_duration": 0}
 
+    def infill(self, prefix: str, suffix: str, n_predict: int = 64, timeout: float = 60.0) -> str:
+        """Fill in the middle with the model's own FIM tokens (Tab completions): the text between prefix and suffix."""
+        body = {"input_prefix": prefix, "input_suffix": suffix, "n_predict": int(n_predict), "temperature": 0,
+                "stream": False, "cache_prompt": True}
+        r = self._json("POST", "/infill", body, timeout=timeout)
+        return str(r.get("content") or "")
+
     def generate(self, model: str, prompt: str, options: Optional[dict] = None, raw: bool = False,
                  keep_alive: str = "", timeout: float = 120.0, system: Optional[str] = None) -> dict:
         msgs = []
         if system:
             msgs.append({"role": "system", "content": system})
         msgs.append({"role": "user", "content": prompt})
-        body = {"model": model or "gpu-model", "messages": msgs, "stream": False, "cache_prompt": True}
+        body = {"model": model or "gpu-model", "messages": msgs, "stream": False, "cache_prompt": True,
+                # Tab completions and terminal commands need the answer, not a long thought process first (Qwen3.5).
+                "chat_template_kwargs": {"enable_thinking": False}}
         body.update(self._options_to_body(options))
         r = self._json("POST", "/v1/chat/completions", body, timeout=timeout)
         text = ""

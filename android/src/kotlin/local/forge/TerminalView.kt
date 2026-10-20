@@ -1,5 +1,6 @@
 package local.forge
 
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Canvas
@@ -10,9 +11,11 @@ import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.util.TypedValue
+import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.widget.PopupMenu
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
@@ -94,6 +97,20 @@ class TerminalView(ctx: Context) : View(ctx) {
         term.onResponse = { s -> onInput?.invoke(s) }
     }
 
+    /** The text size in sp (Settings, Editor font size); the grid is measured again and the shell learns its new size. */
+    fun setFontSize(sp: Float) {
+        if (sp < 6f || sp > 40f) return
+        val px = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, sp, resources.displayMetrics)
+        if (Math.abs(paint.textSize - px) < 0.5f) return
+        paint.textSize = px
+        val fm = paint.fontMetrics
+        cellH = ceil((fm.descent - fm.ascent).toDouble()).toInt().coerceAtLeast(1)
+        baseline = -fm.ascent
+        cellW = paint.measureText("MMMMMMMMMM") / 10f
+        if (width > 0 && height > 0) onSizeChanged(width, height, width, height)
+        invalidate()
+    }
+
     /** Feeds output from the shell and redraws. */
     fun write(s: String) {
         term.write(s)
@@ -109,14 +126,105 @@ class TerminalView(ctx: Context) : View(ctx) {
     val gridCols: Int get() = cols
     val gridRows: Int get() = rows
 
+    // ------------------------------------------------------------------ selection and text
+    /** Called with an action the terminal's right-click menu asked for: "add-to-chat" with the selected or recent text. */
+    var onMenuAction: ((String, String) -> Unit)? = null
+
+    /** A selection in the combined line space (0 is the oldest scrollback line), anchor and moving end, as (line, column). */
+    private var selAnchor: Pair<Int, Int>? = null
+    private var selHead: Pair<Int, Int>? = null
+    private var selecting = false
+    private val selPaint = Paint().also { it.color = 0x55ff8a3d }
+
+    fun hasSelection(): Boolean { val a = selAnchor; val b = selHead; return a != null && b != null && a != b }
+    fun clearSelection() { if (selAnchor != null) { selAnchor = null; selHead = null; invalidate() } }
+
+    private fun ordered(): Pair<Pair<Int, Int>, Pair<Int, Int>>? {
+        val a = selAnchor ?: return null; val b = selHead ?: return null
+        return if (a.first < b.first || (a.first == b.first && a.second <= b.second)) a to b else b to a
+    }
+
+    private fun lineString(index: Int): String {
+        val line = term.lineAt(index) ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until line.size) { val cp = line.text[i]; if (cp != TerminalEmulator.WIDE_FILLER) sb.appendCodePoint(cp) }
+        return sb.toString().trimEnd()
+    }
+
+    /** The selected text, lines joined with newlines and trailing blanks removed. */
+    fun selectedText(): String {
+        val (a, b) = ordered() ?: return ""
+        val out = StringBuilder()
+        for (ln in a.first..b.first) {
+            val full = lineString(ln)
+            val from = if (ln == a.first) a.second.coerceAtMost(full.length) else 0
+            val to = if (ln == b.first) b.second.coerceAtMost(full.length) else full.length
+            if (to > from) out.append(full, from, to)
+            if (ln != b.first) out.append('\n')
+        }
+        return out.toString()
+    }
+
+    /** The last lines of the terminal (scrollback and screen), without trailing empty lines: @terminal context. */
+    fun recentText(maxLines: Int = 200): String {
+        val total = term.scrollbackSize + term.rows
+        var last = total - 1
+        while (last >= 0 && lineString(last).isEmpty()) last--
+        if (last < 0) return ""
+        val first = (last - maxLines + 1).coerceAtLeast(0)
+        return (first..last).joinToString("\n") { lineString(it) }
+    }
+
+    fun selectAll() {
+        val total = term.scrollbackSize + term.rows
+        selAnchor = 0 to 0; selHead = (total - 1) to cols
+        invalidate()
+    }
+
+    fun copySelection(): Boolean {
+        val t = selectedText()
+        if (t.isEmpty()) return false
+        (context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)?.setPrimaryClip(ClipData.newPlainText("Terminal", t))
+        return true
+    }
+
+    /** The cell under a point, in the combined line space. */
+    private fun cellAt(x: Float, y: Float): Pair<Int, Int> {
+        val total = term.scrollbackSize + term.rows
+        val first = total - term.rows - scrollOffset
+        val r = ((y - paddingTop) / cellH).toInt().coerceIn(0, rows - 1)
+        val c = ((x - paddingLeft) / cellW).roundToInt().coerceIn(0, cols)
+        return (first + r) to c
+    }
+
+    private fun showMenu(x: Float, y: Float) {
+        val menu = PopupMenu(context, this)
+        val copy = menu.menu.add("Copy  (Ctrl Shift C)"); copy.isEnabled = hasSelection()
+        menu.menu.add("Paste  (Ctrl Shift V)")
+        val ask = menu.menu.add(if (hasSelection()) "Add the selection to the chat" else "Add the recent output to the chat")
+        menu.menu.add("Select all")
+        menu.menu.add("Clear the terminal")
+        menu.setOnMenuItemClickListener { item ->
+            when (item.title.toString().substringBefore("  (")) {
+                "Copy" -> copySelection()
+                "Paste" -> paste()
+                "Select all" -> selectAll()
+                "Clear the terminal" -> { clear(); clearSelection() }
+                else -> if (item === ask) onMenuAction?.invoke("add-to-chat", if (hasSelection()) selectedText() else recentText(120))
+            }
+            true
+        }
+        menu.show()
+    }
+
     // ------------------------------------------------------------------ size
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         val innerW = w - paddingLeft - paddingRight
         val innerH = h - paddingTop - paddingBottom
         if (innerW <= 0 || innerH <= 0) return
-        val c = (innerW / cellW).toInt().coerceAtLeast(2)
-        val r = (innerH / cellH).coerceAtLeast(1)
+        val c = (innerW / cellW.coerceAtLeast(1f)).toInt().coerceIn(2, 1000)
+        val r = (innerH / cellH.coerceAtLeast(1)).coerceIn(1, 500)
         if (c == cols && r == rows && term.cols == c && term.rows == r) return
         cols = c; rows = r
         term.resize(c, r)
@@ -138,7 +246,21 @@ class TerminalView(ctx: Context) : View(ctx) {
             drawLine(canvas, line, x0, y0 + r * cellH)
         }
         if (scrollOffset == 0 && term.cursorVisible && term.cursorY < rows) drawCursor(canvas, x0, y0, first)
+        drawSelection(canvas, x0, y0, first)
         if (total > rows) drawScrollbar(canvas)
+    }
+
+    private fun drawSelection(canvas: Canvas, x0: Float, y0: Float, first: Int) {
+        val (a, b) = ordered() ?: return
+        if (a == b) return
+        for (r in 0 until rows) {
+            val ln = first + r
+            if (ln < a.first || ln > b.first) continue
+            val from = if (ln == a.first) a.second else 0
+            val to = if (ln == b.first) b.second else cols
+            if (to <= from) continue
+            canvas.drawRect(x0 + from * cellW, y0 + r * cellH, x0 + to * cellW, y0 + (r + 1) * cellH, selPaint)
+        }
     }
 
     private fun drawLine(canvas: Canvas, line: TerminalEmulator.Line, x0: Float, top: Float) {
@@ -280,6 +402,25 @@ class TerminalView(ctx: Context) : View(ctx) {
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        val mouse = event.isFromSource(InputDevice.SOURCE_MOUSE) || event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE
+        if (mouse) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (!isFocused) requestFocus()
+                    if (event.buttonState and MotionEvent.BUTTON_SECONDARY != 0) { showMenu(event.x, event.y); return true }
+                    if (event.buttonState and MotionEvent.BUTTON_TERTIARY != 0) { paste(); return true }
+                    val cell = cellAt(event.x, event.y)
+                    selAnchor = cell; selHead = cell; selecting = true
+                    invalidate()
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> { if (selecting) { selHead = cellAt(event.x, event.y); invalidate() }; return true }
+                MotionEvent.ACTION_UP -> {
+                    if (selecting) { selecting = false; selHead = cellAt(event.x, event.y); if (!hasSelection()) { clearSelection(); performClick() } else invalidate() }
+                    return true
+                }
+            }
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 touchY = event.y; touchMoved = false
@@ -347,7 +488,10 @@ class TerminalView(ctx: Context) : View(ctx) {
         if (ctrl && (keyCode == KeyEvent.KEYCODE_GRAVE || keyCode == KeyEvent.KEYCODE_P || keyCode == KeyEvent.KEYCODE_O ||
                 (shift && keyCode == KeyEvent.KEYCODE_N))) return super.onKeyDown(keyCode, event)
         if (ctrl && shift && keyCode == KeyEvent.KEYCODE_V) { paste(); return true }
-        if (ctrl && shift && keyCode == KeyEvent.KEYCODE_C) return true   // there is no selection to copy yet
+        if (ctrl && shift && keyCode == KeyEvent.KEYCODE_C) { copySelection(); return true }
+        if (ctrl && !shift && keyCode == KeyEvent.KEYCODE_C && hasSelection()) { copySelection(); clearSelection(); return true }
+        if (ctrl && shift && keyCode == KeyEvent.KEYCODE_A) { selectAll(); return true }
+        if (!ctrl && !alt && hasSelection() && keyCode != KeyEvent.KEYCODE_SHIFT_LEFT && keyCode != KeyEvent.KEYCODE_SHIFT_RIGHT) clearSelection()
         if (shift && keyCode == KeyEvent.KEYCODE_INSERT) { paste(); return true }
         if (shift && keyCode == KeyEvent.KEYCODE_PAGE_UP) { scrollLines(rows - 1); return true }
         if (shift && keyCode == KeyEvent.KEYCODE_PAGE_DOWN) { scrollLines(-(rows - 1)); return true }

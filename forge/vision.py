@@ -63,6 +63,8 @@ class VisionManager:
         self._ev: Callable[..., None] = _noop
         self._llama_lent_gpu = False
         self._label = "the vision model"
+        self._engine_sees = False
+        self._engine_sees_at = 0.0
 
     # ------------------------------------------------------------------ app side (long poll)
     def tiers(self) -> List[dict]:
@@ -142,6 +144,60 @@ class VisionManager:
                 "tiers_available": [t["name"] for t in self.tiers()], "ocr": bool(shutil.which("tesseract"))}
 
     # ------------------------------------------------------------------ looking at images
+    def engine_sees(self) -> bool:
+        """True when the GPU engine itself can look at images (its model was started with a vision projector)."""
+        now = time.time()
+        if now - self._engine_sees_at < 20:
+            return self._engine_sees
+        sees = False
+        st = self.st
+        if st.active_engine() == "gpu":
+            c = st.client_for("gpu")
+            try:
+                if c.alive():
+                    sees = bool((c.props().get("modalities") or {}).get("vision"))
+            except Exception:  # noqa: BLE001
+                sees = False
+        self._engine_sees, self._engine_sees_at = sees, now
+        return sees
+
+    def _ask_engine(self, path: str, mime: str, question: str, emit: Callable[[str], None]) -> Optional[tuple]:
+        """The main GPU engine looks at the image itself: no second model, no pause, nothing unloaded or reloaded."""
+        ev = self._ev
+        st = self.st
+        pf = st.gpu_mmproj_file()
+        self._label = (pf["label"] if pf else "The GPU engine") + " (Intel GPU, the main engine)"
+        c = st.client_for("gpu")
+        payload, pmime = vision_payload(path, mime)
+        b64 = base64.b64encode(payload).decode()
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:{pmime};base64,{b64}"}},
+            {"type": "text", "text": question}]}]
+        ev("model_activity", model="vision", state="looking", label=self._label,
+           detail="The GPU engine looks at the image itself (no second model is loaded).")
+        t0 = time.time()
+        parts: List[str] = []
+        try:
+            for obj in c.chat_stream("vision", messages, options={"temperature": 0.1, "num_predict": 220}):
+                delta = (obj.get("message") or {}).get("content", "")
+                if delta:
+                    if not parts:
+                        ev("model_activity", model="vision", state="answering", label=self._label,
+                           detail=f"Writing its answer (it looked for {time.time() - t0:.0f} s).")
+                    parts.append(delta)
+                    ev("vision_delta", text=delta)
+                if obj.get("done"):
+                    break
+        except OllamaError as e:
+            emit(f"The GPU engine could not look at the image ({e}).")
+            ev("model_activity", model="vision", state="failed", label=self._label, detail=f"Failed: {e}")
+            self._engine_sees_at = 0.0
+            return None
+        text = "".join(parts).strip()
+        ev("model_activity", model="vision", state="done", label=self._label,
+           detail=f"Answered in {time.time() - t0:.0f} s ({len(text.split())} words).")
+        return text, self._label.replace("(Intel GPU, the main engine)", "on the Intel GPU (the main engine)").strip()
+
     def _client(self) -> LlamaCppClient:
         return LlamaCppClient(f"http://{self.st.host_ip()}:{VISION_PORT}", str(self.st.settings.get("gpu_engine_key", "")))
 
@@ -238,7 +294,7 @@ class VisionManager:
         self.release()
         return text, self._label.replace("(Intel GPU)", "on the Intel GPU").strip()
 
-    def _ask_cpu(self, path: str, question: str, emit: Callable[[str], None]) -> Optional[tuple]:
+    def _ask_cpu(self, path: str, mime: str, question: str, emit: Callable[[str], None]) -> Optional[tuple]:
         st = self.st
         model = str(st.settings.get("vision_cpu_model", "qwen3-vl:2b"))
         try:
@@ -316,12 +372,16 @@ class VisionManager:
                 self._ev = _noop
 
     def _ask_locked(self, path: str, mime: str, question: str, mode: str, emit: Callable[[str], None]) -> tuple:
+        if mode in ("auto", "gpu") and self.engine_sees():
+            r = self._ask_engine(path, mime, question, emit)
+            if r:
+                return r
         if mode in ("auto", "gpu"):
             r = self._ask_gpu(path, mime, question, emit)
             if r:
                 return r
         if mode in ("auto", "cpu"):
-            r = self._ask_cpu(path, question, emit)
+            r = self._ask_cpu(path, mime, question, emit)
             if r:
                 return r
         self._ev("model_activity", model="vision", state="unavailable", label="the vision model",

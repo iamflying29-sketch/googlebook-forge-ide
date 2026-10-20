@@ -107,6 +107,8 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
     private var settings = JSONObject()
     private val prefs = ctx.getSharedPreferences("forge-chat", Context.MODE_PRIVATE)
     private val thumbs = Thumbs()
+    private lateinit var mentions: ChatMentions
+    private val queueBox = Ui.column(ctx)
     private var generation = 0
     private var stripTicking = false
     private val stripTick = object : Runnable {
@@ -128,6 +130,8 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         var stick = true
         var scrollY = 0
         var draft = ""
+        /** Messages sent while a reply runs; they go out one after another when it ends. */
+        val queue = ArrayList<JSONObject>()
         var attention = false
         var modelChoice = ""
         val models = LinkedHashMap<String, ModelState>()
@@ -261,7 +265,7 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         composer.setPadding(dp(10), dp(6), dp(10), dp(8))
         thinkingToggle = pill("Thinking") { toggleSetting("thinking") }
         autoToggle = pill("Auto-run") { toggleSetting("auto_approve_commands") }
-        val addContext = Ui.button(ctx, R.drawable.ic_at, "Add context", "Attach a file of this folder to the message") { addContextFile() }
+        val addContext = Ui.button(ctx, R.drawable.ic_at, "Add context", "Files, folders, code, docs, web, git, terminal, problems, chats, notepads (or type @)") { openMentionMenu() }
         val addSelection = Ui.button(ctx, R.drawable.ic_plus, "Selection", "Attach the text selected in the editor") { addSelection() }
         val spacerTop = View(ctx)
         val top = Ui.row(ctx, addContext, addSelection, spacerTop, thinkingToggle, autoToggle)
@@ -274,15 +278,24 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         attachScroll.isHorizontalScrollBarEnabled = false
         attachScroll.visibility = View.GONE
         composer.addView(attachScroll, Ui.lp(Ui.match, Ui.wrap).also { it.bottomMargin = dp(6) })
+        queueBox.visibility = View.GONE
+        composer.addView(queueBox, Ui.lp(Ui.match, Ui.wrap).also { it.bottomMargin = dp(6) })
         prompt.minLines = 2; prompt.maxLines = 8
         prompt.setOnKeyListener { _, code, ev ->
             when {
-                code == KeyEvent.KEYCODE_ENTER && !ev.isShiftPressed -> { if (ev.action == KeyEvent.ACTION_DOWN) sendOrStop(); true }
+                mentions.handleKey(code, ev) -> true
+                code == KeyEvent.KEYCODE_ENTER && !ev.isShiftPressed -> { if (ev.action == KeyEvent.ACTION_DOWN) send(); true }
                 code == KeyEvent.KEYCODE_ESCAPE && ev.action == KeyEvent.ACTION_DOWN && active?.run != null -> { stopActive(); true }
                 else -> false
             }
         }
+        prompt.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, n: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, n: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) { prefs.edit().putString(draftKey(), s?.toString() ?: "").apply() }
+        })
         composer.addView(prompt, Ui.lp(Ui.match, Ui.wrap))
+        mentions = ChatMentions(ctx, host, prompt, composer) { item -> pickMention(item) }
         modePill = pill("Agent ▾") { showModeMenu(it) }
         modelPill = pill("Default ▾") { showModelMenu(it) }
         statsText = Ui.text(ctx, "", 11f, Ui.fg3)
@@ -307,7 +320,7 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         composer.addView(bar, Ui.lp(Ui.match, Ui.wrap).also { it.topMargin = dp(6) })
         view.addView(composer, Ui.lp(Ui.match, Ui.wrap))
         mode = prefs.getString("mode", "agent") ?: "agent"
-        if (mode !in listOf("agent", "ask", "plan")) mode = "agent"
+        if (mode.isEmpty()) mode = "agent"
         updateModePill()
     }
 
@@ -380,6 +393,8 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
             if (r != null) for (s in r) addTab(s, false)
             val want = tabs.firstOrNull { it.id == wantActive }
             if (want != null) switchTo(want) else if (tabs.isNotEmpty()) switchTo(tabs.last()) else newChat(null)
+            val draft = prefs.getString(draftKey(), "") ?: ""
+            if (draft.isNotBlank() && prompt.text.isBlank()) { setPromptText(draft); active?.draft = draft }
         }
     }
 
@@ -444,9 +459,18 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         modelPill.text = label + " ▾"
     }
 
+    /** Agent, Ask and Plan, your custom modes (Settings, Custom modes) and a way to edit them. */
     private fun showModeMenu(anchor: View) {
         val m = PopupMenu(ctx, anchor)
-        for ((v, label) in listOf("agent" to "Agent", "ask" to "Ask", "plan" to "Plan")) m.menu.add(label).setOnMenuItemClickListener { mode = v; prefs.edit().putString("mode", v).apply(); updateModePill(); true }
+        for ((v, label) in listOf("agent" to "Agent", "ask" to "Ask", "plan" to "Plan")) m.menu.add((if (mode == v) "✓ " else "    ") + label).setOnMenuItemClickListener { mode = v; prefs.edit().putString("mode", v).apply(); updateModePill(); true }
+        val custom = settings.optJSONArray("custom_modes")
+        if (custom != null) for (i in 0 until custom.length()) {
+            val cm = custom.optJSONObject(i) ?: continue
+            val name = cm.optString("name")
+            if (name.isEmpty()) continue
+            m.menu.add((if (mode == name) "✓ " else "    ") + name).setOnMenuItemClickListener { mode = name; prefs.edit().putString("mode", name).apply(); updateModePill(); true }
+        }
+        m.menu.add("    Edit modes…").setOnMenuItemClickListener { host.openSettingsAt("modes"); true }
         m.show()
     }
 
@@ -481,7 +505,7 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         t.pane.visibility = View.VISIBLE
         prompt.setText(t.draft); prompt.setSelection(t.draft.length)
         emptyView.visibility = if (t.transcript.length() == 0) View.VISIBLE else View.GONE
-        renderTabBar(); refreshComposer(); renderStrip(); updateModelPill()
+        renderTabBar(); refreshComposer(); renderStrip(); updateModelPill(); renderQueue()
         if (!t.stick && t.scrollY > 0) scroll.post { scroll.scrollTo(0, t.scrollY); updateJump() } else followBottom(t, true)
         saveTabs()
     }
@@ -532,6 +556,85 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
             then?.invoke()
         }
     }
+
+    /** Opens a saved chat in a tab (the History view and the history dialog use this). */
+    fun openSession(id: String) = openChat(id)
+
+    /**
+     * Sends a question from another panel ("Fix with AI", "Explain", the terminal's Ask button): the text goes
+     * into the prompt, the mode switches when asked, and the message is sent at once.
+     */
+    fun quickAsk(text: String, askMode: String = "", attachment: JSONObject? = null) {
+        if (askMode.isNotEmpty() && askMode != mode) { mode = askMode; prefs.edit().putString("mode", mode).apply(); updateModePill(); refreshComposer() }
+        if (attachment != null) addAttachment(attachment)
+        setPromptText(text)
+        send()
+    }
+
+    fun newChatTab() = newChat(null)
+    fun exportChatPublic() = exportChat()
+    fun toggleSettingPublic(key: String) = toggleSetting(key)
+    fun dictateIntoPrompt() { prompt.requestFocus(); host.dictate(prompt) }
+    fun activeChatId(): String = active?.id ?: ""
+
+    /** Inserts text at the prompt's cursor (the palette's @codebase and @web commands). */
+    fun insertText(t: String) {
+        val pos = prompt.selectionStart.coerceAtLeast(0)
+        prompt.text.insert(pos, t)
+        prompt.requestFocus()
+    }
+
+    /** The @ menu from the Add context button: an @ goes into the prompt, which opens the menu. */
+    private fun openMentionMenu() {
+        val pos = prompt.selectionStart.coerceAtLeast(0)
+        val before = prompt.text.toString().substring(0, pos)
+        prompt.text.insert(pos, if (before.isEmpty() || before.endsWith(" ") || before.endsWith("\n")) "@" else " @")
+        prompt.requestFocus()
+    }
+
+    /** A pick from the @ or / menu becomes a context chip or runs a slash command. */
+    private fun pickMention(it: ChatMentions.Item) {
+        val d = it.data
+        when (it.kind) {
+            "command" -> runCommand(d, "")
+            "file" -> { val p = d.optString("path"); if (attachments.none { a -> a.optString("kind") == "file" && a.optString("path") == p }) addAttachment(JSONObject().put("kind", "file").put("path", p).put("name", p)) }
+            "folder" -> addAttachment(JSONObject().put("kind", "folder").put("path", d.optString("path")).put("name", d.optString("path")))
+            "codebase", "web", "git" -> if (attachments.none { a -> a.optString("kind") == it.kind }) addAttachment(JSONObject().put("kind", it.kind).put("path", "@" + it.kind).put("name", "@" + it.kind))
+            "terminal" -> { val t = host.terminalText(); if (t.isBlank()) Ui.toast(ctx, "The terminal has no output yet.") else { attachments.removeAll { a -> a.optString("kind") == "terminal" }; addAttachment(JSONObject().put("kind", "terminal").put("text", t).put("name", "Terminal output")) } }
+            "lints" -> addLints()
+            "docs" -> addAttachment(JSONObject().put("kind", "docs").put("name", d.optString("name")))
+            "docs-add" -> host.showDocs()
+            "chat" -> addAttachment(JSONObject().put("kind", "chat").put("id", d.optString("id")).put("title", d.optString("title")))
+            "notepad" -> addAttachment(JSONObject().put("kind", "text").put("title", "Notepad: " + d.optString("name")).put("text", d.optString("text")).put("name", "notepad: " + d.optString("name")))
+        }
+    }
+
+    private fun addLints(): Boolean {
+        val lines = host.problems.allLines()
+        if (lines.isEmpty()) { Ui.toast(ctx, "There are no linter errors right now."); return false }
+        attachments.removeAll { a -> a.optString("title") == "Linter errors" }
+        addAttachment(JSONObject().put("kind", "text").put("title", "Linter errors").put("text", lines.joinToString("\n")).put("name", "Linter errors"))
+        return true
+    }
+
+    /** Slash commands: built-in actions run at once; prompt commands fill the input so details can be added. */
+    private fun runCommand(cmd: JSONObject, rest: String) {
+        val n = cmd.optString("name")
+        when (n) {
+            "new" -> { newChat(null); return }
+            "reset" -> { val t = active ?: return; Api.async("reset", { Api.post("/api/session/reset", JSONObject().put("id", t.id)) }) { r, e -> Ui.toast(ctx, if (r != null) "The model's context was reset. The transcript stays." else "Not reset: " + (e?.message ?: "")) }; return }
+            "export" -> { exportChat(); return }
+            "plan", "ask", "agent" -> { mode = n; prefs.edit().putString("mode", n).apply(); updateModePill(); host.flashStatus(n.replaceFirstChar { c -> c.uppercase() } + " mode"); return }
+            "review" -> if (attachments.none { it.optString("kind") == "git" }) addAttachment(JSONObject().put("kind", "git").put("path", "@git").put("name", "@git"))
+            "explain", "tests" -> host.editorSelection()?.let { s -> attachments.removeAll { it.optString("kind") == "selection" }; addAttachment(s) }
+            "fix-lints" -> if (!addLints()) return
+        }
+        val text = cmd.optString("prompt").trim() + (if (rest.isNotEmpty()) "\n\n" + rest else "")
+        setPromptText(text)
+        prompt.requestFocus()
+    }
+
+    private fun draftKey(): String = "draft:" + Api.folder
 
     private fun openChat(id: String) {
         val open = tabs.firstOrNull { it.id == id }
@@ -746,7 +849,40 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         t.background = Ui.rounded(bg4, 12)
         t.setPadding(dp(12), dp(8), dp(12), dp(8))
         box.addView(t, Ui.lp(Ui.wrap, Ui.wrap).also { it.leftMargin = dp(40) })
+        if (turn.optString("run_id").isNotEmpty()) {
+            val restore = Ui.button(ctx, R.drawable.ic_restore, "Restore checkpoint", "Undo the file changes of this message and everything after it, and continue the chat from here") { restoreCheckpoint(turn) }
+            box.addView(restore, Ui.lp(Ui.wrap, Ui.wrap).also { it.topMargin = dp(2) })
+        }
         return box
+    }
+
+    /** Undoes the file changes of a message and every later one, cuts the chat there and puts the message back in the prompt. */
+    private fun restoreCheckpoint(turn: JSONObject) {
+        val tab = active ?: return
+        if (tab.run != null) { Ui.toast(ctx, "Wait until this chat has finished, or stop it first."); return }
+        AlertDialog.Builder(ctx).setTitle("Restore to before this message?")
+            .setMessage("File changes from this message onward are undone, and the chat continues from here with your message back in the prompt.")
+            .setPositiveButton("Restore") { _, _ ->
+                Api.async("rewind", { Api.post("/api/session/rewind", JSONObject().put("id", tab.id).put("run_id", turn.optString("run_id")), 120000) }) { r, e ->
+                    if (r == null) { Ui.toast(ctx, "Not restored: " + (e?.message ?: "")); return@async }
+                    var idx = -1
+                    for (i in 0 until tab.transcript.length()) if (tab.transcript.opt(i) === turn || tab.transcript.optJSONObject(i)?.optString("run_id") == turn.optString("run_id")) { idx = i; break }
+                    if (idx >= 0) { val kept = JSONArray(); for (i in 0 until idx) kept.put(tab.transcript.get(i)); tab.transcript = kept }
+                    tab.render()
+                    saveTranscript(tab)
+                    val msgs = r.optJSONArray("messages") ?: JSONArray()
+                    for (i in 0 until msgs.length()) Regex("^(?:Restored|Removed) (\\S+)").find(msgs.optString(i))?.let { m -> host.fileChanged(m.groupValues[1]) }
+                    host.refreshTree()
+                    if (tab === active) {
+                        setPromptText(turn.optString("text"))
+                        attachments.clear()
+                        (turn.optJSONArray("attachments") ?: JSONArray()).objects().filter { it.optString("kind") != "editor" }.forEach { attachments.add(it) }
+                        renderAttachments()
+                        emptyView.visibility = if (tab.transcript.length() > 0) View.GONE else View.VISIBLE
+                    }
+                    Ui.toast(ctx, "Restored. " + msgs.length() + " file " + (if (msgs.length() == 1) "change" else "changes") + " undone.")
+                }
+            }.setNegativeButton("Cancel", null).show()
     }
 
     private fun contextLabel(a: JSONObject): String = when (a.optString("kind")) {
@@ -887,22 +1023,40 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         }
     }
 
-    /** Files the reply changed, as chips. */
-    private inner class FilesRow {
+    /** Files the reply changed, as chips, with Review (inline in the editor) and Undo all, like Cursor's change list. */
+    private inner class FilesRow(var runId: String) {
         val view = Ui.column(ctx)
         private val chips = LinearLayout(ctx)
         private val shown = HashSet<String>()
         init {
             chips.orientation = LinearLayout.HORIZONTAL
             val h = HorizontalScrollView(ctx); h.isHorizontalScrollBarEnabled = false; h.addView(chips)
-            view.addView(Ui.text(ctx, "Files changed", 10.5f, Ui.fg3).also { it.letterSpacing = 0.06f; it.text = "FILES CHANGED" })
+            val title = Ui.text(ctx, "FILES CHANGED", 10.5f, Ui.fg3).also { it.letterSpacing = 0.06f }
+            val review = Ui.button(ctx, R.drawable.ic_review, "Review", "Show these changes inline in the editor, with Keep and Undo for each change") { if (runId.isNotEmpty()) host.reviewRun(runId) }
+            val undo = Ui.button(ctx, R.drawable.ic_undo, "Undo all", "Undo every file change of this reply") { undoAll() }
+            val head = Ui.row(ctx, title, View(ctx), review, undo)
+            head.getChildAt(1).layoutParams = Ui.lp(0, 1, 1f)
+            (undo.layoutParams as LinearLayout.LayoutParams).leftMargin = dp(4)
+            view.addView(head, Ui.lp(Ui.match, Ui.wrap))
             view.addView(h, Ui.lp(Ui.match, Ui.wrap).also { it.topMargin = dp(3) })
         }
         fun add(path: String, kind: String) {
             if (!shown.add(path)) return
             val c = chip(path + "  " + kind, null)
-            c.setOnClickListener { host.fileChanged(path) }
+            c.setOnClickListener { host.openFileAt(path, 0) }
+            c.tooltipText = "Open $path (the changes show inline, with Keep and Undo)"
             chips.addView(c, Ui.lp(Ui.wrap, Ui.wrap).also { it.rightMargin = dp(5) })
+        }
+        private fun undoAll() {
+            if (runId.isEmpty()) return
+            AlertDialog.Builder(ctx).setTitle("Undo every file change of this reply?").setPositiveButton("Undo all") { _, _ ->
+                Api.async("revert-all", { Api.post("/api/revert_all", JSONObject().put("run_id", runId)) }) { r, e ->
+                    if (r == null) { Ui.toast(ctx, "Not undone: " + (e?.message ?: "")); return@async }
+                    for (p in shown) { host.fileChanged(p); host.endReview(p) }
+                    host.refreshTree()
+                    Ui.toast(ctx, (r.optJSONArray("messages")?.length() ?: 0).toString() + " files restored.")
+                }
+            }.setNegativeButton("Cancel", null).show()
         }
     }
 
@@ -1162,7 +1316,12 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
                 "ask" -> m.addView(askCard(b.optString("question")), cardMargins())
                 "vision" -> m.addView(visionBlock(b), cardMargins())
                 "status" -> m.addView(statusLine(b.optString("text"), b.optBoolean("error")))
-                "files" -> { val fr = FilesRow(); for (f in b.optJSONArray("files")?.objects() ?: emptyList()) fr.add(f.optString("path"), f.optString("kind")); m.addView(fr.view, cardMargins()) }
+                "files" -> {
+                    val files = b.optJSONArray("files")?.objects() ?: emptyList()
+                    val fr = FilesRow(b.optString("run_id").ifEmpty { files.firstOrNull()?.optString("run_id") ?: "" })
+                    for (f in files) fr.add(f.optString("path"), f.optString("kind"))
+                    m.addView(fr.view, cardMargins())
+                }
             }
         }
         turn.optJSONObject("stats")?.let { m.addView(statLine(it)) }
@@ -1200,19 +1359,72 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         Api.async("cancel", { Api.post("/api/cancel", JSONObject().put("run_id", r.id)) }) { _, _ -> }
     }
 
+    /** The send button: stops a running reply, otherwise sends. */
     private fun sendOrStop() {
         val t = active
-        if (t == null) { newChat { sendOrStop() }; return }
-        if (t.run != null) { cancelRun(t); return }
+        if (t != null && t.run != null && prompt.text.isBlank()) { cancelRun(t); return }
+        send()
+    }
+
+    /** Sends the prompt; while a reply runs the message waits in the queue and goes out when the reply ends. */
+    private fun send() {
+        val t = active
+        if (t == null) { newChat { send() }; return }
         if (t.pending) return
+        mentions.dismiss()
         var text = prompt.text.toString().trim()
+        val slash = Regex("^/([\\w-]+)\\s*([\\s\\S]*)$").find(text)
+        if (slash != null) {
+            val name = slash.groupValues[1]; val rest = slash.groupValues[2]
+            if (!mentions.commandsReady()) { mentions.loadNow { send() }; return }
+            val cmd = mentions.command(name)
+            if (cmd != null && (cmd.optBoolean("builtin") || rest.isEmpty())) { prompt.setText(""); runCommand(cmd, rest); return }
+            if (cmd != null) text = cmd.optString("prompt").trim() + "\n\n" + rest
+        }
+        // Mentions typed by hand work like ones picked from the menu.
+        for (m in Regex("(?:^|\\s)@(codebase|web|git)\\b").findAll(text)) {
+            val k = m.groupValues[1]
+            if (attachments.none { it.optString("kind") == k }) attachments.add(JSONObject().put("kind", k).put("path", "@$k").put("name", "@$k"))
+        }
+        if (Regex("(?:^|\\s)@terminal\\b").containsMatchIn(text) && attachments.none { it.optString("kind") == "terminal" }) {
+            val out = host.terminalText()
+            if (out.isNotBlank()) attachments.add(JSONObject().put("kind", "terminal").put("text", out).put("name", "Terminal output"))
+        }
         if (text.isEmpty() && attachments.any { it.optString("kind") == "image" }) text = "Look at the attached image."
         if (text.isEmpty() && attachments.isNotEmpty()) text = "Look at the attached context."
         if (text.isEmpty()) return
-        val item = JSONObject().put("text", text).put("mode", mode).put("attachments", Api.jsonArrayOf(attachments.toList()))
+        val atts = ArrayList(attachments)
+        // Like Cursor, the model is told which file is open and where the cursor is (name and line only).
+        val viewing = host.activeFile()
+        if (viewing.isNotEmpty() && atts.none { it.optString("path") == viewing }) {
+            val line = host.activeEditor()?.cursorLineCol()?.first?.plus(1)
+            atts.add(JSONObject().put("kind", "editor").put("path", viewing).put("line", line ?: JSONObject.NULL))
+        }
+        val item = JSONObject().put("text", text).put("mode", mode).put("attachments", Api.jsonArrayOf(atts))
         prompt.setText(""); t.draft = ""
+        prefs.edit().remove(draftKey()).apply()
         attachments.clear(); renderAttachments()
+        if (t.run != null) { t.queue.add(item); renderQueue(); host.flashStatus("Queued. It is sent when the current reply finishes."); return }
         startRun(t, item)
+    }
+
+    /** The queued messages of the active chat, above the prompt, each with a button to remove it. */
+    private fun renderQueue() {
+        queueBox.removeAllViews()
+        val t = active
+        if (t == null || t.queue.isEmpty()) { queueBox.visibility = View.GONE; return }
+        queueBox.visibility = View.VISIBLE
+        for (item in t.queue.toList()) {
+            val label = Ui.text(ctx, item.optString("text").replace('\n', ' '), 12f, Ui.fg2)
+            label.isSingleLine = true; label.ellipsize = TextUtils.TruncateAt.END
+            val icon = Ui.iconView(ctx, R.drawable.ic_queue, Ui.fg3, 14)
+            val remove = Ui.miniButton(ctx, R.drawable.ic_close, "Remove from the queue") { t.queue.remove(item); renderQueue() }
+            val row = Ui.row(ctx, icon, label, remove)
+            label.layoutParams = Ui.lp(0, Ui.wrap, 1f).also { it.leftMargin = dp(6) }
+            row.background = Ui.rounded(Ui.bg3, 6, border2)
+            row.setPadding(dp(8), dp(2), dp(4), dp(2))
+            queueBox.addView(row, Ui.lp(Ui.match, Ui.wrap).also { it.bottomMargin = dp(3) })
+        }
     }
 
     // ---------------------------------------------------------------- a reply and its event stream
@@ -1358,19 +1570,25 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
                 val card = R.tools[ev.optString("call_id")] ?: return
                 card.setResult(ev.optBoolean("ok"), ev.optString("result"), if (ev.has("seconds") && !ev.isNull("seconds")) ev.optDouble("seconds") else null)
                 val name = ev.optString("name")
-                if (name == "write_file" || name == "edit_file") host.fileChanged(card.block.optJSONObject("arguments")?.optString("path") ?: "")
+                if (name == "write_file" || name == "edit_file") {
+                    val p = card.block.optJSONObject("arguments")?.optString("path") ?: ""
+                    host.fileChanged(p)
+                    val res = ev.optString("result")
+                    host.reportCheck(p, if (res.contains("SYNTAX CHECK FAILED")) res.substring(res.indexOf("SYNTAX CHECK FAILED")) else "")
+                }
                 followBottom(tab, false)
             }
             "file_changed" -> {
                 var fb: JSONObject? = null
                 for (b in blocks(R).objects()) if (b.optString("type") == "files") fb = b
-                if (fb == null) { fb = JSONObject().put("type", "files").put("files", JSONArray()); blocks(R).put(fb); R.filesRow = FilesRow(); R.msgEl.addView(R.filesRow!!.view, cardMargins()) }
+                if (fb == null) { fb = JSONObject().put("type", "files").put("files", JSONArray()).put("run_id", ev.optString("run_id")); blocks(R).put(fb); R.filesRow = FilesRow(ev.optString("run_id", R.id)); R.msgEl.addView(R.filesRow!!.view, cardMargins()) }
                 val files = fb.getJSONArray("files")
                 var found = false
                 for (i in 0 until files.length()) if (files.getJSONObject(i).optString("path") == ev.optString("path")) { files.put(i, JSONObject().put("path", ev.optString("path")).put("kind", ev.optString("kind")).put("run_id", ev.optString("run_id"))); found = true }
                 if (!found) files.put(JSONObject().put("path", ev.optString("path")).put("kind", ev.optString("kind")).put("run_id", ev.optString("run_id")))
                 R.filesRow?.add(ev.optString("path"), ev.optString("kind"))
-                host.fileChanged(ev.optString("path"))
+                // The editor reloads the file and shows the change under review (green and red lines, Keep and Undo).
+                host.agentChanged(ev.optString("run_id", R.id), ev.optString("path"))
             }
             "todos" -> {
                 var b: JSONObject? = null
@@ -1390,6 +1608,7 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
                 R.msgEl.addView(approvalCard(a, false), cardMargins())
                 followBottom(tab, true)
                 if (tab !== active) { tab.attention = true; renderTabBar() }
+                if (tab !== active || !host.inFront()) host.notifyUser("Forge needs your approval", approvalTitle(ev.optString("tool")) + ": " + argSummary(ev.optString("tool"), ev.optJSONObject("arguments")))
             }
             "ask_user" -> {
                 closeCurrent(R)
@@ -1446,6 +1665,11 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         renderStrip(); renderTabBar(); refreshComposer(); updateJump()
         saveTranscript(tab)
         host.refreshTree()
+        if (tab.queue.isNotEmpty()) {
+            val next = tab.queue.removeAt(0)
+            if (tab === active) renderQueue()
+            Api.main.postDelayed({ if (tab.run == null && !tab.pending) startRun(tab, next) else tab.queue.add(0, next) }, 400)
+        }
     }
 
     fun focusPrompt() { prompt.requestFocus() }

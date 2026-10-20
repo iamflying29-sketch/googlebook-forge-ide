@@ -33,20 +33,9 @@ class TerminalPanel(private val ctx: Context, private val host: MainActivity, pr
         view.orientation = LinearLayout.VERTICAL
         view.setBackgroundColor(Ui.bg)
 
-        // The header: a 34 dp bar in the panel background with the label on the left and small buttons on the right.
-        val head = LinearLayout(ctx)
-        head.orientation = LinearLayout.HORIZONTAL
-        head.gravity = Gravity.CENTER_VERTICAL
-        head.setBackgroundColor(Ui.bg2)
-        head.setPadding(Ui.dp(ctx, 12), 0, Ui.dp(ctx, 6), 0)
+        // No header of its own: TerminalTabs shows one bar for all shells with this shell's state on it.
         state = capsLabel("NOT CONNECTED", gray)
-        // The bottom panel's tab strip already says TERMINAL, so the header shows only the connection state.
-        head.addView(state, Ui.lp(0, Ui.wrap, 1f))
-        head.addView(Ui.miniButton(ctx, R.drawable.ic_trash, "Clear the terminal") { terminal.clear() }.also { it.layoutParams = Ui.lp(Ui.dp(ctx, 24), Ui.dp(ctx, 24)).also { p -> p.leftMargin = Ui.dp(ctx, 4) } })
-        head.addView(Ui.miniButton(ctx, R.drawable.ic_refresh, "Reconnect the shell") { reconnectDelayS = 3; connect() }.also { it.layoutParams = Ui.lp(Ui.dp(ctx, 24), Ui.dp(ctx, 24)).also { p -> p.leftMargin = Ui.dp(ctx, 4) } })
-        head.addView(Ui.miniButton(ctx, R.drawable.ic_chevron_down, "Hide the panel (Ctrl J)") { host.toggleTerminal() }.also { it.layoutParams = Ui.lp(Ui.dp(ctx, 24), Ui.dp(ctx, 24)).also { p -> p.leftMargin = Ui.dp(ctx, 4) } })
-        view.addView(head, Ui.lp(Ui.match, Ui.dp(ctx, 34)))
-        view.addView(Ui.divider(ctx, vertical = false))
+        terminal.onMenuAction = { action, text -> if (action == "add-to-chat") host.addTerminalToChat(text) }
 
         // The terminal itself, inset like the web page's .term-host (4 px top and bottom, 10 px left, 6 px right).
         terminal.setPadding(Ui.dp(ctx, 10), Ui.dp(ctx, 4), Ui.dp(ctx, 6), Ui.dp(ctx, 4))
@@ -75,7 +64,21 @@ class TerminalPanel(private val ctx: Context, private val host: MainActivity, pr
         return b
     }
 
-    private fun setState(text: String, color: Int = gray) { state.text = text; state.setTextColor(color) }
+    /** The shell's connection state for the bar of TerminalTabs ("CONNECTED" in green, and so on). */
+    var stateText = "NOT CONNECTED"; private set
+    var stateColor = gray; private set
+    var onState: (() -> Unit)? = null
+
+    private fun setState(text: String, color: Int = gray) { state.text = text; state.setTextColor(color); stateText = text; stateColor = color; onState?.invoke() }
+
+    fun clear() { terminal.clear() }
+    fun setFontSize(sp: Float) = terminal.setFontSize(sp)
+    fun reconnect() { reconnectDelayS = 3; connect() }
+    /** The last lines of this shell (scrollback and screen), for @terminal context and "add to chat". */
+    fun recentText(maxLines: Int = 200): String = terminal.recentText(maxLines)
+    fun selectedText(): String = terminal.selectedText()
+    /** Types text into the shell as if it was pasted (a command from Ctrl K is not run until Enter is pressed). */
+    fun pasteText(text: String) { if (text.isNotEmpty()) send(text.replace("\r\n", "\r").replace('\n', '\r')); terminal.requestFocus() }
 
     /** Opens (or reopens) the WebSocket to the shell. Safe to call again at any time. */
     fun connect() {
