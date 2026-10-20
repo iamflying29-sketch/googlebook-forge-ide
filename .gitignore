@@ -6,8 +6,6 @@ build/
 *.class
 res.zip
 android/jni/
-# Vendored browser libraries (download them with static/fetch-vendor.sh)
-static/vendor/
 # Models and engine build trees
 *.gguf
 models/
