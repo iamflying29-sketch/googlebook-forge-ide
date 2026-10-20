@@ -737,10 +737,14 @@ class ChatPanel(private val ctx: Context, private val host: MainActivity) {
         }) { r, e -> Ui.toast(ctx, if (r != null) "Exported to " + r.optString("path") else "Export failed: " + (e?.message ?: "")) }
     }
 
-    fun showHistory() {
+    fun showHistory(attempt: Int = 0) {
         Api.async("history", { Api.get("/api/sessions") }) { r, e ->
             val list = r?.optJSONArray("sessions")
-            if (list == null) { Ui.toast(ctx, "Could not list the chats: " + (e?.message ?: "")); return@async }
+            if (list == null) {
+                // The server may be restarting for a few seconds: try again quietly before saying anything failed.
+                if (attempt < 10) { if (attempt == 0) host.flashStatus("Connecting to the Forge server…"); Api.main.postDelayed({ showHistory(attempt + 1) }, 2000); return@async }
+                Ui.toast(ctx, "Could not list the chats: " + (e?.message ?: "")); return@async
+            }
             if (list.length() == 0) { Ui.toast(ctx, "No chats in this folder yet."); return@async }
             val names = ArrayList<String>(); val ids = ArrayList<String>()
             for (s in list.objects()) {

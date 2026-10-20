@@ -41,9 +41,17 @@ class HistoryPanel(private val ctx: Context, private val host: MainActivity) {
     }
 
     /** GET /api/sessions?all=1: {"folder": ..., "sessions": [{"id", "title", "updated", "workspace", "messages"}]}. */
-    fun load() {
+    fun load(attempt: Int = 0) {
         Api.async("sessions", { Api.get("/api/sessions", mapOf("all" to "1")) }) { r, e ->
-            if (r == null) { error = e?.message ?: "Could not list the chats."; sessions.clear(); render(); return@async }
+            if (r == null) {
+                // The server may be restarting for a few seconds: keep trying for half a minute before giving up.
+                if (attempt < 15) {
+                    if (sessions.isEmpty()) { error = "Connecting to the Forge server…"; render() }
+                    Api.main.postDelayed({ load(attempt + 1) }, 2000)
+                    return@async
+                }
+                error = (e?.message ?: "Could not list the chats.") + " Press the refresh button to try again."; sessions.clear(); render(); return@async
+            }
             error = null
             val list = r.optJSONArray("sessions") ?: JSONArray()
             sessions = ArrayList()

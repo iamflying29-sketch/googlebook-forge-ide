@@ -1045,6 +1045,11 @@ class Handler(BaseHTTPRequestHandler):
                 items = [s for s in items if s.get("workspace") == ws.root]
             # Empty chats are open tabs, not history.
             items = [s for s in items if not st.session_is_empty(s)]
+            # A saved chat whose file was deleted outside Forge is forgotten here, so no restart is needed.
+            gone = [s for s in items if not os.path.exists(os.path.join(SESSIONS_DIR, s["id"] + ".json"))]
+            for s in gone:
+                st.sessions.pop(s["id"], None)
+            items = [s for s in items if s not in gone]
             return self._json(200, {"folder": ws.root, "sessions": [{"id": s["id"], "title": s["title"], "updated": s["updated"],
                                     "workspace": s.get("workspace"), "messages": len(s.get("messages", []))}
                                     for s in items[:300]]})
