@@ -375,8 +375,18 @@ class State:
                 if isinstance(s, dict) and s.get("id"):
                     self.sessions[s["id"]] = s
 
+    @staticmethod
+    def session_is_empty(s: dict) -> bool:
+        """A chat nobody has written in yet (a fresh "New chat" tab). It is kept in memory only, so opening and
+        closing Forge does not leave saved empty chats behind; a renamed chat counts as used."""
+        if s.get("renamed") or s.get("transcript"):
+            return False
+        return not any(m.get("role") == "user" for m in s.get("messages", []))
+
     def save_session(self, s: dict) -> None:
         s["updated"] = time.time()
+        if self.session_is_empty(s) and not os.path.exists(os.path.join(SESSIONS_DIR, s["id"] + ".json")):
+            return
         _save_json(os.path.join(SESSIONS_DIR, s["id"] + ".json"), s)
 
     # ------------------------------------------------------------ folders (one per window, like Cursor)
@@ -410,8 +420,8 @@ class State:
         return {"effective": self.effective_settings(root), "user": self.settings, "folder": self.folder_overrides(root),
                 "folder_keys": sorted(FOLDER_SETTING_KEYS), "folder_path": root}
 
-    def new_session(self, title: str = "New chat", folder: Optional[str] = None) -> dict:
-        s = {"id": uuid.uuid4().hex[:10], "title": title, "workspace": folder or self.workspace.root, "created": time.time(),
+    def new_session(self, title: str = "New chat", folder: Optional[str] = None, sid: str = "") -> dict:
+        s = {"id": sid if re.fullmatch(r"[0-9a-f]{10}", sid or "") else uuid.uuid4().hex[:10], "title": title, "workspace": folder or self.workspace.root, "created": time.time(),
              "updated": time.time(), "messages": [], "transcript": [], "auto_approve": False}
         self.sessions[s["id"]] = s
         self.save_session(s)
@@ -1033,6 +1043,8 @@ class Handler(BaseHTTPRequestHandler):
             items = sorted(st.sessions.values(), key=lambda s: -s.get("updated", 0))
             if arg("all") != "1":
                 items = [s for s in items if s.get("workspace") == ws.root]
+            # Empty chats are open tabs, not history.
+            items = [s for s in items if not st.session_is_empty(s)]
             return self._json(200, {"folder": ws.root, "sessions": [{"id": s["id"], "title": s["title"], "updated": s["updated"],
                                     "workspace": s.get("workspace"), "messages": len(s.get("messages", []))}
                                     for s in items[:300]]})
@@ -1310,10 +1322,13 @@ class Handler(BaseHTTPRequestHandler):
             if not s:
                 return self._error(404, "no such session")
             s["title"] = str(b.get("title") or s["title"])[:120]
+            s["renamed"] = True
             st.save_session(s)
             return self._json(200, {"ok": True})
         if path == "/api/session/transcript":
             s = st.sessions.get(str(b.get("id")))
+            if not s and b.get("transcript"):
+                s = st.new_session("New chat", ws.root, str(b.get("id")))
             if not s:
                 return self._error(404, "no such session")
             s["transcript"] = b.get("transcript", [])
@@ -1844,7 +1859,9 @@ class Handler(BaseHTTPRequestHandler):
         sid = str(b.get("session_id") or "")
         s = st.sessions.get(sid)
         if not s:
-            s = st.new_session("New chat", win_ws.root)
+            # An empty chat tab lives only in memory; after a server restart it comes back under the same id, so the
+            # app's tab and the saved chat stay one chat.
+            s = st.new_session("New chat", win_ws.root, sid)
         if not s.get("workspace"):
             s["workspace"] = win_ws.root
         try:
